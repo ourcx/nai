@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import argparse
+import io
+from datetime import datetime, time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from PIL import Image
+
+from nailong_classifier.bot import (
+    build_catalog_post,
+    format_catalog_caption,
+    format_chain_caption,
+    format_daily_stats,
+    format_existing_observation,
+    format_help_message,
+    has_direct_image,
+    is_catalog_command,
+    is_daily_stats_command,
+    is_help_command,
+    is_help_request,
+    media_response_mode,
+    parse_correction_command,
+    parse_daily_report_time,
+)
+from nailong_classifier.model import Prediction
+from nailong_classifier.storage import LOCAL_TIMEZONE, BotStore
+
+
+def make_image_bytes(color: str, *, image_format: str = "PNG") -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (48, 48), color).save(output, format=image_format)
+    return output.getvalue()
+
+
+def record(
+    store: BotStore,
+    image_bytes: bytes,
+    *,
+    message_id: str,
+    label: str,
+    chat_id: str = "chat-a",
+    chat_type: str = "group",
+):
+    return store.record_observation(
+        image_bytes=image_bytes,
+        source_message_id=message_id,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_id="user-a",
+        predicted_label=label,
+        confidence=0.91,
+        accepted=True,
+    )
+
+
+def test_hash_deduplicates_assets_and_message_events(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    image_bytes = make_image_bytes("yellow")
+
+    first = record(store, image_bytes, message_id="message-1", label="nailong")
+    second = record(store, image_bytes, message_id="message-2", label="nailong")
+    duplicate_event = record(store, image_bytes, message_id="message-1", label="nailong")
+
+    assert first.is_new_asset is True
+    assert second.is_new_asset is False
+    assert second.asset.id == first.asset.id
+    assert second.asset.seen_count == 2
+    assert duplicate_event.is_new_observation is False
+    assert duplicate_event.asset.seen_count == 2
+    assert len(list((tmp_path / "assets").iterdir())) == 1
+
+
+def test_correction_accepts_source_or_response_message_id(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    observation = record(
+        store,
+        make_image_bytes("pink"),
+        message_id="source-message",
+        label="naiwa",
+    )
+    store.attach_response(observation.id, "response-message")
+
+    correction = store.correct_label("response-message", "nailong")
+
+    assert correction is not None
+    assert correction.old_label == "naiwa"
+    assert correction.new_label == "nailong"
+    assert store.catalog_stats().total == 1
+    assert store.random_asset("nailong").id == observation.asset.id
+    corrected_observation = record(
+        store,
+        make_image_bytes("pink"),
+        message_id="source-message",
+        label="naiwa",
+    )
+    prediction = Prediction(
+        label="naiwa",
+        confidence=0.6,
+        accepted=False,
+        scores={"nailong": 0.35, "naiwa": 0.6, "other": 0.05},
+    )
+    assert format_existing_observation(corrected_observation, prediction) == (
+        f"这张图已经确认是奶龙，图鉴编号 #{observation.asset.id:04d}。"
+    )
+    assert store.correct_label("missing-message", "other") is None
+
+
+def test_daily_stats_are_scoped_to_the_current_chat(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    nailong = record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="nailong-a",
+        label="nailong",
+    )
+    record(
+        store,
+        make_image_bytes("pink"),
+        message_id="naiwa-a",
+        label="naiwa",
+    )
+    record(
+        store,
+        make_image_bytes("gray"),
+        message_id="other-a",
+        label="other",
+    )
+    record(
+        store,
+        make_image_bytes("green"),
+        message_id="nailong-b",
+        label="nailong",
+        chat_id="chat-b",
+    )
+
+    stats = store.daily_stats("chat-a")
+
+    assert stats.total == 3
+    assert stats.nailong == 1
+    assert stats.naiwa == 1
+    assert stats.other == 1
+    assert str(stats.milk_percent) == "66.7"
+    assert stats.new_nailong == 1
+    assert "今日含奶量：66.7%" in format_daily_stats(stats)
+    assert f"#{nailong.asset.id:04d}" in format_chain_caption(nailong)
+
+
+def test_catalog_uses_collected_milk_assets_and_builds_multi_image_post(
+    tmp_path: Path,
+) -> None:
+    store = BotStore(tmp_path)
+    store.register_seed(make_image_bytes("gold"), "nailong")
+    record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="collected-nailong",
+        label="nailong",
+    )
+    record(
+        store,
+        make_image_bytes("pink"),
+        message_id="collected-naiwa",
+        label="naiwa",
+    )
+    store.record_observation(
+        image_bytes=make_image_bytes("green"),
+        source_message_id="pending-milk",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-a",
+        predicted_label="naiwa",
+        confidence=0.6,
+        accepted=False,
+    )
+    store.record_observation(
+        image_bytes=make_image_bytes("gray"),
+        source_message_id="confirmed-other",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-a",
+        predicted_label="naiwa",
+        confidence=0.6,
+        accepted=False,
+    )
+    store.correct_label("confirmed-other", "other")
+
+    stats = store.catalog_stats()
+    assets = store.catalog_assets()
+    image_keys = [f"img_{index}" for index in range(len(assets))]
+    post = build_catalog_post(assets, image_keys, stats)
+
+    assert stats.total == 3
+    assert stats.nailong == 1
+    assert stats.naiwa == 1
+    assert stats.pending == 1
+    assert stats.today_new == 3
+    assert len(assets) == 3
+    assert all(asset.origin == "collected" for asset in assets)
+    assert post["zh_cn"]["title"] == "奶龙图鉴"
+    post_images = [
+        node["image_key"]
+        for row in post["zh_cn"]["content"]
+        for node in row
+        if node["tag"] == "img"
+    ]
+    assert post_images == image_keys
+    assert format_catalog_caption(stats, len(assets)) == (
+        "共收录 3 张：奶龙 1 · 奶娃 1 · 待确认 1。"
+        "今日新增 3 张，当前展示最近 3 张。"
+    )
+
+
+def test_commands_are_exact_and_support_correction_aliases() -> None:
+    assert parse_correction_command("纠正为奶龙") == "nailong"
+    assert parse_correction_command("改成 奶娃") == "naiwa"
+    assert parse_correction_command("这是其他") == "other"
+    assert parse_correction_command("帮我纠正为奶龙") is None
+    assert is_daily_stats_command(" 今日含奶量 ") is True
+    assert is_catalog_command("查看奶龙图鉴") is True
+    assert is_help_command("HELP") is True
+    assert is_help_command("帮助") is True
+    assert is_help_request("help", mentioned_bot=True) is True
+    assert is_help_request("help", mentioned_bot=False) is False
+    assert "每天 23:55 也会自动播报" in format_help_message(
+        time(hour=23, minute=55)
+    )
+    assert has_direct_image(
+        SimpleNamespace(resources=[SimpleNamespace(type="sticker")])
+    )
+    assert not has_direct_image(SimpleNamespace(resources=[]))
+    assert parse_daily_report_time("23:55") == time(hour=23, minute=55)
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_daily_report_time("24:00")
+    assert (
+        media_response_mode(
+            mentioned_bot=True,
+            chat_type="group",
+            label="nailong",
+        )
+        == "prediction"
+    )
+    assert (
+        media_response_mode(
+            mentioned_bot=False,
+            chat_type="group",
+            label="nailong",
+        )
+        == "chain"
+    )
+    assert (
+        media_response_mode(
+            mentioned_bot=False,
+            chat_type="p2p",
+            label="naiwa",
+        )
+        == "chain"
+    )
+    assert (
+        media_response_mode(
+            mentioned_bot=False,
+            chat_type="group",
+            label="other",
+        )
+        == "silent"
+    )
+    assert (
+        media_response_mode(
+            mentioned_bot=False,
+            chat_type="p2p",
+            label="other",
+        )
+        == "prediction"
+    )
+
+
+def test_uncorrected_duplicate_keeps_the_model_uncertainty_message(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    image_bytes = make_image_bytes("green")
+    first = store.record_observation(
+        image_bytes=image_bytes,
+        source_message_id="uncertain-message",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-a",
+        predicted_label="naiwa",
+        confidence=0.6,
+        accepted=False,
+    )
+    duplicate = store.record_observation(
+        image_bytes=image_bytes,
+        source_message_id="uncertain-message",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-a",
+        predicted_label="naiwa",
+        confidence=0.6,
+        accepted=False,
+    )
+    prediction = Prediction(
+        label="naiwa",
+        confidence=0.6,
+        accepted=False,
+        scores={"nailong": 0.35, "naiwa": 0.6, "other": 0.05},
+    )
+
+    assert first.is_new_observation is True
+    assert duplicate.is_new_observation is False
+    assert format_existing_observation(duplicate, prediction) == (
+        "我不太确定。最高候选是「奶娃」，置信度 60.0%。"
+    )
+
+
+def test_daily_reports_target_active_groups_once_per_day(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="group-message",
+        label="nailong",
+        chat_id="group-chat",
+    )
+    record(
+        store,
+        make_image_bytes("pink"),
+        message_id="p2p-message",
+        label="naiwa",
+        chat_id="p2p-chat",
+        chat_type="p2p",
+    )
+    report_day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+
+    targets = store.pending_daily_report_targets(report_day)
+
+    assert [target.chat_id for target in targets] == ["group-chat"]
+    store.mark_daily_report_sent(
+        chat_id="group-chat",
+        report_day=report_day,
+        response_message_id="report-message",
+    )
+    assert store.pending_daily_report_targets(report_day) == []
