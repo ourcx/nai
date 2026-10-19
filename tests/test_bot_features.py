@@ -26,6 +26,7 @@ from nailong_classifier.bot import (
     parse_asset_ids,
     parse_correction_command,
     parse_daily_report_time,
+    should_reply_media_error,
 )
 from nailong_classifier.model import Prediction
 from nailong_classifier.storage import LOCAL_TIMEZONE, BotStore
@@ -405,6 +406,9 @@ def test_commands_are_exact_and_support_correction_aliases() -> None:
         SimpleNamespace(resources=[SimpleNamespace(type="sticker")])
     )
     assert not has_direct_image(SimpleNamespace(resources=[]))
+    assert should_reply_media_error(mentioned_bot=False, chat_type="group") is False
+    assert should_reply_media_error(mentioned_bot=True, chat_type="group") is True
+    assert should_reply_media_error(mentioned_bot=False, chat_type="p2p") is True
     assert parse_daily_report_time("23:55") == time(hour=23, minute=55)
     with pytest.raises(argparse.ArgumentTypeError):
         parse_daily_report_time("24:00")

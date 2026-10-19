@@ -243,6 +243,11 @@ def has_direct_image(message) -> bool:
     return any(resource.type in {"image", "sticker"} for resource in message.resources)
 
 
+def should_reply_media_error(*, mentioned_bot: bool, chat_type: str) -> bool:
+    # 群聊里没 @ 机器人的图片属于自动识别，出错时只记日志，避免在群里刷报错。
+    return mentioned_bot or chat_type == "p2p"
+
+
 def media_response_mode(
     *,
     mentioned_bot: bool,
@@ -782,8 +787,19 @@ async def run_bot(args: argparse.Namespace) -> None:
                     await reply(message, "请发送图片，或回复一条图片消息后 @我。")
                 return
 
+            reply_error = should_reply_media_error(
+                mentioned_bot=message.mentioned_bot,
+                chat_type=message.chat_type,
+            )
             image_bytes = await download_target(channel, target)
             if not image_bytes:
+                LOGGER.warning(
+                    "Failed to download resource kind=%s message_id=%s",
+                    target.resource_type,
+                    target.message_id,
+                )
+                if not reply_error:
+                    return
                 if target.resource_type == "sticker":
                     await reply(
                         message,
@@ -793,7 +809,13 @@ async def run_bot(args: argparse.Namespace) -> None:
                     await reply(message, "图片下载失败，请重新发送。")
                 return
             if len(image_bytes) > MAX_IMAGE_BYTES:
-                await reply(message, "图片超过 20 MB，暂时无法识别。")
+                LOGGER.warning(
+                    "Skipping oversized resource bytes=%d message_id=%s",
+                    len(image_bytes),
+                    target.message_id,
+                )
+                if reply_error:
+                    await reply(message, "图片超过 20 MB，暂时无法识别。")
                 return
             prediction = await asyncio.to_thread(predictor.predict_bytes, image_bytes)
             observation = await asyncio.to_thread(
@@ -835,7 +857,11 @@ async def run_bot(args: argparse.Namespace) -> None:
                 await continue_chain(message, observation, prediction)
         except Exception:
             LOGGER.exception("Message handling failed")
-            await reply(message, "消息处理失败，请稍后重试。")
+            if not has_direct_image(message) or should_reply_media_error(
+                mentioned_bot=message.mentioned_bot,
+                chat_type=message.chat_type,
+            ):
+                await reply(message, "消息处理失败，请稍后重试。")
 
     async def on_error(error) -> None:
         LOGGER.error("Feishu channel error: %s", error)
