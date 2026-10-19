@@ -183,10 +183,20 @@ def build_train_val_loaders(
     if train_dataset.classes != class_names or val_dataset.classes != class_names:
         raise RuntimeError("Class order changed while building datasets")
 
+    # 线上收集的图里奶龙极少、其他图很多，按类别样本数倒数加权，
+    # 让每个类别每轮被抽到的总概率相同，避免模型只学会多数类。
+    # GIF 的额外权重叠加在类别权重之上，并按类别内总权重归一，不改变类别间的平衡。
     animated_index_set = set(animated_indices)
-    sample_weights = [
+    raw_weights = [
         ANIMATED_SAMPLE_WEIGHT if index in animated_index_set else 1.0
         for index in train_indices
+    ]
+    class_weight_totals: Counter[int] = Counter()
+    for index, weight in zip(train_indices, raw_weights, strict=True):
+        class_weight_totals[index_dataset.targets[index]] += weight
+    sample_weights = [
+        weight / class_weight_totals[index_dataset.targets[index]]
+        for index, weight in zip(train_indices, raw_weights, strict=True)
     ]
     sampler = WeightedRandomSampler(
         sample_weights,

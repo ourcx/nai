@@ -43,7 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--label-smoothing", type=float, default=0.15)
     parser.add_argument("--patience", type=int, default=8)
-    parser.add_argument("--threshold", type=float, default=0.60)
+    # 交叉验证中 0.65 比 0.60 少收进几张截图等非奶龙图，代价是少收录少量真奶龙/奶蛙。
+    parser.add_argument("--threshold", type=float, default=0.65)
     parser.add_argument("--seed", type=int, default=20261017)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")

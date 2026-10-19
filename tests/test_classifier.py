@@ -59,7 +59,35 @@ def test_gif_hard_negatives_are_loaded_only_for_training() -> None:
 
     assert any(path.suffix.lower() == ".gif" for path in train_paths)
     assert all(path.suffix.lower() != ".gif" for path in val_paths)
-    assert float(train_loader.sampler.weights.max().item()) == ANIMATED_SAMPLE_WEIGHT
+
+    # 每个类别的总采样权重相同；同一类别内 GIF 的权重是静态图的 ANIMATED_SAMPLE_WEIGHT 倍。
+    weights = train_loader.sampler.weights.tolist()
+    targets_by_position = [
+        train_subset.dataset.targets[index] for index in train_subset.indices
+    ]
+    class_totals: dict[int, float] = {}
+    for target, weight in zip(targets_by_position, weights, strict=True):
+        class_totals[target] = class_totals.get(target, 0.0) + weight
+    assert all(abs(total - 1.0) < 1e-9 for total in class_totals.values())
+    for target in class_totals:
+        gif_weights = {
+            round(weight, 12)
+            for path, weight, item_target in zip(
+                train_paths, weights, targets_by_position, strict=True
+            )
+            if item_target == target and path.suffix.lower() == ".gif"
+        }
+        static_weights = {
+            round(weight, 12)
+            for path, weight, item_target in zip(
+                train_paths, weights, targets_by_position, strict=True
+            )
+            if item_target == target and path.suffix.lower() != ".gif"
+        }
+        if gif_weights and static_weights:
+            assert len(gif_weights) == 1 and len(static_weights) == 1
+            ratio = gif_weights.pop() / static_weights.pop()
+            assert abs(ratio - ANIMATED_SAMPLE_WEIGHT) < 1e-9
     images, targets = next(iter(train_loader))
     assert images.shape[1:] == (3, 224, 224)
     assert images.shape[0] == targets.shape[0]
@@ -72,7 +100,7 @@ def test_yellow_kangaroo_hard_negative_is_other() -> None:
         Path("data/train/other/v3_0016h_1ed02b0a-b69c-4a62-b947-3dc46dc0b9cg.gif")
     )
 
-    assert predictor.threshold == 0.60
+    assert predictor.threshold == 0.65
     assert prediction.label == "other"
     assert prediction.accepted is True
     assert prediction.scores["naiwa"] < predictor.threshold
