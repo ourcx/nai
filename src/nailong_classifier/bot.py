@@ -16,6 +16,7 @@ from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
 from lark_channel.channel.types import MediaSource, ReplyRef
 from lark_channel.core import LogLevel
 
+from .catalog_document import CatalogDocumentClient
 from .model import NailongPredictor, Prediction
 from .storage import (
     LOCAL_TIMEZONE,
@@ -30,16 +31,17 @@ LOGGER = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DISPLAY_LABELS = {
     "nailong": "奶龙",
-    "naiwa": "奶娃",
+    "naiwa": "奶蛙",
     "other": "其他",
 }
-CORRECTION_PATTERN = re.compile(r"^(?:纠正(?:为|成)?|改成|这是)\s*(奶龙|奶娃|其他)$")
+CORRECTION_PATTERN = re.compile(r"^(?:纠正(?:为|成)?|改成|这是)\s*(奶龙|奶蛙|其他)$")
 COMMAND_LABELS = {
     "奶龙": "nailong",
-    "奶娃": "naiwa",
+    "奶蛙": "naiwa",
     "其他": "other",
 }
 DEFAULT_DAILY_REPORT_TIME = time(hour=23, minute=55)
+DEFAULT_CATALOG_SYNC_RETRY_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -189,7 +191,7 @@ def format_prediction(prediction: Prediction) -> str:
     if not prediction.accepted:
         return f"我不太确定。最高候选是「{display_label}」，置信度 {confidence}。"
     if prediction.label == "other":
-        return f"识别结果：这张图不像奶龙或奶娃。置信度 {confidence}。"
+        return f"识别结果：这张图不像奶龙或奶蛙。置信度 {confidence}。"
     return f"识别结果：{display_label}。置信度 {confidence}。"
 
 
@@ -221,6 +223,22 @@ def parse_daily_report_time(value: str) -> time:
         raise argparse.ArgumentTypeError("daily report time must use HH:MM") from error
 
 
+def parse_asset_ids(value: str) -> list[int]:
+    if not value.strip():
+        return []
+    try:
+        asset_ids = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "catalog baseline asset IDs must be comma-separated integers"
+        ) from error
+    if any(asset_id <= 0 for asset_id in asset_ids):
+        raise argparse.ArgumentTypeError(
+            "catalog baseline asset IDs must be positive integers"
+        )
+    return list(dict.fromkeys(asset_ids))
+
+
 def has_direct_image(message) -> bool:
     return any(resource.type in {"image", "sticker"} for resource in message.resources)
 
@@ -243,7 +261,7 @@ def media_response_mode(
 def format_daily_stats(stats: DailyStats) -> str:
     return (
         f"今日含奶量：{stats.milk_percent}%\n"
-        f"奶龙 {stats.nailong} · 奶娃 {stats.naiwa} · 其他 {stats.other}\n"
+        f"奶龙 {stats.nailong} · 奶蛙 {stats.naiwa} · 其他 {stats.other}\n"
         f"今日共识别 {stats.total} 张图片/表情，新收录奶龙 {stats.new_nailong} 张。"
     )
 
@@ -253,7 +271,7 @@ def format_help_message(report_time: time) -> str:
         "我是奶龙，可以这样玩：\n"
         "1. 直接发送图片或表情：自动接龙，不用 @。\n"
         "2. 回复图片并 @我：查看文字识别结果。\n"
-        "3. 回复原图或接龙图，发送“纠正为奶龙/奶娃/其他”：修正分类。\n"
+        "3. 回复原图或接龙图，发送“纠正为奶龙/奶蛙/其他”：修正分类。\n"
         "4. 发送“奶龙图鉴”：查看最近收录的奶龙图。\n"
         "5. 发送“今日含奶量”：立即查看；"
         f"每天 {report_time.strftime('%H:%M')} 也会自动播报。"
@@ -262,7 +280,7 @@ def format_help_message(report_time: time) -> str:
 
 def format_catalog_caption(stats: CatalogStats, shown: int) -> str:
     return (
-        f"共收录 {stats.total} 张：奶龙 {stats.nailong} · 奶娃 {stats.naiwa}。"
+        f"共收录 {stats.total} 张：奶龙 {stats.nailong} · 奶蛙 {stats.naiwa}。"
         f"今日新增 {stats.today_new} 张，"
         f"当前展示最近 {shown} 张。"
     )
@@ -301,7 +319,7 @@ def format_chain_caption(observation: ObservationRecord) -> str:
         if observation.is_new_asset and observation.asset.origin == "collected":
             return f"奶龙接上了，新收录图鉴 #{observation.asset.id:04d}。"
         return "奶龙接上了。"
-    return "奶娃接上了。"
+    return "奶蛙接上了。"
 
 
 def format_existing_observation(
@@ -342,6 +360,29 @@ def parse_args() -> argparse.Namespace:
             )
         ),
     )
+    parser.add_argument(
+        "--catalog-document-id",
+        default=os.getenv("CATALOG_DOCUMENT_ID") or None,
+    )
+    parser.add_argument(
+        "--catalog-section-block-id",
+        default=os.getenv("CATALOG_SECTION_BLOCK_ID") or None,
+    )
+    parser.add_argument(
+        "--catalog-baseline-asset-ids",
+        type=parse_asset_ids,
+        default=parse_asset_ids(os.getenv("CATALOG_BASELINE_ASSET_IDS", "")),
+    )
+    parser.add_argument(
+        "--catalog-sync-retry-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "CATALOG_SYNC_RETRY_SECONDS",
+                str(DEFAULT_CATALOG_SYNC_RETRY_SECONDS),
+            )
+        ),
+    )
     return parser.parse_args()
 
 
@@ -369,6 +410,31 @@ async def run_bot(args: argparse.Namespace) -> None:
         security=SecurityConfig(mode="audit"),
     )
     chain_lock = asyncio.Lock()
+    catalog_sync_event = asyncio.Event()
+    catalog_sync_lock = asyncio.Lock()
+    catalog_document: CatalogDocumentClient | None = None
+    if bool(args.catalog_document_id) != bool(args.catalog_section_block_id):
+        raise RuntimeError(
+            "CATALOG_DOCUMENT_ID and CATALOG_SECTION_BLOCK_ID must be set together"
+        )
+    if args.catalog_document_id and args.catalog_section_block_id:
+        catalog_document = CatalogDocumentClient(
+            channel.client,
+            document_id=args.catalog_document_id,
+            section_block_id=args.catalog_section_block_id,
+        )
+        baseline_count = await asyncio.to_thread(
+            store.mark_catalog_document_baseline,
+            document_id=args.catalog_document_id,
+            asset_ids=args.catalog_baseline_asset_ids,
+        )
+        LOGGER.info(
+            "Catalog document sync enabled document_id=%s section_block_id=%s "
+            "baseline_inserted=%d",
+            args.catalog_document_id,
+            args.catalog_section_block_id,
+            baseline_count,
+        )
 
     async def reply(message, text: str):
         result = await channel.send(
@@ -435,7 +501,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         if corrected_label:
             reference_id = message.reply_to_message_id or _raw_parent_id(message)
             if not reference_id:
-                await reply(message, "请回复原图片或我的接龙图片，再发送“纠正为奶龙/奶娃/其他”。")
+                await reply(message, "请回复原图片或我的接龙图片，再发送“纠正为奶龙/奶蛙/其他”。")
                 return True
             correction = await asyncio.to_thread(
                 store.correct_label,
@@ -445,6 +511,8 @@ async def run_bot(args: argparse.Namespace) -> None:
             if not correction:
                 await reply(message, "没有找到这张图的识别记录，请重新发送图片后再纠正。")
                 return True
+            if catalog_document and correction.new_label in {"nailong", "naiwa"}:
+                catalog_sync_event.set()
             display_label = DISPLAY_LABELS[correction.new_label]
             if correction.old_label == correction.new_label:
                 text = f"已确认：图鉴 #{correction.asset_id:04d} 是{display_label}。"
@@ -555,6 +623,111 @@ async def run_bot(args: argparse.Namespace) -> None:
                 )
         return all_sent
 
+    async def sync_catalog_document_once() -> tuple[int, int]:
+        if not catalog_document or not args.catalog_document_id:
+            return 0, 0
+        synced_count = 0
+        failed_count = 0
+        async with catalog_sync_lock:
+            records = await asyncio.to_thread(
+                store.pending_catalog_document_sync,
+                document_id=args.catalog_document_id,
+                limit=100,
+            )
+            for record in records:
+                image_block_id = record.image_block_id
+                file_token = record.file_token
+                try:
+                    if not image_block_id:
+                        parent_block_id = record.parent_block_id
+                        if not parent_block_id:
+                            parent_block_id = (
+                                await catalog_document.resolve_target_column()
+                            )
+                            await asyncio.to_thread(
+                                store.mark_catalog_document_target_assigned,
+                                document_id=args.catalog_document_id,
+                                asset_id=record.asset.id,
+                                parent_block_id=parent_block_id,
+                            )
+                        image_block_id = await catalog_document.create_image_block(
+                            parent_block_id=parent_block_id,
+                            client_token=catalog_document.client_token(
+                                record.asset.sha256,
+                                "create-image-block",
+                            ),
+                        )
+                        await asyncio.to_thread(
+                            store.mark_catalog_document_block_created,
+                            document_id=args.catalog_document_id,
+                            asset_id=record.asset.id,
+                            image_block_id=image_block_id,
+                        )
+
+                    if not file_token:
+                        file_token = await catalog_document.upload_image(
+                            record.asset.path,
+                            image_block_id=image_block_id,
+                        )
+                        await asyncio.to_thread(
+                            store.mark_catalog_document_media_uploaded,
+                            document_id=args.catalog_document_id,
+                            asset_id=record.asset.id,
+                            image_block_id=image_block_id,
+                            file_token=file_token,
+                        )
+
+                    await catalog_document.replace_image(
+                        image_block_id=image_block_id,
+                        file_token=file_token,
+                        client_token=catalog_document.client_token(
+                            record.asset.sha256,
+                            "replace-image",
+                        ),
+                    )
+                    await asyncio.to_thread(
+                        store.mark_catalog_document_synced,
+                        document_id=args.catalog_document_id,
+                        asset_id=record.asset.id,
+                        image_block_id=image_block_id,
+                        file_token=file_token,
+                    )
+                    synced_count += 1
+                    LOGGER.info(
+                        "Catalog document image synced asset_id=%d block_id=%s",
+                        record.asset.id,
+                        image_block_id,
+                    )
+                except Exception as error:
+                    failed_count += 1
+                    await asyncio.to_thread(
+                        store.mark_catalog_document_sync_failed,
+                        document_id=args.catalog_document_id,
+                        asset_id=record.asset.id,
+                        error=str(error),
+                    )
+                    LOGGER.exception(
+                        "Catalog document sync failed asset_id=%d attempt=%d",
+                        record.asset.id,
+                        record.attempt_count + 1,
+                    )
+        return synced_count, failed_count
+
+    async def catalog_document_sync_loop() -> None:
+        if not catalog_document:
+            return
+        catalog_sync_event.set()
+
+        while True:
+            await catalog_sync_event.wait()
+            catalog_sync_event.clear()
+            synced_count, failed_count = await sync_catalog_document_once()
+            if synced_count:
+                catalog_sync_event.set()
+            if failed_count:
+                await asyncio.sleep(args.catalog_sync_retry_seconds)
+                catalog_sync_event.set()
+
     async def daily_report_loop() -> None:
         while not channel.connection_snapshot().ready:
             await asyncio.sleep(1)
@@ -634,6 +807,8 @@ async def run_bot(args: argparse.Namespace) -> None:
                 confidence=prediction.confidence,
                 accepted=prediction.accepted,
             )
+            if catalog_document:
+                catalog_sync_event.set()
             if not observation.is_new_observation:
                 LOGGER.info(
                     "Skipping duplicate message source_message_id=%s",
@@ -673,20 +848,31 @@ async def run_bot(args: argparse.Namespace) -> None:
     channel.on("reject", on_reject)
     LOGGER.info(
         "Starting bot with model=%s device=%s threshold=%.3f state_dir=%s "
-        "daily_report_time=%s",
+        "daily_report_time=%s catalog_document_sync=%s",
         args.model,
         predictor.device,
         predictor.threshold,
         args.state_dir,
         args.daily_report_time.strftime("%H:%M"),
+        bool(catalog_document),
     )
     report_task = asyncio.create_task(daily_report_loop())
+    catalog_sync_task = (
+        asyncio.create_task(catalog_document_sync_loop())
+        if catalog_document
+        else None
+    )
     try:
         await channel.connect()
     finally:
-        report_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await report_task
+        tasks = [report_task]
+        if catalog_sync_task:
+            tasks.append(catalog_sync_task)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 def main() -> None:

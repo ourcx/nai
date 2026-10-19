@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import sqlite3
 from datetime import datetime, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from nailong_classifier.bot import (
     is_help_command,
     is_help_request,
     media_response_mode,
+    parse_asset_ids,
     parse_correction_command,
     parse_daily_report_time,
 )
@@ -71,6 +73,38 @@ def test_hash_deduplicates_assets_and_message_events(tmp_path: Path) -> None:
     assert duplicate_event.is_new_observation is False
     assert duplicate_event.asset.seen_count == 2
     assert len(list((tmp_path / "assets").iterdir())) == 1
+
+
+def test_store_migrates_existing_catalog_document_sync_table(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(tmp_path / "bot.sqlite3") as connection:
+        connection.execute(
+            """
+            CREATE TABLE catalog_document_sync (
+                document_id TEXT NOT NULL,
+                asset_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                image_block_id TEXT,
+                file_token TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                synced_at TEXT,
+                PRIMARY KEY (document_id, asset_id)
+            )
+            """
+        )
+
+    BotStore(tmp_path)
+
+    with sqlite3.connect(tmp_path / "bot.sqlite3") as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(catalog_document_sync)"
+            ).fetchall()
+        }
+    assert "parent_block_id" in columns
 
 
 def test_chain_rotation_prefers_collected_assets_without_repeating(
@@ -243,15 +277,14 @@ def test_catalog_uses_collected_milk_assets_and_builds_multi_image_post(
     image_keys = [f"img_{index}" for index in range(len(assets))]
     post = build_catalog_post(assets, image_keys, stats)
 
-    assert stats.total == 3
+    assert stats.total == 2
     assert stats.nailong == 1
-    assert stats.naiwa == 2
-    assert stats.today_new == 3
-    assert len(assets) == 3
+    assert stats.naiwa == 1
+    assert stats.today_new == 2
+    assert len(assets) == 2
     assert all(asset.origin == "collected" for asset in assets)
     assert sorted(asset.label for asset in assets) == [
         "nailong",
-        "naiwa",
         "naiwa",
     ]
     assert post["zh_cn"]["title"] == "奶龙图鉴"
@@ -263,14 +296,100 @@ def test_catalog_uses_collected_milk_assets_and_builds_multi_image_post(
     ]
     assert post_images == image_keys
     assert format_catalog_caption(stats, len(assets)) == (
-        "共收录 3 张：奶龙 1 · 奶娃 2。"
-        "今日新增 3 张，当前展示最近 3 张。"
+        "共收录 2 张：奶龙 1 · 奶蛙 1。"
+        "今日新增 2 张，当前展示最近 2 张。"
     )
+
+
+def test_catalog_document_sync_tracks_baseline_and_resumes_stages(
+    tmp_path: Path,
+) -> None:
+    store = BotStore(tmp_path)
+    baseline = record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="baseline",
+        label="nailong",
+    ).asset
+    pending = record(
+        store,
+        make_image_bytes("pink"),
+        message_id="pending",
+        label="naiwa",
+    ).asset
+    other = record(
+        store,
+        make_image_bytes("gray"),
+        message_id="other",
+        label="other",
+    ).asset
+    document_id = "doc-a"
+
+    assert store.mark_catalog_document_baseline(
+        document_id=document_id,
+        asset_ids=[baseline.id, baseline.id],
+    ) == 1
+    assert store.mark_catalog_document_baseline(
+        document_id=document_id,
+        asset_ids=[baseline.id],
+    ) == 0
+
+    records = store.pending_catalog_document_sync(document_id=document_id)
+    assert [record.asset.id for record in records] == [pending.id]
+    assert records[0].status == "pending"
+
+    store.mark_catalog_document_target_assigned(
+        document_id=document_id,
+        asset_id=pending.id,
+        parent_block_id="column-a",
+    )
+    store.mark_catalog_document_block_created(
+        document_id=document_id,
+        asset_id=pending.id,
+        image_block_id="block-a",
+    )
+    records = store.pending_catalog_document_sync(document_id=document_id)
+    assert records[0].status == "block_created"
+    assert records[0].parent_block_id == "column-a"
+    assert records[0].image_block_id == "block-a"
+
+    store.mark_catalog_document_media_uploaded(
+        document_id=document_id,
+        asset_id=pending.id,
+        image_block_id="block-a",
+        file_token="file-a",
+    )
+    store.mark_catalog_document_sync_failed(
+        document_id=document_id,
+        asset_id=pending.id,
+        error="temporary error",
+    )
+    records = store.pending_catalog_document_sync(document_id=document_id)
+    assert records[0].status == "failed"
+    assert records[0].image_block_id == "block-a"
+    assert records[0].file_token == "file-a"
+    assert records[0].attempt_count == 1
+
+    store.mark_catalog_document_synced(
+        document_id=document_id,
+        asset_id=pending.id,
+        image_block_id="block-a",
+        file_token="file-a",
+    )
+    assert store.pending_catalog_document_sync(document_id=document_id) == []
+    assert store.catalog_document_sync_counts(document_id=document_id) == {
+        "baseline": 1,
+        "synced": 1,
+    }
+
+    store.correct_label("other", "naiwa")
+    records = store.pending_catalog_document_sync(document_id=document_id)
+    assert [record.asset.id for record in records] == [other.id]
 
 
 def test_commands_are_exact_and_support_correction_aliases() -> None:
     assert parse_correction_command("纠正为奶龙") == "nailong"
-    assert parse_correction_command("改成 奶娃") == "naiwa"
+    assert parse_correction_command("改成 奶蛙") == "naiwa"
     assert parse_correction_command("这是其他") == "other"
     assert parse_correction_command("帮我纠正为奶龙") is None
     assert is_daily_stats_command(" 今日含奶量 ") is True
@@ -289,6 +408,12 @@ def test_commands_are_exact_and_support_correction_aliases() -> None:
     assert parse_daily_report_time("23:55") == time(hour=23, minute=55)
     with pytest.raises(argparse.ArgumentTypeError):
         parse_daily_report_time("24:00")
+    assert parse_asset_ids("") == []
+    assert parse_asset_ids("3, 1,3") == [3, 1]
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_asset_ids("3,bad")
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_asset_ids("0")
     assert (
         media_response_mode(
             mentioned_bot=True,
@@ -364,7 +489,7 @@ def test_uncorrected_duplicate_keeps_the_model_uncertainty_message(tmp_path: Pat
     assert first.is_new_observation is True
     assert duplicate.is_new_observation is False
     assert format_existing_observation(duplicate, prediction) == (
-        "我不太确定。最高候选是「奶娃」，置信度 60.0%。"
+        "我不太确定。最高候选是「奶蛙」，置信度 60.0%。"
     )
 
 

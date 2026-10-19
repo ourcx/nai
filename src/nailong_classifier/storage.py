@@ -87,6 +87,16 @@ class DailyReportTarget:
     report_day: str
 
 
+@dataclass(frozen=True)
+class CatalogDocumentSyncRecord:
+    asset: AssetRecord
+    status: str
+    parent_block_id: str | None
+    image_block_id: str | None
+    file_token: str | None
+    attempt_count: int
+
+
 class BotStore:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -171,8 +181,38 @@ class BotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_chain_replies_rotation
                 ON chain_replies(chat_hash, label, asset_id, sent_at);
+
+                CREATE TABLE IF NOT EXISTS catalog_document_sync (
+                    document_id TEXT NOT NULL,
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    status TEXT NOT NULL,
+                    parent_block_id TEXT,
+                    image_block_id TEXT,
+                    file_token TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL,
+                    synced_at TEXT,
+                    PRIMARY KEY (document_id, asset_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_catalog_document_sync_status
+                ON catalog_document_sync(document_id, status, updated_at);
                 """
             )
+            sync_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(catalog_document_sync)"
+                ).fetchall()
+            }
+            if "parent_block_id" not in sync_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE catalog_document_sync
+                    ADD COLUMN parent_block_id TEXT
+                    """
+                )
 
     @staticmethod
     def _image_suffix(image_bytes: bytes) -> str:
@@ -600,7 +640,10 @@ class BotStore:
             counts = connection.execute(
                 """
                 WITH latest_predictions AS (
-                    SELECT observations.asset_id, observations.predicted_label
+                    SELECT
+                        observations.asset_id,
+                        observations.predicted_label,
+                        observations.accepted
                     FROM observations
                     JOIN (
                         SELECT asset_id, MAX(id) AS latest_id
@@ -615,7 +658,9 @@ class BotStore:
                         assets.first_seen_day,
                         CASE
                             WHEN assets.corrected = 1 THEN assets.label
-                            ELSE latest_predictions.predicted_label
+                            WHEN latest_predictions.accepted = 1
+                                THEN latest_predictions.predicted_label
+                            ELSE 'other'
                         END AS catalog_label
                     FROM assets
                     LEFT JOIN latest_predictions
@@ -650,7 +695,10 @@ class BotStore:
             rows = connection.execute(
                 """
                 WITH latest_predictions AS (
-                    SELECT observations.asset_id, observations.predicted_label
+                    SELECT
+                        observations.asset_id,
+                        observations.predicted_label,
+                        observations.accepted
                     FROM observations
                     JOIN (
                         SELECT asset_id, MAX(id) AS latest_id
@@ -664,7 +712,9 @@ class BotStore:
                         assets.*,
                         CASE
                             WHEN assets.corrected = 1 THEN assets.label
-                            ELSE latest_predictions.predicted_label
+                            WHEN latest_predictions.accepted = 1
+                                THEN latest_predictions.predicted_label
+                            ELSE 'other'
                         END AS catalog_label
                     FROM assets
                     LEFT JOIN latest_predictions
@@ -682,6 +732,255 @@ class BotStore:
             self._asset_from_row(row, label_column="catalog_label")
             for row in rows
         ]
+
+    def mark_catalog_document_baseline(
+        self,
+        *,
+        document_id: str,
+        asset_ids: list[int],
+    ) -> int:
+        if not asset_ids:
+            return 0
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        inserted = 0
+        with self._connect() as connection:
+            for asset_id in dict.fromkeys(asset_ids):
+                cursor = connection.execute(
+                    """
+                    INSERT INTO catalog_document_sync (
+                        document_id, asset_id, status, updated_at, synced_at
+                    )
+                    SELECT ?, assets.id, 'baseline', ?, ?
+                    FROM assets
+                    WHERE assets.id = ?
+                    ON CONFLICT(document_id, asset_id) DO NOTHING
+                    """,
+                    (document_id, now, now, asset_id),
+                )
+                inserted += cursor.rowcount
+        return inserted
+
+    def pending_catalog_document_sync(
+        self,
+        *,
+        document_id: str,
+        limit: int = 25,
+    ) -> list[CatalogDocumentSyncRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH latest_predictions AS (
+                    SELECT
+                        observations.asset_id,
+                        observations.predicted_label,
+                        observations.accepted
+                    FROM observations
+                    JOIN (
+                        SELECT asset_id, MAX(id) AS latest_id
+                        FROM observations
+                        GROUP BY asset_id
+                    ) AS latest
+                      ON latest.latest_id = observations.id
+                ),
+                catalog_candidates AS (
+                    SELECT
+                        assets.*,
+                        CASE
+                            WHEN assets.corrected = 1 THEN assets.label
+                            WHEN latest_predictions.accepted = 1
+                                THEN latest_predictions.predicted_label
+                            ELSE 'other'
+                        END AS catalog_label
+                    FROM assets
+                    LEFT JOIN latest_predictions
+                      ON latest_predictions.asset_id = assets.id
+                    WHERE assets.origin = 'collected'
+                )
+                SELECT
+                    catalog_candidates.*,
+                    catalog_document_sync.status AS sync_status,
+                    catalog_document_sync.parent_block_id,
+                    catalog_document_sync.image_block_id,
+                    catalog_document_sync.file_token,
+                    catalog_document_sync.attempt_count
+                FROM catalog_candidates
+                LEFT JOIN catalog_document_sync
+                  ON catalog_document_sync.asset_id = catalog_candidates.id
+                 AND catalog_document_sync.document_id = ?
+                WHERE catalog_candidates.catalog_label IN ('nailong', 'naiwa')
+                  AND (
+                      catalog_document_sync.status IS NULL
+                      OR catalog_document_sync.status NOT IN ('baseline', 'synced')
+                  )
+                ORDER BY catalog_candidates.first_seen_at, catalog_candidates.id
+                LIMIT ?
+                """,
+                (document_id, limit),
+            ).fetchall()
+        return [
+            CatalogDocumentSyncRecord(
+                asset=self._asset_from_row(row, label_column="catalog_label"),
+                status=row["sync_status"] or "pending",
+                parent_block_id=row["parent_block_id"],
+                image_block_id=row["image_block_id"],
+                file_token=row["file_token"],
+                attempt_count=row["attempt_count"] or 0,
+            )
+            for row in rows
+        ]
+
+    def mark_catalog_document_target_assigned(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        parent_block_id: str,
+    ) -> None:
+        self._upsert_catalog_document_sync(
+            document_id=document_id,
+            asset_id=asset_id,
+            status="target_assigned",
+            parent_block_id=parent_block_id,
+        )
+
+    def mark_catalog_document_block_created(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        image_block_id: str,
+    ) -> None:
+        self._upsert_catalog_document_sync(
+            document_id=document_id,
+            asset_id=asset_id,
+            status="block_created",
+            image_block_id=image_block_id,
+        )
+
+    def mark_catalog_document_media_uploaded(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        image_block_id: str,
+        file_token: str,
+    ) -> None:
+        self._upsert_catalog_document_sync(
+            document_id=document_id,
+            asset_id=asset_id,
+            status="media_uploaded",
+            image_block_id=image_block_id,
+            file_token=file_token,
+        )
+
+    def mark_catalog_document_synced(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        image_block_id: str,
+        file_token: str,
+    ) -> None:
+        self._upsert_catalog_document_sync(
+            document_id=document_id,
+            asset_id=asset_id,
+            status="synced",
+            image_block_id=image_block_id,
+            file_token=file_token,
+            synced=True,
+        )
+
+    def mark_catalog_document_sync_failed(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        error: str,
+    ) -> None:
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO catalog_document_sync (
+                    document_id, asset_id, status, attempt_count,
+                    last_error, updated_at
+                )
+                VALUES (?, ?, 'failed', 1, ?, ?)
+                ON CONFLICT(document_id, asset_id) DO UPDATE SET
+                    status = 'failed',
+                    attempt_count = catalog_document_sync.attempt_count + 1,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (document_id, asset_id, error[:2000], now),
+            )
+
+    def catalog_document_sync_counts(self, *, document_id: str) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM catalog_document_sync
+                WHERE document_id = ?
+                GROUP BY status
+                """,
+                (document_id,),
+            ).fetchall()
+        return {row["status"]: row["count"] for row in rows}
+
+    def _upsert_catalog_document_sync(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        status: str,
+        parent_block_id: str | None = None,
+        image_block_id: str | None = None,
+        file_token: str | None = None,
+        synced: bool = False,
+    ) -> None:
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        synced_at = now if synced else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO catalog_document_sync (
+                    document_id, asset_id, status, parent_block_id, image_block_id,
+                    file_token, updated_at, synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, asset_id) DO UPDATE SET
+                    status = excluded.status,
+                    parent_block_id = COALESCE(
+                        excluded.parent_block_id,
+                        catalog_document_sync.parent_block_id
+                    ),
+                    image_block_id = COALESCE(
+                        excluded.image_block_id,
+                        catalog_document_sync.image_block_id
+                    ),
+                    file_token = COALESCE(
+                        excluded.file_token,
+                        catalog_document_sync.file_token
+                    ),
+                    last_error = NULL,
+                    updated_at = excluded.updated_at,
+                    synced_at = COALESCE(
+                        excluded.synced_at,
+                        catalog_document_sync.synced_at
+                    )
+                """,
+                (
+                    document_id,
+                    asset_id,
+                    status,
+                    parent_block_id,
+                    image_block_id,
+                    file_token,
+                    now,
+                    synced_at,
+                ),
+            )
 
     def _asset_from_row(
         self,

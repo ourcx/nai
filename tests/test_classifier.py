@@ -110,7 +110,7 @@ def test_prediction_message_handles_rejection() -> None:
         scores={"nailong": 0.31, "naiwa": 0.52, "other": 0.17},
     )
 
-    assert format_prediction(prediction) == "我不太确定。最高候选是「奶娃」，置信度 52.0%。"
+    assert format_prediction(prediction) == "我不太确定。最高候选是「奶蛙」，置信度 52.0%。"
 
 
 def test_quoted_image_key_is_found_in_message_body() -> None:
