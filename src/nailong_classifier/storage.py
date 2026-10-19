@@ -12,7 +12,12 @@ from zoneinfo import ZoneInfo
 
 from PIL import Image
 
+from .image_fingerprint import try_content_hash
+from .rarity import Rarity, classify_rarity
+
 LABELS = {"nailong", "naiwa", "other"}
+# 盲盒猜图只在奶龙/奶蛙之间出题，“其他”不作为可猜答案。
+GUESS_LABELS = {"nailong", "naiwa"}
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 FORMAT_SUFFIXES = {
     "GIF": ".gif",
@@ -97,6 +102,38 @@ class CatalogDocumentSyncRecord:
     attempt_count: int
 
 
+@dataclass(frozen=True)
+class GuessRound:
+    """一局盲盒猜图：出题的图鉴图、正确答案和开局时间。"""
+
+    id: int
+    asset: AssetRecord
+    answer: str
+    started_at: str
+
+
+@dataclass(frozen=True)
+class GuessResult:
+    """一次抢答的结果。first_correct 为 True 表示这是本局第一个答对、拿分的人。"""
+
+    round_id: int
+    answer: str
+    correct: bool
+    first_correct: bool
+    already_settled: bool
+    winner_hash: str | None
+
+
+@dataclass(frozen=True)
+class GuessRanking:
+    """猜图积分榜上的一行：玩家名、答对次数、积分。"""
+
+    sender_hash: str
+    display_name: str
+    wins: int
+    score: int
+
+
 class BotStore:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -131,7 +168,10 @@ class BotStore:
                     last_seen_at TEXT NOT NULL,
                     seen_count INTEGER NOT NULL DEFAULT 1,
                     corrected INTEGER NOT NULL DEFAULT 0,
-                    origin TEXT NOT NULL DEFAULT 'collected'
+                    origin TEXT NOT NULL DEFAULT 'collected',
+                    -- 感知指纹：同一张表情不同版本的 phash 相近，用来数“撞脸数”算稀有度。
+                    -- 为空表示这张图解析不了，统计时跳过。
+                    phash TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS observations (
@@ -208,6 +248,33 @@ class BotStore:
                     recorded_at TEXT NOT NULL,
                     PRIMARY KEY (document_id, file_token)
                 );
+
+                -- 盲盒猜图：每局记录出的图鉴图、正确答案、是否已被抢答，以及第一个答对的人。
+                -- winner_hash 非空即代表本局已结算，后来的答对者不再加分。
+                CREATE TABLE IF NOT EXISTS guess_rounds (
+                    id INTEGER PRIMARY KEY,
+                    chat_hash TEXT NOT NULL,
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    answer TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    settled_at TEXT,
+                    winner_hash TEXT,
+                    winner_name TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_guess_rounds_open
+                ON guess_rounds(chat_hash, settled_at);
+
+                -- 猜图积分：按群聊 + 玩家累计答对次数，每答对一次 +1 分。
+                CREATE TABLE IF NOT EXISTS guess_scores (
+                    chat_hash TEXT NOT NULL,
+                    sender_hash TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    wins INTEGER NOT NULL DEFAULT 0,
+                    score INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_hash, sender_hash)
+                );
                 """
             )
             sync_columns = {
@@ -229,6 +296,31 @@ class BotStore:
                     ALTER TABLE catalog_document_sync
                     ADD COLUMN duplicate_of TEXT
                     """
+                )
+            asset_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(assets)").fetchall()
+            }
+            if "phash" not in asset_columns:
+                connection.execute("ALTER TABLE assets ADD COLUMN phash TEXT")
+        # 老库新增 phash 列后为存量图回填一次指纹，让稀有度统计立刻可用。
+        self._backfill_phashes()
+
+    def _backfill_phashes(self) -> None:
+        """为还没算过感知指纹的图补算一次。解析不了的图写入空串占位，避免每次启动反复重试。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, file_name FROM assets WHERE phash IS NULL"
+            ).fetchall()
+            for row in rows:
+                path = self.assets_dir / row["file_name"]
+                try:
+                    phash = try_content_hash(path.read_bytes())
+                except OSError:
+                    phash = None
+                connection.execute(
+                    "UPDATE assets SET phash = ? WHERE id = ?",
+                    (phash or "", row["id"]),
                 )
 
     @staticmethod
@@ -252,18 +344,20 @@ class BotStore:
         self._validate_label(label)
         digest = hashlib.sha256(image_bytes).hexdigest()
         file_name = self._write_asset(image_bytes, digest)
+        phash = try_content_hash(image_bytes) or ""
         now = datetime.now(LOCAL_TIMEZONE).isoformat()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO assets (
                     sha256, label, confidence, file_name, first_seen_at,
-                    first_seen_day, last_seen_at, seen_count, corrected, origin
+                    first_seen_day, last_seen_at, seen_count, corrected, origin,
+                    phash
                 )
-                VALUES (?, ?, 1.0, ?, ?, NULL, ?, 0, 1, 'seed')
+                VALUES (?, ?, 1.0, ?, ?, NULL, ?, 0, 1, 'seed', ?)
                 ON CONFLICT(sha256) DO NOTHING
                 """,
-                (digest, label, file_name, now, now),
+                (digest, label, file_name, now, now, phash),
             )
             row = connection.execute(
                 "SELECT * FROM assets WHERE sha256 = ?",
@@ -289,6 +383,7 @@ class BotStore:
         day = now.date().isoformat()
         digest = hashlib.sha256(image_bytes).hexdigest()
         file_name = self._write_asset(image_bytes, digest)
+        phash = try_content_hash(image_bytes) or ""
         chat_hash = self.identity_hash(chat_id)
         sender_hash = self.identity_hash(sender_id)
         final_label = predicted_label if accepted else "other"
@@ -333,9 +428,10 @@ class BotStore:
                 """
                 INSERT INTO assets (
                     sha256, label, confidence, file_name, first_seen_at,
-                    first_seen_day, last_seen_at, seen_count, corrected, origin
+                    first_seen_day, last_seen_at, seen_count, corrected, origin,
+                    phash
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 'collected')
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 'collected', ?)
                 ON CONFLICT(sha256) DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
                     seen_count = assets.seen_count + 1,
@@ -346,6 +442,11 @@ class BotStore:
                     confidence = CASE
                         WHEN assets.corrected = 1 THEN assets.confidence
                         ELSE excluded.confidence
+                    END,
+                    phash = CASE
+                        WHEN assets.phash IS NULL OR assets.phash = ''
+                        THEN excluded.phash
+                        ELSE assets.phash
                     END
                 """,
                 (
@@ -356,6 +457,7 @@ class BotStore:
                     now_iso,
                     day,
                     now_iso,
+                    phash,
                 ),
             )
             asset_row = connection.execute(
@@ -747,6 +849,240 @@ class BotStore:
             ).fetchall()
         return [
             self._asset_from_row(row, label_column="catalog_label")
+            for row in rows
+        ]
+
+    def asset_rarity(self, asset_id: int) -> Rarity | None:
+        """按这张图在群里被发送的累计次数（seen_count）评定稀有度。
+
+        发得越多越烂大街，发得少才稀有。拿不到这张图时返回 None。
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT seen_count FROM assets WHERE id = ?",
+                (asset_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return classify_rarity(max(1, int(row["seen_count"])))
+
+    def start_guess_round(self, *, chat_id: str) -> GuessRound | None:
+        """开一局盲盒猜图：从入典的奶龙/奶蛙图里随机抽一张当题目。没有可用图时返回 None。"""
+        chat_hash = self.identity_hash(chat_id)
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                WITH latest_predictions AS (
+                    SELECT
+                        observations.asset_id,
+                        observations.predicted_label,
+                        observations.accepted
+                    FROM observations
+                    JOIN (
+                        SELECT asset_id, MAX(id) AS latest_id
+                        FROM observations
+                        GROUP BY asset_id
+                    ) AS latest
+                      ON latest.latest_id = observations.id
+                ),
+                catalog_candidates AS (
+                    SELECT
+                        assets.*,
+                        CASE
+                            WHEN assets.corrected = 1 THEN assets.label
+                            WHEN latest_predictions.accepted = 1
+                                THEN latest_predictions.predicted_label
+                            ELSE 'other'
+                        END AS catalog_label
+                    FROM assets
+                    LEFT JOIN latest_predictions
+                      ON latest_predictions.asset_id = assets.id
+                    WHERE assets.origin = 'collected'
+                )
+                SELECT * FROM catalog_candidates
+                WHERE catalog_label IN ('nailong', 'naiwa')
+                ORDER BY RANDOM()
+                LIMIT 1
+                """,
+            ).fetchone()
+            if not row:
+                return None
+            asset = self._asset_from_row(row, label_column="catalog_label")
+            cursor = connection.execute(
+                """
+                INSERT INTO guess_rounds (
+                    chat_hash, asset_id, answer, started_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_hash, asset.id, asset.label, now),
+            )
+            round_id = int(cursor.lastrowid)
+        return GuessRound(
+            id=round_id,
+            asset=asset,
+            answer=asset.label,
+            started_at=now,
+        )
+
+    def open_guess_round(self, *, chat_id: str) -> GuessRound | None:
+        """返回该群当前未结算的最新一局；没有则返回 None。"""
+        chat_hash = self.identity_hash(chat_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT guess_rounds.id AS round_id, guess_rounds.answer,
+                       guess_rounds.started_at, assets.*
+                FROM guess_rounds
+                JOIN assets ON assets.id = guess_rounds.asset_id
+                WHERE guess_rounds.chat_hash = ?
+                  AND guess_rounds.settled_at IS NULL
+                ORDER BY guess_rounds.id DESC
+                LIMIT 1
+                """,
+                (chat_hash,),
+            ).fetchone()
+            if not row:
+                return None
+        return GuessRound(
+            id=row["round_id"],
+            asset=self._asset_from_row(row),
+            answer=row["answer"],
+            started_at=row["started_at"],
+        )
+
+    def close_guess_round(self, *, round_id: int) -> bool:
+        """公布答案时关掉一局但不给任何人加分。返回是否确实关掉了一局未结算的局。"""
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE guess_rounds
+                SET settled_at = ?
+                WHERE id = ? AND settled_at IS NULL
+                """,
+                (now, round_id),
+            )
+        return updated.rowcount == 1
+
+    def settle_guess_round(
+        self,
+        *,
+        chat_id: str,
+        guess: str,
+        sender_id: str,
+        display_name: str,
+    ) -> GuessResult | None:
+        """对该群未结算的最新一局判定一次抢答。
+
+        第一个答对的人拿分并结算本局；之后再答对只回复“已被抢答”。
+        没有进行中的局时返回 None。并发时靠 UPDATE ... WHERE settled_at IS NULL 保证只有一人结算。
+        """
+        self._validate_label(guess)
+        chat_hash = self.identity_hash(chat_id)
+        sender_hash = self.identity_hash(sender_id)
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT id, answer, winner_hash
+                FROM guess_rounds
+                WHERE chat_hash = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (chat_hash,),
+            ).fetchone()
+            if not current:
+                return None
+            if current["winner_hash"] is not None:
+                return GuessResult(
+                    round_id=current["id"],
+                    answer=current["answer"],
+                    correct=guess == current["answer"],
+                    first_correct=False,
+                    already_settled=True,
+                    winner_hash=current["winner_hash"],
+                )
+
+            answer = current["answer"]
+            if guess != answer:
+                return GuessResult(
+                    round_id=current["id"],
+                    answer=answer,
+                    correct=False,
+                    first_correct=False,
+                    already_settled=False,
+                    winner_hash=None,
+                )
+
+            updated = connection.execute(
+                """
+                UPDATE guess_rounds
+                SET settled_at = ?, winner_hash = ?, winner_name = ?
+                WHERE id = ? AND settled_at IS NULL
+                """,
+                (now, sender_hash, display_name, current["id"]),
+            )
+            if updated.rowcount != 1:
+                # 竞态：别人已经先结算了这一局，这次不再加分。
+                winner = connection.execute(
+                    "SELECT winner_hash FROM guess_rounds WHERE id = ?",
+                    (current["id"],),
+                ).fetchone()
+                return GuessResult(
+                    round_id=current["id"],
+                    answer=answer,
+                    correct=True,
+                    first_correct=False,
+                    already_settled=True,
+                    winner_hash=winner["winner_hash"] if winner else None,
+                )
+            connection.execute(
+                """
+                INSERT INTO guess_scores (
+                    chat_hash, sender_hash, display_name, wins, score, updated_at
+                )
+                VALUES (?, ?, ?, 1, 1, ?)
+                ON CONFLICT(chat_hash, sender_hash) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    wins = guess_scores.wins + 1,
+                    score = guess_scores.score + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_hash, sender_hash, display_name, now),
+            )
+        return GuessResult(
+            round_id=current["id"],
+            answer=answer,
+            correct=True,
+            first_correct=True,
+            already_settled=False,
+            winner_hash=sender_hash,
+        )
+
+    def guess_ranking(self, *, chat_id: str, limit: int = 10) -> list[GuessRanking]:
+        """该群的猜图积分榜，按积分降序。"""
+        chat_hash = self.identity_hash(chat_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sender_hash, display_name, wins, score
+                FROM guess_scores
+                WHERE chat_hash = ?
+                ORDER BY score DESC, wins DESC, updated_at ASC
+                LIMIT ?
+                """,
+                (chat_hash, limit),
+            ).fetchall()
+        return [
+            GuessRanking(
+                sender_hash=row["sender_hash"],
+                display_name=row["display_name"],
+                wins=row["wins"],
+                score=row["score"],
+            )
             for row in rows
         ]
 

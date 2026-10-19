@@ -8,7 +8,7 @@ import os
 import re
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,14 +17,20 @@ from lark_channel.channel.types import MediaSource, ReplyRef
 from lark_channel.core import LogLevel
 
 from .catalog_document import CatalogDocumentClient
+from .contact import ContactResolver
 from .image_fingerprint import find_duplicate, try_content_hash, try_file_content_hash
 from .model import NailongPredictor, Prediction
+from .puzzle import try_make_puzzle_image
+from .rarity import Rarity
 from .storage import (
     LOCAL_TIMEZONE,
     AssetRecord,
     BotStore,
     CatalogStats,
     DailyStats,
+    GuessRanking,
+    GuessResult,
+    GuessRound,
     ObservationRecord,
 )
 
@@ -41,8 +47,15 @@ COMMAND_LABELS = {
     "奶蛙": "naiwa",
     "其他": "other",
 }
+# 猜图抢答：只在奶龙/奶蛙之间二选一，所以答案词表不含“其他”。
+GUESS_ANSWER_LABELS = {
+    "奶龙": "nailong",
+    "奶蛙": "naiwa",
+}
 DEFAULT_DAILY_REPORT_TIME = time(hour=23, minute=55)
 DEFAULT_CATALOG_SYNC_RETRY_SECONDS = 60
+# 每日播报的轮询间隔：每分钟看一眼是否过了播报点，错过或重启都能靠下一次轮询补上。
+DAILY_REPORT_POLL_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -196,6 +209,53 @@ def format_prediction(prediction: Prediction) -> str:
     return f"识别结果：{display_label}。置信度 {confidence}。"
 
 
+def milk_concentration(prediction: Prediction) -> int:
+    """把「奶龙 + 奶蛙」两类概率之和当作这张图的奶含量，取 0~100 的整数。
+
+    用两类之和而不是单一置信度，是为了让“偏奶但两类拿不准”的图也能有高浓度读数。
+    """
+    milk = prediction.scores.get("nailong", 0.0) + prediction.scores.get("naiwa", 0.0)
+    return max(0, min(100, round(milk * 100)))
+
+
+def format_concentration(prediction: Prediction) -> str:
+    """奶龙浓度检测仪：把识别置信度包装成一句分级吐槽，仅用于 @机器人 的娱乐回复。"""
+    percent = milk_concentration(prediction)
+    display_label = DISPLAY_LABELS.get(prediction.label, prediction.label)
+    if percent >= 90:
+        verdict = f"纯度爆表！纯正{display_label}血统，建议立刻收藏。"
+    elif percent >= 65:
+        verdict = f"奶味浓郁，{display_label}认证通过。"
+    elif percent >= 40:
+        verdict = "有点奶，但不够纯，再加把劲。"
+    else:
+        verdict = "查无此奶，这含量约等于清水。"
+    return f"🥛 奶龙浓度检测仪\n本图奶含量 {percent}%\n{verdict}"
+
+
+def format_rarity(rarity: Rarity) -> str:
+    """把稀有度评级拼成一行展示，附带这张图在群里出现过多少次。"""
+    return (
+        f"稀有度：{rarity.stars_text} {rarity.name}"
+        f"（{rarity.note}，群里出现过 {rarity.seen_count} 次）"
+    )
+
+
+def format_mention_reply(
+    observation: ObservationRecord,
+    prediction: Prediction,
+    rarity: Rarity | None,
+) -> str:
+    """@机器人识别一张图时的完整回复：识别结论 + 奶龙浓度，奶图再附稀有度。
+
+    识别结论沿用既有文案（已确认图/模型不确定提示都不变），浓度和稀有度作为附加娱乐信息。
+    """
+    lines = [format_existing_observation(observation, prediction), format_concentration(prediction)]
+    if rarity is not None:
+        lines.append(format_rarity(rarity))
+    return "\n".join(lines)
+
+
 def parse_correction_command(text: str) -> str | None:
     match = CORRECTION_PATTERN.fullmatch(text.strip())
     return COMMAND_LABELS[match.group(1)] if match else None
@@ -215,6 +275,72 @@ def is_help_command(text: str) -> bool:
 
 def is_help_request(text: str, *, mentioned_bot: bool) -> bool:
     return mentioned_bot and is_help_command(text)
+
+
+def is_guess_start_command(text: str) -> bool:
+    return text.strip() in {"猜图", "盲盒猜图", "来一局", "猜一猜"}
+
+
+def is_guess_reveal_command(text: str) -> bool:
+    return text.strip() in {"公布答案", "揭晓答案", "公布"}
+
+
+def is_guess_ranking_command(text: str) -> bool:
+    return text.strip() in {"猜图榜", "猜图排行榜", "猜图积分榜"}
+
+
+GUESS_ANSWER_PATTERN = re.compile(r"^(?:猜|是|答案是?)?\s*(奶龙|奶蛙)$")
+
+
+def parse_guess_answer(text: str) -> str | None:
+    """把「奶龙」「猜奶蛙」「是奶龙」这类抢答解析成内部标签，其它文本返回 None。"""
+    match = GUESS_ANSWER_PATTERN.fullmatch(text.strip())
+    return GUESS_ANSWER_LABELS[match.group(1)] if match else None
+
+
+def format_guess_prompt() -> str:
+    return (
+        "🎲 盲盒猜图开始！\n"
+        "这是打了码的局部，猜猜它是奶龙还是奶蛙？"
+        "直接发「奶龙」或「奶蛙」抢答，首答对者得 1 分。"
+    )
+
+
+def format_guess_correct(result: GuessResult, display_name: str) -> str:
+    answer = DISPLAY_LABELS.get(result.answer, result.answer)
+    return f"🎉 {display_name} 抢答正确！答案是{answer}，积 1 分。发「猜图」再来一局。"
+
+
+def format_guess_wrong() -> str:
+    return "答错了，再想想～（答案保密，让别人也猜猜）"
+
+
+def format_guess_already_settled() -> str:
+    return "这一局已经被抢答啦，发「猜图」开新的一局。"
+
+
+def format_guess_no_assets() -> str:
+    return "图鉴里还没有可用的奶图，先让大家多发几张再来玩吧。"
+
+
+def format_guess_reveal(round_: GuessRound) -> str:
+    answer = DISPLAY_LABELS.get(round_.answer, round_.answer)
+    return f"本局答案揭晓：这是{answer}（图鉴 #{round_.asset.id:04d}）。发「猜图」开新的一局。"
+
+
+def format_guess_no_open_round() -> str:
+    return "现在没有进行中的猜图，发「猜图」开一局吧。"
+
+
+def format_guess_ranking(rankings: list[GuessRanking]) -> str:
+    if not rankings:
+        return "还没有人上榜，发「猜图」开一局，抢答得分。"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 猜图积分榜"]
+    for index, ranking in enumerate(rankings):
+        prefix = medals[index] if index < len(medals) else f"{index + 1}."
+        lines.append(f"{prefix} {ranking.display_name}：{ranking.score} 分")
+    return "\n".join(lines)
 
 
 def parse_daily_report_time(value: str) -> time:
@@ -276,11 +402,13 @@ def format_help_message(report_time: time) -> str:
     return (
         "我是奶龙，可以这样玩：\n"
         "1. 直接发送图片或表情：自动接龙，不用 @。\n"
-        "2. 回复图片并 @我：查看文字识别结果。\n"
+        "2. 回复图片并 @我：查看识别结果、奶龙浓度和稀有度。\n"
         "3. 回复原图或接龙图，发送“纠正为奶龙/奶蛙/其他”：修正分类。\n"
         "4. 发送“奶龙图鉴”：查看最近收录的奶龙图。\n"
         "5. 发送“今日含奶量”：立即查看；"
-        f"每天 {report_time.strftime('%H:%M')} 也会自动播报。"
+        f"每天 {report_time.strftime('%H:%M')} 也会自动播报。\n"
+        "6. 发送“猜图”：开一局盲盒猜图，抢答“奶龙/奶蛙”得分；"
+        "“公布答案”揭晓本局，“猜图榜”看积分排行。"
     )
 
 
@@ -416,6 +544,8 @@ async def run_bot(args: argparse.Namespace) -> None:
         security=SecurityConfig(mode="audit"),
     )
     chain_lock = asyncio.Lock()
+    guess_lock = asyncio.Lock()
+    contact_resolver = ContactResolver(channel.client)
     catalog_sync_event = asyncio.Event()
     catalog_sync_lock = asyncio.Lock()
     catalog_document: CatalogDocumentClient | None = None
@@ -545,7 +675,92 @@ async def run_bot(args: argparse.Namespace) -> None:
             await reply_catalog(message, assets, stats)
             return True
 
+        if is_guess_start_command(text):
+            await start_guess(message)
+            return True
+
+        if is_guess_reveal_command(text):
+            async with guess_lock:
+                round_ = await asyncio.to_thread(
+                    store.open_guess_round,
+                    chat_id=message.chat_id,
+                )
+                if round_:
+                    await asyncio.to_thread(
+                        store.close_guess_round,
+                        round_id=round_.id,
+                    )
+            if not round_:
+                await reply(message, format_guess_no_open_round())
+                return True
+            await reply(message, format_guess_reveal(round_))
+            return True
+
+        if is_guess_ranking_command(text):
+            rankings = await asyncio.to_thread(
+                store.guess_ranking,
+                chat_id=message.chat_id,
+            )
+            await reply(message, format_guess_ranking(rankings))
+            return True
+
+        guess_label = parse_guess_answer(text)
+        if guess_label and not message.mentioned_bot:
+            await settle_guess(message, guess_label)
+            return True
+
         return False
+
+    async def start_guess(message) -> None:
+        async with guess_lock:
+            round_ = await asyncio.to_thread(
+                store.start_guess_round,
+                chat_id=message.chat_id,
+            )
+        if not round_:
+            await reply(message, format_guess_no_assets())
+            return
+        # 出题只露原图的一块局部，放大后发出来；裁剪失败（图损坏等）才回退发完整图。
+        puzzle = await asyncio.to_thread(
+            try_make_puzzle_image,
+            round_.asset.path.read_bytes(),
+        )
+        if puzzle is not None:
+            await reply_image(message, puzzle, format_guess_prompt())
+        else:
+            await reply_image(message, round_.asset.path, format_guess_prompt())
+
+    async def settle_guess(message, guess_label: str) -> None:
+        # 群消息常拿不到 sender_name，为空时按 open_id 反查通讯录真名，兜底“神秘奶友”。
+        display_name = message.sender_name
+        if not display_name:
+            display_name = await contact_resolver.resolve(message.sender_id)
+        async with guess_lock:
+            round_ = await asyncio.to_thread(
+                store.open_guess_round,
+                chat_id=message.chat_id,
+            )
+            result = await asyncio.to_thread(
+                store.settle_guess_round,
+                chat_id=message.chat_id,
+                guess=guess_label,
+                sender_id=message.sender_id,
+                display_name=display_name,
+            )
+        if result is None:
+            # 没有进行中的局，静默忽略，避免把群聊里正常的“奶龙/奶蛙”闲聊都怼回去。
+            return
+        if result.first_correct:
+            # 答对后亮出完整原图，让大家看清这局到底是哪张。
+            caption = format_guess_correct(result, display_name)
+            if round_:
+                await reply_image(message, round_.asset.path, caption)
+            else:
+                await reply(message, caption)
+        elif result.already_settled:
+            await reply(message, format_guess_already_settled())
+        elif not result.correct:
+            await reply(message, format_guess_wrong())
 
     async def continue_chain(
         message,
@@ -583,6 +798,16 @@ async def run_bot(args: argparse.Namespace) -> None:
                     asset_id=reply_asset.id,
                     response_message_id=result.message_id,
                 )
+
+    async def build_mention_reply(
+        observation: ObservationRecord,
+        prediction: Prediction,
+    ) -> str:
+        # 稀有度只对真正入典的奶龙/奶蛙图有意义，“其他”不算稀有度。
+        rarity = None
+        if observation.asset.label in {"nailong", "naiwa"}:
+            rarity = await asyncio.to_thread(store.asset_rarity, observation.asset.id)
+        return format_mention_reply(observation, prediction, rarity)
 
     async def send_pending_daily_reports(report_day: str) -> bool:
         targets = await asyncio.to_thread(
@@ -812,6 +1037,8 @@ async def run_bot(args: argparse.Namespace) -> None:
         while not channel.connection_snapshot().ready:
             await asyncio.sleep(1)
 
+        # 每分钟轮询：只要当天已过播报点就尝试发送。发没发过由数据库按
+        # (群, 日期) 去重，所以重复轮询不会重发；重启或错过点都会在下一次轮询自动补发。
         while True:
             now = datetime.now(LOCAL_TIMEZONE)
             report_at = datetime.combine(
@@ -819,17 +1046,13 @@ async def run_bot(args: argparse.Namespace) -> None:
                 args.daily_report_time,
                 tzinfo=LOCAL_TIMEZONE,
             )
-            if now < report_at:
-                await asyncio.sleep((report_at - now).total_seconds())
-                continue
-
-            report_day = now.date().isoformat()
-            if not await send_pending_daily_reports(report_day):
-                await asyncio.sleep(300)
-                continue
-
-            next_report_at = report_at + timedelta(days=1)
-            await asyncio.sleep((next_report_at - now).total_seconds())
+            if now >= report_at:
+                report_day = now.date().isoformat()
+                try:
+                    await send_pending_daily_reports(report_day)
+                except Exception:
+                    LOGGER.exception("Daily report polling failed report_day=%s", report_day)
+            await asyncio.sleep(DAILY_REPORT_POLL_SECONDS)
 
     async def on_message(message) -> None:
         if message.sender_is_bot:
@@ -914,7 +1137,7 @@ async def run_bot(args: argparse.Namespace) -> None:
                 if message.mentioned_bot:
                     await reply(
                         message,
-                        format_existing_observation(observation, prediction),
+                        await build_mention_reply(observation, prediction),
                     )
                 return
 
@@ -926,7 +1149,7 @@ async def run_bot(args: argparse.Namespace) -> None:
             if response_mode == "prediction":
                 await reply(
                     message,
-                    format_existing_observation(observation, prediction),
+                    await build_mention_reply(observation, prediction),
                 )
             elif response_mode == "chain":
                 await continue_chain(message, observation, prediction)
