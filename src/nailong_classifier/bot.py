@@ -17,6 +17,7 @@ from lark_channel.channel.types import MediaSource, ReplyRef
 from lark_channel.core import LogLevel
 
 from .catalog_document import CatalogDocumentClient
+from .image_fingerprint import find_duplicate, try_content_hash, try_file_content_hash
 from .model import NailongPredictor, Prediction
 from .storage import (
     LOCAL_TIMEZONE,
@@ -628,6 +629,30 @@ async def run_bot(args: argparse.Namespace) -> None:
                 )
         return all_sent
 
+    async def load_catalog_document_hashes() -> dict[str, str]:
+        """返回图鉴章节里现有图片的「素材 token → 内容指纹」；没算过的素材下载一次后缓存。"""
+        tokens = await catalog_document.list_section_image_tokens()
+        cached = await asyncio.to_thread(
+            store.catalog_document_image_hashes,
+            document_id=args.catalog_document_id,
+        )
+        for token in tokens:
+            if token in cached:
+                continue
+            image_bytes = await catalog_document.download_media(token)
+            cached[token] = await asyncio.to_thread(try_content_hash, image_bytes)
+            await asyncio.to_thread(
+                store.record_catalog_document_image_hash,
+                document_id=args.catalog_document_id,
+                file_token=token,
+                content_hash=cached[token],
+            )
+        return {
+            token: cached[token]
+            for token in tokens
+            if cached.get(token) is not None
+        }
+
     async def sync_catalog_document_once() -> tuple[int, int]:
         if not catalog_document or not args.catalog_document_id:
             return 0, 0
@@ -639,11 +664,53 @@ async def run_bot(args: argparse.Namespace) -> None:
                 document_id=args.catalog_document_id,
                 limit=100,
             )
+            if not records:
+                return 0, 0
+            # 同一张图换个尺寸或编码字节 hash 就变了，追加前按内容指纹和文档里已有的图比一遍。
+            # 文档指纹拿不全时宁可这轮不追加新图，等下一轮重试，避免把重复图放进文档。
+            known_hashes: dict[str, str] | None
+            try:
+                known_hashes = await load_catalog_document_hashes()
+            except Exception:
+                known_hashes = None
+                failed_count += 1
+                LOGGER.exception("Failed to load catalog document image hashes")
+
             for record in records:
                 image_block_id = record.image_block_id
                 file_token = record.file_token
+                asset_hash: str | None = None
                 try:
                     if not image_block_id:
+                        if known_hashes is None:
+                            continue
+                        asset_hash = await asyncio.to_thread(
+                            try_file_content_hash,
+                            record.asset.path,
+                        )
+                        duplicate_of = (
+                            find_duplicate(asset_hash, known_hashes)
+                            if asset_hash
+                            else None
+                        )
+                        if duplicate_of:
+                            await asyncio.to_thread(
+                                store.mark_catalog_document_duplicate,
+                                document_id=args.catalog_document_id,
+                                asset_id=record.asset.id,
+                                duplicate_of=duplicate_of,
+                            )
+                            LOGGER.info(
+                                "Catalog document image skipped as duplicate "
+                                "asset_id=%d duplicate_of=%s",
+                                record.asset.id,
+                                duplicate_of,
+                            )
+                            continue
+                        if asset_hash:
+                            # 先占位，同一批里后面内容相同的图即使这张还没传完也会被拦下。
+                            known_hashes[f"asset:{record.asset.id}"] = asset_hash
+
                         parent_block_id = record.parent_block_id
                         if not parent_block_id:
                             parent_block_id = (
@@ -697,6 +764,14 @@ async def run_bot(args: argparse.Namespace) -> None:
                         image_block_id=image_block_id,
                         file_token=file_token,
                     )
+                    if asset_hash:
+                        # 刚上传的素材本地就有原图，直接记指纹，下一轮不用再下载。
+                        await asyncio.to_thread(
+                            store.record_catalog_document_image_hash,
+                            document_id=args.catalog_document_id,
+                            file_token=file_token,
+                            content_hash=asset_hash,
+                        )
                     synced_count += 1
                     LOGGER.info(
                         "Catalog document image synced asset_id=%d block_id=%s",

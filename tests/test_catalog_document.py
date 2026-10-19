@@ -4,20 +4,29 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from nailong_classifier.catalog_document import CatalogDocumentClient
+from nailong_classifier.catalog_document import CatalogDocumentClient, CatalogDocumentError
 
 
 class FakeClient:
-    def __init__(self, responses: list[dict]) -> None:
+    def __init__(self, responses: list[dict | bytes]) -> None:
         self.responses = list(responses)
         self.requests = []
 
     async def arequest(self, request):
         self.requests.append(request)
         payload = self.responses.pop(0)
+        if isinstance(payload, bytes):
+            return SimpleNamespace(
+                raw=SimpleNamespace(
+                    status_code=200,
+                    headers={"Content-Type": "image/png"},
+                    content=payload,
+                )
+            )
         return SimpleNamespace(
             raw=SimpleNamespace(
-                status_code=200,
+                status_code=200 if payload.get("code") == 0 else 400,
+                headers={"Content-Type": "application/json; charset=utf-8"},
                 content=json.dumps(payload).encode("utf-8"),
             )
         )
@@ -116,3 +125,86 @@ def test_create_image_block_uses_stable_client_token() -> None:
         "create-image-block",
     )
     assert client_token != document.client_token("other-sha256", "create-image-block")
+
+
+def test_list_section_image_tokens_only_returns_images_inside_section() -> None:
+    client = FakeClient(
+        [
+            success(
+                {
+                    "items": [
+                        {
+                            "block_id": "document",
+                            "block_type": 1,
+                            "children": ["before", "section", "grid", "next-section"],
+                        },
+                        {"block_id": "before", "block_type": 2, "parent_id": "document"},
+                        {"block_id": "section", "block_type": 3, "parent_id": "document"},
+                        {"block_id": "grid", "block_type": 24, "parent_id": "document"},
+                    ],
+                    "has_more": True,
+                    "page_token": "page-2",
+                }
+            ),
+            success(
+                {
+                    "items": [
+                        {"block_id": "column", "block_type": 25, "parent_id": "grid"},
+                        {
+                            "block_id": "inside",
+                            "block_type": 27,
+                            "parent_id": "column",
+                            "image": {"token": "token-inside"},
+                        },
+                        {
+                            "block_id": "empty",
+                            "block_type": 27,
+                            "parent_id": "column",
+                            "image": {},
+                        },
+                        {"block_id": "next-section", "block_type": 3, "parent_id": "document"},
+                        {
+                            "block_id": "outside",
+                            "block_type": 27,
+                            "parent_id": "document",
+                            "image": {"token": "token-outside"},
+                        },
+                    ],
+                    "has_more": False,
+                }
+            ),
+        ]
+    )
+    document = CatalogDocumentClient(
+        client,
+        document_id="document",
+        section_block_id="section",
+    )
+
+    tokens = asyncio.run(document.list_section_image_tokens())
+
+    assert tokens == ["token-inside"]
+    assert ("page_token", "page-2") in client.requests[1].queries
+
+
+def test_download_media_returns_bytes_and_raises_on_json_error() -> None:
+    client = FakeClient(
+        [
+            b"\x89PNG-bytes",
+            {"code": 99991672, "msg": "Access denied", "data": {}},
+        ]
+    )
+    document = CatalogDocumentClient(
+        client,
+        document_id="document",
+        section_block_id="section",
+    )
+
+    assert asyncio.run(document.download_media("file-a")) == b"\x89PNG-bytes"
+    assert client.requests[0].paths == {"file_token": "file-a"}
+    try:
+        asyncio.run(document.download_media("file-b"))
+    except CatalogDocumentError as error:
+        assert error.code == 99991672
+    else:
+        raise AssertionError("download_media should raise on JSON error")

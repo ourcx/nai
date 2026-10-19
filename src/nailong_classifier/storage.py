@@ -198,6 +198,16 @@ class BotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_catalog_document_sync_status
                 ON catalog_document_sync(document_id, status, updated_at);
+
+                -- 文档图鉴章节里已有图片的内容指纹缓存，按素材 token 记录，避免每轮重复下载。
+                -- content_hash 为空表示这张素材解析不了，比较时跳过。
+                CREATE TABLE IF NOT EXISTS catalog_document_images (
+                    document_id TEXT NOT NULL,
+                    file_token TEXT NOT NULL,
+                    content_hash TEXT,
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY (document_id, file_token)
+                );
                 """
             )
             sync_columns = {
@@ -211,6 +221,13 @@ class BotStore:
                     """
                     ALTER TABLE catalog_document_sync
                     ADD COLUMN parent_block_id TEXT
+                    """
+                )
+            if "duplicate_of" not in sync_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE catalog_document_sync
+                    ADD COLUMN duplicate_of TEXT
                     """
                 )
 
@@ -810,7 +827,9 @@ class BotStore:
                 WHERE catalog_candidates.catalog_label IN ('nailong', 'naiwa')
                   AND (
                       catalog_document_sync.status IS NULL
-                      OR catalog_document_sync.status NOT IN ('baseline', 'synced')
+                      OR catalog_document_sync.status NOT IN (
+                          'baseline', 'synced', 'duplicate'
+                      )
                   )
                 ORDER BY catalog_candidates.first_seen_at, catalog_candidates.id
                 LIMIT ?
@@ -889,6 +908,70 @@ class BotStore:
             file_token=file_token,
             synced=True,
         )
+
+    def mark_catalog_document_duplicate(
+        self,
+        *,
+        document_id: str,
+        asset_id: int,
+        duplicate_of: str,
+    ) -> None:
+        # 文档里已有内容相同的图（只是尺寸或编码不同），这张不再追加；
+        # duplicate_of 记下文档里对应的素材 token，方便排查。
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO catalog_document_sync (
+                    document_id, asset_id, status, duplicate_of, updated_at
+                )
+                VALUES (?, ?, 'duplicate', ?, ?)
+                ON CONFLICT(document_id, asset_id) DO UPDATE SET
+                    status = 'duplicate',
+                    duplicate_of = excluded.duplicate_of,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (document_id, asset_id, duplicate_of, now),
+            )
+
+    def catalog_document_image_hashes(
+        self,
+        *,
+        document_id: str,
+    ) -> dict[str, str | None]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT file_token, content_hash
+                FROM catalog_document_images
+                WHERE document_id = ?
+                """,
+                (document_id,),
+            ).fetchall()
+        return {row["file_token"]: row["content_hash"] for row in rows}
+
+    def record_catalog_document_image_hash(
+        self,
+        *,
+        document_id: str,
+        file_token: str,
+        content_hash: str | None,
+    ) -> None:
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO catalog_document_images (
+                    document_id, file_token, content_hash, recorded_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(document_id, file_token) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    recorded_at = excluded.recorded_at
+                """,
+                (document_id, file_token, content_hash, now),
+            )
 
     def mark_catalog_document_sync_failed(
         self,

@@ -106,6 +106,7 @@ def test_store_migrates_existing_catalog_document_sync_table(tmp_path: Path) -> 
             ).fetchall()
         }
     assert "parent_block_id" in columns
+    assert "duplicate_of" in columns
 
 
 def test_chain_rotation_prefers_collected_assets_without_repeating(
@@ -386,6 +387,40 @@ def test_catalog_document_sync_tracks_baseline_and_resumes_stages(
     store.correct_label("other", "naiwa")
     records = store.pending_catalog_document_sync(document_id=document_id)
     assert [record.asset.id for record in records] == [other.id]
+
+    # 内容和文档里已有图相同的素材标记为 duplicate 后，不再进入待同步列表。
+    store.mark_catalog_document_duplicate(
+        document_id=document_id,
+        asset_id=other.id,
+        duplicate_of="file-a",
+    )
+    assert store.pending_catalog_document_sync(document_id=document_id) == []
+    assert store.catalog_document_sync_counts(document_id=document_id)["duplicate"] == 1
+
+
+def test_catalog_document_image_hash_cache(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+
+    store.record_catalog_document_image_hash(
+        document_id="doc-a",
+        file_token="file-a",
+        content_hash="ab",
+    )
+    store.record_catalog_document_image_hash(
+        document_id="doc-a",
+        file_token="file-broken",
+        content_hash=None,
+    )
+    store.record_catalog_document_image_hash(
+        document_id="doc-b",
+        file_token="file-b",
+        content_hash="cd",
+    )
+
+    assert store.catalog_document_image_hashes(document_id="doc-a") == {
+        "file-a": "ab",
+        "file-broken": None,
+    }
 
 
 def test_commands_are_exact_and_support_correction_aliases() -> None:

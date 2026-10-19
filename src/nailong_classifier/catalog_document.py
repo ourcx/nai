@@ -57,33 +57,9 @@ class CatalogDocumentClient:
 
     async def resolve_target_column(self) -> str:
         top_level = await self._list_children(self.document_id)
-        section_index = next(
-            (
-                index
-                for index, block in enumerate(top_level)
-                if block.get("block_id") == self.section_block_id
-            ),
-            None,
-        )
-        if section_index is None:
-            raise CatalogDocumentError(
-                "locate catalog section",
-                status_code=None,
-                code=None,
-                message=f"section block {self.section_block_id} was not found",
-            )
-
-        section_end = next(
-            (
-                index
-                for index in range(section_index + 1, len(top_level))
-                if top_level[index].get("block_type") == HEADING_1_BLOCK_TYPE
-            ),
-            len(top_level),
-        )
         grids = [
             block
-            for block in top_level[section_index + 1 : section_end]
+            for block in self._section_blocks(top_level)
             if block.get("block_type") == GRID_BLOCK_TYPE
         ]
         if not grids:
@@ -113,6 +89,98 @@ class CatalogDocumentClient:
         )
         target_index = min(range(len(columns)), key=lambda index: (counts[index], index))
         return str(columns[target_index]["block_id"])
+
+    async def list_section_image_tokens(self) -> list[str]:
+        """按文档顺序列出图鉴章节内所有图片的素材 token，包括人工放进去的图，用于追加前去重。"""
+        blocks = await self._list_paginated(
+            "list document blocks",
+            "/open-apis/docx/v1/documents/:document_id/blocks",
+            paths={"document_id": self.document_id},
+        )
+        blocks_by_id = {block.get("block_id"): block for block in blocks}
+        root = blocks_by_id.get(self.document_id) or {}
+        top_level = [
+            blocks_by_id[block_id]
+            for block_id in root.get("children") or []
+            if block_id in blocks_by_id
+        ]
+        section_ids = {block["block_id"] for block in self._section_blocks(top_level)}
+
+        tokens: list[str] = []
+        for block in blocks:
+            token = (block.get("image") or {}).get("token")
+            if block.get("block_type") != IMAGE_BLOCK_TYPE or not token:
+                continue
+            # 图片一般挂在 grid_column → grid → 顶层块下面，
+            # 顺着 parent 往上找到顶层块，再判断它是否在图鉴章节内。
+            ancestor_id = block.get("parent_id")
+            while ancestor_id and ancestor_id not in section_ids:
+                ancestor_id = (blocks_by_id.get(ancestor_id) or {}).get("parent_id")
+            if ancestor_id:
+                tokens.append(str(token))
+        return tokens
+
+    async def download_media(self, file_token: str) -> bytes:
+        response = await self.client.arequest(
+            self._request(
+                HttpMethod.GET,
+                "/open-apis/drive/v1/medias/:file_token/download",
+                paths={"file_token": file_token},
+            )
+        )
+        raw = response.raw
+        content_type = next(
+            (
+                value
+                for key, value in (raw.headers if raw else {}).items()
+                if key.lower() == "content-type"
+            ),
+            "",
+        )
+        # 成功时返回的是图片二进制；失败时是 JSON 错误体，交给 _response_data 抛出具体错误码。
+        if (
+            raw
+            and raw.status_code is not None
+            and 200 <= raw.status_code < 300
+            and not content_type.startswith("application/json")
+            and raw.content
+        ):
+            return raw.content
+        self._response_data("download catalog image", response)
+        raise CatalogDocumentError(
+            "download catalog image",
+            status_code=raw.status_code if raw else None,
+            code=None,
+            message="response did not contain image bytes",
+        )
+
+    def _section_blocks(self, top_level: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """返回图鉴章节标题之后、下一个一级标题之前的顶层块。"""
+        section_index = next(
+            (
+                index
+                for index, block in enumerate(top_level)
+                if block.get("block_id") == self.section_block_id
+            ),
+            None,
+        )
+        if section_index is None:
+            raise CatalogDocumentError(
+                "locate catalog section",
+                status_code=None,
+                code=None,
+                message=f"section block {self.section_block_id} was not found",
+            )
+
+        section_end = next(
+            (
+                index
+                for index in range(section_index + 1, len(top_level))
+                if top_level[index].get("block_type") == HEADING_1_BLOCK_TYPE
+            ),
+            len(top_level),
+        )
+        return top_level[section_index + 1 : section_end]
 
     async def create_image_block(
         self,
@@ -197,6 +265,22 @@ class CatalogDocumentClient:
         return len(await self._list_children(block_id))
 
     async def _list_children(self, block_id: str) -> list[dict[str, Any]]:
+        return await self._list_paginated(
+            "list document children",
+            "/open-apis/docx/v1/documents/:document_id/blocks/:block_id/children",
+            paths={
+                "document_id": self.document_id,
+                "block_id": block_id,
+            },
+        )
+
+    async def _list_paginated(
+        self,
+        operation: str,
+        uri: str,
+        *,
+        paths: dict[str, str],
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
@@ -207,13 +291,10 @@ class CatalogDocumentClient:
             if page_token:
                 queries["page_token"] = page_token
             data = await self._json_request(
-                "list document children",
+                operation,
                 HttpMethod.GET,
-                "/open-apis/docx/v1/documents/:document_id/blocks/:block_id/children",
-                paths={
-                    "document_id": self.document_id,
-                    "block_id": block_id,
-                },
+                uri,
+                paths=paths,
                 queries=queries,
             )
             items.extend(data.get("items") or [])
@@ -222,7 +303,7 @@ class CatalogDocumentClient:
             page_token = data.get("page_token")
             if not page_token:
                 raise CatalogDocumentError(
-                    "list document children",
+                    operation,
                     status_code=None,
                     code=None,
                     message="paginated response did not contain a page token",
