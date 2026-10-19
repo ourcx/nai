@@ -262,8 +262,8 @@ def format_help_message(report_time: time) -> str:
 
 def format_catalog_caption(stats: CatalogStats, shown: int) -> str:
     return (
-        f"共收录 {stats.total} 张：奶龙 {stats.nailong} · 奶娃 {stats.naiwa} · "
-        f"待确认 {stats.pending}。今日新增 {stats.today_new} 张，"
+        f"共收录 {stats.total} 张：奶龙 {stats.nailong} · 奶娃 {stats.naiwa}。"
+        f"今日新增 {stats.today_new} 张，"
         f"当前展示最近 {shown} 张。"
     )
 
@@ -280,9 +280,7 @@ def build_catalog_post(
         [{"tag": "text", "text": format_catalog_caption(stats, len(assets))}]
     ]
     for asset, image_key in zip(assets, image_keys, strict=True):
-        display_label = DISPLAY_LABELS.get(asset.label, "待确认")
-        if asset.label == "other":
-            display_label = "待确认"
+        display_label = DISPLAY_LABELS[asset.label]
         rows.append([{"tag": "img", "image_key": image_key}])
         rows.append(
             [
@@ -370,6 +368,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         ),
         security=SecurityConfig(mode="audit"),
     )
+    chain_lock = asyncio.Lock()
 
     async def reply(message, text: str):
         result = await channel.send(
@@ -479,28 +478,37 @@ async def run_bot(args: argparse.Namespace) -> None:
         observation: ObservationRecord,
         prediction: Prediction,
     ) -> None:
-        reply_asset = await asyncio.to_thread(
-            store.random_asset,
-            observation.asset.label,
-            exclude_sha256=observation.asset.sha256,
-        )
-        if not reply_asset:
-            LOGGER.warning("No reply asset available for label=%s", observation.asset.label)
-            if message.mentioned_bot:
-                await reply(message, format_prediction(prediction))
-            return
-
-        result = await reply_image(
-            message,
-            reply_asset.path,
-            format_chain_caption(observation),
-        )
-        if result.success and result.message_id:
-            await asyncio.to_thread(
-                store.attach_response,
-                observation.id,
-                result.message_id,
+        async with chain_lock:
+            reply_asset = await asyncio.to_thread(
+                store.next_chain_asset,
+                chat_id=message.chat_id,
+                label=observation.asset.label,
+                exclude_sha256=observation.asset.sha256,
             )
+            if not reply_asset:
+                LOGGER.warning("No reply asset available for label=%s", observation.asset.label)
+                if message.mentioned_bot:
+                    await reply(message, format_prediction(prediction))
+                return
+
+            result = await reply_image(
+                message,
+                reply_asset.path,
+                format_chain_caption(observation),
+            )
+            if result.success and result.message_id:
+                await asyncio.to_thread(
+                    store.attach_response,
+                    observation.id,
+                    result.message_id,
+                )
+                await asyncio.to_thread(
+                    store.record_chain_reply,
+                    chat_id=message.chat_id,
+                    label=observation.asset.label,
+                    asset_id=reply_asset.id,
+                    response_message_id=result.message_id,
+                )
 
     async def send_pending_daily_reports(report_day: str) -> bool:
         targets = await asyncio.to_thread(

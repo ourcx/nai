@@ -73,6 +73,57 @@ def test_hash_deduplicates_assets_and_message_events(tmp_path: Path) -> None:
     assert len(list((tmp_path / "assets").iterdir())) == 1
 
 
+def test_chain_rotation_prefers_collected_assets_without_repeating(
+    tmp_path: Path,
+) -> None:
+    store = BotStore(tmp_path)
+    seed_assets = [
+        store.register_seed(make_image_bytes(color), "nailong")
+        for color in ("gold", "orange")
+    ]
+    collected_assets = [
+        record(
+            store,
+            make_image_bytes(color),
+            message_id=f"collected-{index}",
+            label="nailong",
+        ).asset
+        for index, color in enumerate(("yellow", "pink"))
+    ]
+
+    chosen_assets = []
+    for index in range(4):
+        asset = store.next_chain_asset(
+            chat_id="chat-a",
+            label="nailong",
+            exclude_sha256=(
+                collected_assets[0].sha256 if index == 0 else None
+            ),
+        )
+        assert asset is not None
+        chosen_assets.append(asset)
+        store.record_chain_reply(
+            chat_id="chat-a",
+            label="nailong",
+            asset_id=asset.id,
+            response_message_id=f"response-{index}",
+        )
+
+    assert chosen_assets[0].id == collected_assets[1].id
+    assert chosen_assets[1].id == collected_assets[0].id
+    assert {asset.id for asset in chosen_assets[2:]} == {
+        asset.id for asset in seed_assets
+    }
+    assert len({asset.id for asset in chosen_assets}) == 4
+
+    next_cycle = store.next_chain_asset(chat_id="chat-a", label="nailong")
+    other_chat = store.next_chain_asset(chat_id="chat-b", label="nailong")
+    assert next_cycle is not None
+    assert next_cycle.id in {asset.id for asset in chosen_assets}
+    assert other_chat is not None
+    assert other_chat.origin == "collected"
+
+
 def test_correction_accepts_source_or_response_message_id(tmp_path: Path) -> None:
     store = BotStore(tmp_path)
     observation = record(
@@ -194,11 +245,15 @@ def test_catalog_uses_collected_milk_assets_and_builds_multi_image_post(
 
     assert stats.total == 3
     assert stats.nailong == 1
-    assert stats.naiwa == 1
-    assert stats.pending == 1
+    assert stats.naiwa == 2
     assert stats.today_new == 3
     assert len(assets) == 3
     assert all(asset.origin == "collected" for asset in assets)
+    assert sorted(asset.label for asset in assets) == [
+        "nailong",
+        "naiwa",
+        "naiwa",
+    ]
     assert post["zh_cn"]["title"] == "奶龙图鉴"
     post_images = [
         node["image_key"]
@@ -208,7 +263,7 @@ def test_catalog_uses_collected_milk_assets_and_builds_multi_image_post(
     ]
     assert post_images == image_keys
     assert format_catalog_caption(stats, len(assets)) == (
-        "共收录 3 张：奶龙 1 · 奶娃 1 · 待确认 1。"
+        "共收录 3 张：奶龙 1 · 奶娃 2。"
         "今日新增 3 张，当前展示最近 3 张。"
     )
 

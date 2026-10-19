@@ -78,7 +78,6 @@ class CatalogStats:
     total: int
     nailong: int
     naiwa: int
-    pending: int
     today_new: int
 
 
@@ -160,6 +159,18 @@ class BotStore:
                     response_message_id TEXT,
                     PRIMARY KEY (chat_hash, report_day)
                 );
+
+                CREATE TABLE IF NOT EXISTS chain_replies (
+                    id INTEGER PRIMARY KEY,
+                    chat_hash TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    response_message_id TEXT NOT NULL UNIQUE,
+                    sent_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chain_replies_rotation
+                ON chain_replies(chat_hash, label, asset_id, sent_at);
                 """
             )
 
@@ -396,6 +407,104 @@ class BotStore:
                 ).fetchall()
         return self._asset_from_row(secrets.choice(rows)) if rows else None
 
+    def next_chain_asset(
+        self,
+        *,
+        chat_id: str,
+        label: str,
+        exclude_sha256: str | None = None,
+    ) -> AssetRecord | None:
+        self._validate_label(label)
+        chat_hash = self.identity_hash(chat_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT assets.*, MAX(chain_replies.sent_at) AS last_sent_at
+                FROM assets
+                LEFT JOIN chain_replies
+                  ON chain_replies.asset_id = assets.id
+                 AND chain_replies.chat_hash = ?
+                 AND chain_replies.label = ?
+                WHERE assets.label = ?
+                  AND (? IS NULL OR assets.sha256 != ?)
+                GROUP BY assets.id
+                ORDER BY
+                    CASE
+                        WHEN MAX(chain_replies.sent_at) IS NULL THEN 0
+                        ELSE 1
+                    END,
+                    CASE
+                        WHEN MAX(chain_replies.sent_at) IS NULL
+                         AND assets.origin = 'collected' THEN 0
+                        ELSE 1
+                    END,
+                    MAX(chain_replies.sent_at) ASC,
+                    RANDOM()
+                LIMIT 1
+                """,
+                (
+                    chat_hash,
+                    label,
+                    label,
+                    exclude_sha256,
+                    exclude_sha256,
+                ),
+            ).fetchone()
+            if row is None and exclude_sha256:
+                row = connection.execute(
+                    """
+                    SELECT assets.*, MAX(chain_replies.sent_at) AS last_sent_at
+                    FROM assets
+                    LEFT JOIN chain_replies
+                      ON chain_replies.asset_id = assets.id
+                     AND chain_replies.chat_hash = ?
+                     AND chain_replies.label = ?
+                    WHERE assets.label = ?
+                    GROUP BY assets.id
+                    ORDER BY
+                        CASE
+                            WHEN MAX(chain_replies.sent_at) IS NULL THEN 0
+                            ELSE 1
+                        END,
+                        CASE
+                            WHEN MAX(chain_replies.sent_at) IS NULL
+                             AND assets.origin = 'collected' THEN 0
+                            ELSE 1
+                        END,
+                        MAX(chain_replies.sent_at) ASC,
+                        RANDOM()
+                    LIMIT 1
+                    """,
+                    (chat_hash, label, label),
+                ).fetchone()
+        return self._asset_from_row(row) if row else None
+
+    def record_chain_reply(
+        self,
+        *,
+        chat_id: str,
+        label: str,
+        asset_id: int,
+        response_message_id: str,
+    ) -> None:
+        self._validate_label(label)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chain_replies (
+                    chat_hash, label, asset_id, response_message_id, sent_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    self.identity_hash(chat_id),
+                    label,
+                    asset_id,
+                    response_message_id,
+                    datetime.now(LOCAL_TIMEZONE).isoformat(),
+                ),
+            )
+
     def daily_stats(self, chat_id: str, *, day: str | None = None) -> DailyStats:
         day = day or datetime.now(LOCAL_TIMEZONE).date().isoformat()
         chat_hash = self.identity_hash(chat_id)
@@ -490,89 +599,100 @@ class BotStore:
         with self._connect() as connection:
             counts = connection.execute(
                 """
+                WITH latest_predictions AS (
+                    SELECT observations.asset_id, observations.predicted_label
+                    FROM observations
+                    JOIN (
+                        SELECT asset_id, MAX(id) AS latest_id
+                        FROM observations
+                        GROUP BY asset_id
+                    ) AS latest
+                      ON latest.latest_id = observations.id
+                ),
+                catalog_candidates AS (
+                    SELECT
+                        assets.id,
+                        assets.first_seen_day,
+                        CASE
+                            WHEN assets.corrected = 1 THEN assets.label
+                            ELSE latest_predictions.predicted_label
+                        END AS catalog_label
+                    FROM assets
+                    LEFT JOIN latest_predictions
+                      ON latest_predictions.asset_id = assets.id
+                    WHERE assets.origin = 'collected'
+                )
                 SELECT
                     COUNT(*) AS total,
-                    SUM(CASE WHEN label = 'nailong' THEN 1 ELSE 0 END) AS nailong,
-                    SUM(CASE WHEN label = 'naiwa' THEN 1 ELSE 0 END) AS naiwa,
-                    SUM(CASE WHEN label = 'other' THEN 1 ELSE 0 END) AS pending
-                FROM assets
-                WHERE origin = 'collected'
-                  AND (
-                      label IN ('nailong', 'naiwa')
-                      OR (
-                          corrected = 0
-                          AND EXISTS (
-                              SELECT 1
-                              FROM observations
-                              WHERE observations.asset_id = assets.id
-                                AND observations.predicted_label
-                                    IN ('nailong', 'naiwa')
-                          )
-                      )
-                  )
-                """
-            ).fetchone()
-            today_new = connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM assets
-                WHERE origin = 'collected'
-                  AND first_seen_day = ?
-                  AND (
-                      label IN ('nailong', 'naiwa')
-                      OR (
-                          corrected = 0
-                          AND EXISTS (
-                              SELECT 1
-                              FROM observations
-                              WHERE observations.asset_id = assets.id
-                                AND observations.predicted_label
-                                    IN ('nailong', 'naiwa')
-                          )
-                      )
-                  )
+                    SUM(
+                        CASE WHEN catalog_label = 'nailong' THEN 1 ELSE 0 END
+                    ) AS nailong,
+                    SUM(
+                        CASE WHEN catalog_label = 'naiwa' THEN 1 ELSE 0 END
+                    ) AS naiwa,
+                    SUM(
+                        CASE WHEN first_seen_day = ? THEN 1 ELSE 0 END
+                    ) AS today_new
+                FROM catalog_candidates
+                WHERE catalog_label IN ('nailong', 'naiwa')
                 """,
                 (day,),
-            ).fetchone()["count"]
+            ).fetchone()
         return CatalogStats(
             total=counts["total"] or 0,
             nailong=counts["nailong"] or 0,
             naiwa=counts["naiwa"] or 0,
-            pending=counts["pending"] or 0,
-            today_new=today_new or 0,
+            today_new=counts["today_new"] or 0,
         )
 
     def catalog_assets(self, *, limit: int = 9) -> list[AssetRecord]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM assets
-                WHERE origin = 'collected'
-                  AND (
-                      label IN ('nailong', 'naiwa')
-                      OR (
-                          corrected = 0
-                          AND EXISTS (
-                              SELECT 1
-                              FROM observations
-                              WHERE observations.asset_id = assets.id
-                                AND observations.predicted_label
-                                    IN ('nailong', 'naiwa')
-                          )
-                      )
-                  )
+                WITH latest_predictions AS (
+                    SELECT observations.asset_id, observations.predicted_label
+                    FROM observations
+                    JOIN (
+                        SELECT asset_id, MAX(id) AS latest_id
+                        FROM observations
+                        GROUP BY asset_id
+                    ) AS latest
+                      ON latest.latest_id = observations.id
+                ),
+                catalog_candidates AS (
+                    SELECT
+                        assets.*,
+                        CASE
+                            WHEN assets.corrected = 1 THEN assets.label
+                            ELSE latest_predictions.predicted_label
+                        END AS catalog_label
+                    FROM assets
+                    LEFT JOIN latest_predictions
+                      ON latest_predictions.asset_id = assets.id
+                    WHERE assets.origin = 'collected'
+                )
+                SELECT * FROM catalog_candidates
+                WHERE catalog_label IN ('nailong', 'naiwa')
                 ORDER BY first_seen_at DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
-        return [self._asset_from_row(row) for row in rows]
+        return [
+            self._asset_from_row(row, label_column="catalog_label")
+            for row in rows
+        ]
 
-    def _asset_from_row(self, row: sqlite3.Row) -> AssetRecord:
+    def _asset_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        label_column: str = "label",
+    ) -> AssetRecord:
         return AssetRecord(
             id=row["id"],
             sha256=row["sha256"],
-            label=row["label"],
+            label=row[label_column],
             confidence=float(row["confidence"]),
             path=self.assets_dir / row["file_name"],
             first_seen_at=row["first_seen_at"],
