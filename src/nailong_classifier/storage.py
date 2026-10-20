@@ -16,8 +16,8 @@ from .image_fingerprint import try_content_hash
 from .rarity import Rarity, classify_rarity
 
 LABELS = {"nailong", "naiwa", "other"}
-# 盲盒猜图只在奶龙/奶蛙之间出题，“其他”不作为可猜答案。
-GUESS_LABELS = {"nailong", "naiwa"}
+# 盲盒猜图在奶龙/奶蛙/其他三类之间出题。
+GUESS_LABELS = {"nailong", "naiwa", "other"}
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 FORMAT_SUFFIXES = {
     "GIF": ".gif",
@@ -867,11 +867,15 @@ class BotStore:
         return classify_rarity(max(1, int(row["seen_count"])))
 
     def start_guess_round(self, *, chat_id: str) -> GuessRound | None:
-        """开一局盲盒猜图：从入典的奶龙/奶蛙图里随机抽一张当题目。没有可用图时返回 None。"""
+        """开一局盲盒猜图：在奶龙/奶蛙/其他三类间等概率选一类，再从该类里随机抽一张当题目。
+
+        先按类别均衡再抽图，避免库存多的「其他」把题目几乎占满；某类没有图就自动跳过。
+        没有任何可用图时返回 None。
+        """
         chat_hash = self.identity_hash(chat_id)
         now = datetime.now(LOCAL_TIMEZONE).isoformat()
         with self._connect() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
                 WITH latest_predictions AS (
                     SELECT
@@ -901,14 +905,20 @@ class BotStore:
                     WHERE assets.origin = 'collected'
                 )
                 SELECT * FROM catalog_candidates
-                WHERE catalog_label IN ('nailong', 'naiwa')
-                ORDER BY RANDOM()
-                LIMIT 1
+                WHERE catalog_label IN ('nailong', 'naiwa', 'other')
                 """,
-            ).fetchone()
-            if not row:
+            ).fetchall()
+            if not rows:
                 return None
-            asset = self._asset_from_row(row, label_column="catalog_label")
+            # 先按类别分组，等概率选一类，再在该类里随机抽一张，让三类出现频率接近。
+            by_label: dict[str, list] = {}
+            for candidate in rows:
+                by_label.setdefault(candidate["catalog_label"], []).append(candidate)
+            label = secrets.choice(sorted(by_label))
+            asset = self._asset_from_row(
+                secrets.choice(by_label[label]),
+                label_column="catalog_label",
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO guess_rounds (

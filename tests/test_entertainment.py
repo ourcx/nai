@@ -234,6 +234,34 @@ def test_reveal_closes_round_without_scoring(tmp_path: Path) -> None:
     assert store.guess_ranking(chat_id="chat-a") == []
 
 
+def test_guess_round_balances_labels_despite_skewed_inventory(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    # 故意造成库存失衡：其他远多于奶龙/奶蛙。均衡抽样应让三类都稳定出现，而非被“其他”占满。
+    record(store, make_image_bytes("yellow"), message_id="n-1", label="nailong")
+    record(store, make_image_bytes("pink"), message_id="w-1", label="naiwa")
+    for index in range(20):
+        store.record_observation(
+            image_bytes=make_image_bytes(f"#{index:02x}{index:02x}{index:02x}"),
+            source_message_id=f"o-{index}",
+            chat_id="chat-a",
+            chat_type="group",
+            sender_id="user-a",
+            predicted_label="other",
+            confidence=0.9,
+            accepted=True,
+        )
+
+    seen: set[str] = set()
+    for _ in range(60):
+        round_ = store.start_guess_round(chat_id="chat-a")
+        assert round_ is not None
+        seen.add(round_.answer)
+        store.close_guess_round(round_id=round_.id)
+
+    # 60 次抽样里三类都应出现过（均衡抽样下每类概率约 1/3，漏掉某类几乎不可能）。
+    assert seen == {"nailong", "naiwa", "other"}
+
+
 def test_guess_commands_and_answer_parsing() -> None:
     assert is_guess_start_command("猜图") is True
     assert is_guess_start_command("盲盒猜图") is True
@@ -243,7 +271,8 @@ def test_guess_commands_and_answer_parsing() -> None:
     assert parse_guess_answer("猜奶蛙") == "naiwa"
     assert parse_guess_answer("是奶龙") == "nailong"
     assert parse_guess_answer("答案是奶蛙") == "naiwa"
-    assert parse_guess_answer("其他") is None
+    assert parse_guess_answer("其他") == "other"
+    assert parse_guess_answer("猜其他") == "other"
     assert parse_guess_answer("奶龙好可爱") is None
 
 

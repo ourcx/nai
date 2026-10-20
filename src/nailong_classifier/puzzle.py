@@ -5,12 +5,12 @@ import random
 
 from PIL import Image, ImageFilter, ImageOps
 
-# 盲盒出题默认只露原图约 45% 宽高的一块局部，放大后发出来，让人只能靠细节猜，不再是一眼二选一。
-DEFAULT_REVEAL_FRACTION = 0.45
+# 盲盒出题默认只露原图约 30% 宽高的一块局部，放大后发出来，让人只能靠细节猜，不再是一眼就能认出。
+DEFAULT_REVEAL_FRACTION = 0.30
 # 裁出的局部放大到这个边长再发送，避免小图在群里糊成一团看不清。
 PUZZLE_OUTPUT_SIZE = 360
 # 放大后再叠一层高斯模糊，连局部细节也抹掉，和裁剪一起把“一眼认出”的线索压到最低。
-DEFAULT_BLUR_RADIUS = 6.0
+DEFAULT_BLUR_RADIUS = 9.0
 
 
 def make_puzzle_image(

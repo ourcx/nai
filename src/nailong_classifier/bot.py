@@ -47,10 +47,11 @@ COMMAND_LABELS = {
     "奶蛙": "naiwa",
     "其他": "other",
 }
-# 猜图抢答：只在奶龙/奶蛙之间二选一，所以答案词表不含“其他”。
+# 猜图抢答：在奶龙/奶蛙/其他三类之间抢答。
 GUESS_ANSWER_LABELS = {
     "奶龙": "nailong",
     "奶蛙": "naiwa",
+    "其他": "other",
 }
 DEFAULT_DAILY_REPORT_TIME = time(hour=23, minute=55)
 DEFAULT_CATALOG_SYNC_RETRY_SECONDS = 60
@@ -289,7 +290,7 @@ def is_guess_ranking_command(text: str) -> bool:
     return text.strip() in {"猜图榜", "猜图排行榜", "猜图积分榜"}
 
 
-GUESS_ANSWER_PATTERN = re.compile(r"^(?:猜|是|答案是?)?\s*(奶龙|奶蛙)$")
+GUESS_ANSWER_PATTERN = re.compile(r"^(?:猜|是|答案是?)?\s*(奶龙|奶蛙|其他)$")
 
 
 def parse_guess_answer(text: str) -> str | None:
@@ -301,8 +302,8 @@ def parse_guess_answer(text: str) -> str | None:
 def format_guess_prompt() -> str:
     return (
         "🎲 盲盒猜图开始！\n"
-        "这是打了码的局部，猜猜它是奶龙还是奶蛙？"
-        "直接发「奶龙」或「奶蛙」抢答，首答对者得 1 分。"
+        "这是打了码的局部，猜猜它是奶龙、奶蛙还是其他？"
+        "直接发「奶龙」「奶蛙」或「其他」抢答，首答对者得 1 分。"
     )
 
 
