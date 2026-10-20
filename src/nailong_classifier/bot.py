@@ -8,7 +8,7 @@ import os
 import re
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -814,6 +814,12 @@ async def run_bot(args: argparse.Namespace) -> None:
             store.pending_daily_report_targets,
             report_day,
         )
+        if targets:
+            LOGGER.info(
+                "Daily report pending report_day=%s targets=%d",
+                report_day,
+                len(targets),
+            )
         all_sent = True
         for target in targets:
             try:
@@ -1034,11 +1040,14 @@ async def run_bot(args: argparse.Namespace) -> None:
                 catalog_sync_event.set()
 
     async def daily_report_loop() -> None:
-        while not channel.connection_snapshot().ready:
-            await asyncio.sleep(1)
+        # 不用 connection_snapshot().ready 作门禁：阻塞式 connect() 下该标志恒为 False，
+        # 旧写法会在这里死循环导致播报从不执行。启动先等几秒让 WS 建连，之后靠每分钟轮询，
+        # 没连上时 send 会失败并记日志，下一轮自动重试。
+        await asyncio.sleep(10)
 
-        # 每分钟轮询：只要当天已过播报点就尝试发送。发没发过由数据库按
-        # (群, 日期) 去重，所以重复轮询不会重发；重启或错过点都会在下一次轮询自动补发。
+        # 每分钟轮询：昨天的播报点一定已过，每轮都补发昨天没发出去的；今天过了播报点再发今天的。
+        # 发没发过由数据库按 (群, 日期) 去重，重复轮询不会重发；
+        # 过零点、重启、发送失败都能在下一轮补上。
         while True:
             now = datetime.now(LOCAL_TIMEZONE)
             report_at = datetime.combine(
@@ -1046,8 +1055,10 @@ async def run_bot(args: argparse.Namespace) -> None:
                 args.daily_report_time,
                 tzinfo=LOCAL_TIMEZONE,
             )
+            report_days = [(now.date() - timedelta(days=1)).isoformat()]
             if now >= report_at:
-                report_day = now.date().isoformat()
+                report_days.append(now.date().isoformat())
+            for report_day in report_days:
                 try:
                     await send_pending_daily_reports(report_day)
                 except Exception:
