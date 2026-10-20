@@ -359,3 +359,45 @@ def test_make_puzzle_image_rejects_bad_params() -> None:
     with pytest.raises(ValueError):
         make_puzzle_image(source, blur_radius=-1)
 
+
+def test_deactivate_chat_excludes_from_daily_report(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    from nailong_classifier.storage import LOCAL_TIMEZONE
+
+    store = BotStore(tmp_path)
+    record(store, make_image_bytes("yellow"), message_id="m-1", label="nailong", chat_id="grp")
+    day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+
+    # 失效前该群在待播报列表里。
+    assert [t.chat_id for t in store.pending_daily_report_targets(day)] == ["grp"]
+
+    store.deactivate_chat("grp")
+    # 失效后不再出现。
+    assert store.pending_daily_report_targets(day) == []
+
+
+def test_random_milk_asset_only_milk_and_balanced(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    # 没有任何奶图时返回 None。
+    assert store.random_milk_asset() is None
+
+    store.register_seed(make_image_bytes("gold"), "nailong")
+    record(store, make_image_bytes("pink"), message_id="w-1", label="naiwa")
+    # 加一张“其他”，不应被主动推送选中。
+    store.record_observation(
+        image_bytes=make_image_bytes("#101010"),
+        source_message_id="o-1",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-a",
+        predicted_label="other",
+        confidence=0.9,
+        accepted=True,
+    )
+
+    labels = {store.random_milk_asset().label for _ in range(40)}
+    assert labels <= {"nailong", "naiwa"}
+    assert "other" not in labels
+
+

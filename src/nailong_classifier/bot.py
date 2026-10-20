@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import time as time_module
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
+from lark_channel.channel.errors import FeishuChannelErrorCode
 from lark_channel.channel.types import MediaSource, ReplyRef
 from lark_channel.core import LogLevel
 
@@ -57,6 +60,10 @@ DEFAULT_DAILY_REPORT_TIME = time(hour=23, minute=55)
 DEFAULT_CATALOG_SYNC_RETRY_SECONDS = 60
 # 每日播报的轮询间隔：每分钟看一眼是否过了播报点，错过或重启都能靠下一次轮询补上。
 DAILY_REPORT_POLL_SECONDS = 60
+# 主动推送抽象奶图：群里有人正常聊天时，以此概率冷不丁丢一张图（只发图不说话）。
+DEFAULT_RANDOM_PUSH_PROBABILITY = 0.03
+# 两次主动推送之间的最小间隔（秒），同一个群内生效，避免连着刷屏。默认 2 小时。
+DEFAULT_RANDOM_PUSH_COOLDOWN_SECONDS = 7200
 
 
 @dataclass(frozen=True)
@@ -518,6 +525,26 @@ def parse_args() -> argparse.Namespace:
             )
         ),
     )
+    parser.add_argument(
+        "--random-push-probability",
+        type=float,
+        default=float(
+            os.getenv(
+                "RANDOM_PUSH_PROBABILITY",
+                str(DEFAULT_RANDOM_PUSH_PROBABILITY),
+            )
+        ),
+    )
+    parser.add_argument(
+        "--random-push-cooldown-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "RANDOM_PUSH_COOLDOWN_SECONDS",
+                str(DEFAULT_RANDOM_PUSH_COOLDOWN_SECONDS),
+            )
+        ),
+    )
     return parser.parse_args()
 
 
@@ -547,6 +574,8 @@ async def run_bot(args: argparse.Namespace) -> None:
     chain_lock = asyncio.Lock()
     guess_lock = asyncio.Lock()
     contact_resolver = ContactResolver(channel.client)
+    # 每个群上次主动推送的单调时钟时间，用于冷却；进程内存着即可，重启清零无妨。
+    last_random_push: dict[str, float] = {}
     catalog_sync_event = asyncio.Event()
     catalog_sync_lock = asyncio.Lock()
     catalog_document: CatalogDocumentClient | None = None
@@ -835,6 +864,17 @@ async def run_bot(args: argparse.Namespace) -> None:
                 )
                 if not result.success:
                     all_sent = False
+                    if (
+                        result.error
+                        and result.error.code == FeishuChannelErrorCode.TARGET_REVOKED
+                    ):
+                        # 机器人已被踢出该群，标记失效，不再反复尝试刷错误日志。
+                        await asyncio.to_thread(store.deactivate_chat, target.chat_id)
+                        LOGGER.warning(
+                            "Deactivated revoked chat chat_hash=%s",
+                            store.identity_hash(target.chat_id),
+                        )
+                        continue
                     LOGGER.error(
                         "Failed to send daily report chat_hash=%s error=%s",
                         store.identity_hash(target.chat_id),
@@ -1066,6 +1106,46 @@ async def run_bot(args: argparse.Namespace) -> None:
                     LOGGER.exception("Daily report polling failed report_day=%s", report_day)
             await asyncio.sleep(DAILY_REPORT_POLL_SECONDS)
 
+    async def maybe_random_push(message) -> None:
+        """群聊有人说话时，按概率+冷却冷不丁丢一张抽象奶图，只发图不说话。
+
+        仅在群聊生效；被踢出的群和冷却期内跳过；发送遇到 TARGET_REVOKED 标记该群失效。
+        """
+        if message.chat_type not in {"group", "topic"}:
+            return
+        if args.random_push_probability <= 0:
+            return
+        now = time_module.monotonic()
+        last = last_random_push.get(message.chat_id)
+        if last is not None and now - last < args.random_push_cooldown_seconds:
+            return
+        if secrets.SystemRandom().random() >= args.random_push_probability:
+            return
+        asset = await asyncio.to_thread(store.random_milk_asset)
+        if not asset:
+            return
+        # 先占住冷却，避免并发消息同时触发多张。
+        last_random_push[message.chat_id] = now
+        result = await channel.send(
+            message.chat_id,
+            {"image": {"source": str(asset.path)}},
+        )
+        if result.success:
+            LOGGER.info(
+                "Random push sent chat_hash=%s asset_id=%d",
+                store.identity_hash(message.chat_id),
+                asset.id,
+            )
+            return
+        if result.error and result.error.code == FeishuChannelErrorCode.TARGET_REVOKED:
+            await asyncio.to_thread(store.deactivate_chat, message.chat_id)
+            LOGGER.warning(
+                "Deactivated revoked chat chat_hash=%s",
+                store.identity_hash(message.chat_id),
+            )
+        else:
+            LOGGER.error("Random push failed error=%s", result.error)
+
     async def on_message(message) -> None:
         if message.sender_is_bot:
             return
@@ -1082,6 +1162,8 @@ async def run_bot(args: argparse.Namespace) -> None:
             if await handle_command(message):
                 return
             if not has_direct_image(message) and not message.mentioned_bot:
+                # 群里有人正常聊天（没发图、没 @），按概率冷不丁丢一张抽象奶图。
+                await maybe_random_push(message)
                 return
 
             target = await resolve_image_target(channel, message)

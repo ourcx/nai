@@ -199,7 +199,9 @@ class BotStore:
                     chat_hash TEXT PRIMARY KEY,
                     chat_id TEXT NOT NULL,
                     chat_type TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL
+                    last_seen_at TEXT NOT NULL,
+                    -- 机器人被踢出群后标记为 0，不再向它发送每日播报和主动推送。
+                    active INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS daily_reports (
@@ -303,6 +305,16 @@ class BotStore:
             }
             if "phash" not in asset_columns:
                 connection.execute("ALTER TABLE assets ADD COLUMN phash TEXT")
+            chat_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(chat_targets)"
+                ).fetchall()
+            }
+            if "active" not in chat_columns:
+                connection.execute(
+                    "ALTER TABLE chat_targets ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
+                )
         # 老库新增 phash 列后为存量图回填一次指纹，让稀有度统计立刻可用。
         self._backfill_phashes()
 
@@ -566,6 +578,26 @@ class BotStore:
                 ).fetchall()
         return self._asset_from_row(secrets.choice(rows)) if rows else None
 
+    def random_milk_asset(self) -> AssetRecord | None:
+        """主动推送用：随机取一张奶龙或奶蛙图（含种子图）。
+
+        先在奶龙/奶蛙两类间等概率选一类再抽图，避免某类图多就总发那类；都没有则返回 None。
+        按 assets.label 取，收录图和种子图都算。
+        """
+        with self._connect() as connection:
+            by_label: dict[str, list] = {}
+            for label in ("nailong", "naiwa"):
+                rows = connection.execute(
+                    "SELECT * FROM assets WHERE label = ?",
+                    (label,),
+                ).fetchall()
+                if rows:
+                    by_label[label] = rows
+            if not by_label:
+                return None
+            label = secrets.choice(sorted(by_label))
+        return self._asset_from_row(secrets.choice(by_label[label]))
+
     def next_chain_asset(
         self,
         *,
@@ -711,6 +743,7 @@ class BotStore:
                 SELECT chat_targets.chat_id
                 FROM chat_targets
                 WHERE chat_targets.chat_type IN ('group', 'topic')
+                  AND chat_targets.active = 1
                   AND EXISTS (
                       SELECT 1
                       FROM observations
@@ -731,6 +764,14 @@ class BotStore:
             DailyReportTarget(chat_id=row["chat_id"], report_day=report_day)
             for row in rows
         ]
+
+    def deactivate_chat(self, chat_id: str) -> None:
+        """机器人被踢出群（发送返回 TARGET_REVOKED）后调用，标记该群失效，不再发送。"""
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE chat_targets SET active = 0 WHERE chat_hash = ?",
+                (self.identity_hash(chat_id),),
+            )
 
     def mark_daily_report_sent(
         self,
