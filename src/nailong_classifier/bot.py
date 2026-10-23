@@ -23,6 +23,7 @@ from lark_channel.core import LogLevel
 
 from .catalog_document import CatalogDocumentClient
 from .contact import ContactResolver
+from .douyin import DouyinSearchError, DouyinVideo, search_douyin_videos
 from .hdr import (
     DEFAULT_HDR_PEAK_NITS,
     DEFAULT_HDR_PROBABILITY,
@@ -107,6 +108,7 @@ DEFAULT_DOUYIN_VIDEO_PUSH_PROBABILITY = 0.4
 # 同一群在滚动一小时内最多发送两条链接。
 DEFAULT_DOUYIN_VIDEO_PUSH_WINDOW_SECONDS = 3600
 DEFAULT_DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW = 2
+DEFAULT_DOUYIN_SEARCH_CACHE_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -1328,7 +1330,25 @@ def parse_args() -> argparse.Namespace:
         "--douyin-video-urls",
         type=parse_douyin_video_urls,
         default=parse_douyin_video_urls(os.getenv("DOUYIN_VIDEO_URLS", "")),
-        help="Comma-separated Douyin video URLs. Empty disables video link pushes.",
+        help="Fallback comma-separated Douyin video URLs when cookie search is disabled.",
+    )
+    parser.add_argument(
+        "--douyin-cookie-file",
+        type=Path,
+        default=Path(os.getenv("DOUYIN_COOKIE_FILE"))
+        if os.getenv("DOUYIN_COOKIE_FILE")
+        else None,
+        help="Path to a private browser-exported Douyin cookie JSON file.",
+    )
+    parser.add_argument(
+        "--douyin-search-cache-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "DOUYIN_SEARCH_CACHE_SECONDS",
+                str(DEFAULT_DOUYIN_SEARCH_CACHE_SECONDS),
+            )
+        ),
     )
     parser.add_argument(
         "--douyin-video-push-probability",
@@ -1381,6 +1401,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("douyin video push window seconds must be positive")
     if args.douyin_video_push_max_per_window <= 0:
         parser.error("douyin video push max per window must be positive")
+    if args.douyin_search_cache_seconds <= 0:
+        parser.error("douyin search cache seconds must be positive")
     return args
 
 
@@ -1412,6 +1434,9 @@ async def run_bot(args: argparse.Namespace) -> None:
     contact_resolver = ContactResolver(channel.client)
     # 每个群上次主动推送的单调时钟时间，用于冷却；进程内存着即可，重启清零无妨。
     last_random_push: dict[str, float] = {}
+    douyin_search_lock = asyncio.Lock()
+    douyin_videos: list[DouyinVideo] = []
+    douyin_videos_fetched_at = 0.0
     catalog_sync_event = asyncio.Event()
     catalog_sync_lock = asyncio.Lock()
     catalog_document: CatalogDocumentClient | None = None
@@ -2077,12 +2102,37 @@ async def run_bot(args: argparse.Namespace) -> None:
 
     async def maybe_douyin_video_push(message) -> bool:
         """按配置概率发送抖音奶龙/奶娃链接，并按群限制滚动窗口内的发送次数。"""
-        if message.chat_type not in {"group", "topic"} or not args.douyin_video_urls:
+        if message.chat_type not in {"group", "topic"}:
+            return False
+        if not args.douyin_cookie_file and not args.douyin_video_urls:
             return False
         if args.douyin_video_push_probability <= 0:
             return False
         if secrets.SystemRandom().random() >= args.douyin_video_push_probability:
             return False
+        nonlocal douyin_videos_fetched_at
+        async with douyin_search_lock:
+            now = time_module.monotonic()
+            if (
+                args.douyin_cookie_file
+                and now - douyin_videos_fetched_at >= args.douyin_search_cache_seconds
+            ):
+                try:
+                    douyin_videos[:] = await asyncio.to_thread(
+                        search_douyin_videos,
+                        args.douyin_cookie_file,
+                    )
+                    douyin_videos_fetched_at = now
+                    LOGGER.info("Douyin search cache refreshed video_count=%d", len(douyin_videos))
+                except DouyinSearchError:
+                    LOGGER.warning("Douyin search failed; skipping video link push", exc_info=True)
+                    return False
+            if douyin_videos:
+                video_url = secrets.choice(douyin_videos).url
+            elif args.douyin_video_urls:
+                video_url = secrets.choice(args.douyin_video_urls)
+            else:
+                return False
         reservation_id = await asyncio.to_thread(
             store.reserve_video_link_push,
             message.chat_id,
@@ -2091,7 +2141,6 @@ async def run_bot(args: argparse.Namespace) -> None:
         )
         if reservation_id is None:
             return False
-        video_url = secrets.choice(args.douyin_video_urls)
         result = await channel.send(message.chat_id, {"text": f"来点奶：{video_url}"})
         if result.success:
             LOGGER.info(
@@ -2325,7 +2374,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         "Starting bot with model=%s device=%s threshold=%.3f state_dir=%s "
         "daily_report_time=%s catalog_document_sync=%s hdr_probability=%.2f hdr_peak_nits=%.0f "
         "random_push_probability=%.2f random_push_cooldown_seconds=%d "
-        "douyin_video_urls=%d douyin_video_push_probability=%.2f "
+        "douyin_video_urls=%d douyin_cookie_search=%s douyin_video_push_probability=%.2f "
         "douyin_video_push_window_seconds=%d douyin_video_push_max_per_window=%d",
         args.model,
         predictor.device,
@@ -2338,6 +2387,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         args.random_push_probability,
         args.random_push_cooldown_seconds,
         len(args.douyin_video_urls),
+        bool(args.douyin_cookie_file),
         args.douyin_video_push_probability,
         args.douyin_video_push_window_seconds,
         args.douyin_video_push_max_per_window,

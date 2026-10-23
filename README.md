@@ -93,7 +93,7 @@ uv run nailong-bot
 - 发送 `猜图`（或 `盲盒猜图`）开一局盲盒猜图：机器人从图鉴里随机抽一张奶图，裁出局部并打上高斯模糊出题，群友直接发 `奶龙` 或 `奶蛙` 抢答，本群第一个答对的人得 1 分并亮出完整原图。发 `公布答案` 揭晓本局但不给任何人加分，发 `猜图榜` 查看本群积分排行。积分按群聊独立统计。
 - 发送 `今日奶运`（也支持 `奶运`、`奶龙签`、`抽奶签`）抽当天奶签，获得奶气值、接梗力、宜忌、关键词和群聊称号。同一人在同一群同一天结果固定，第二天自动换签。
 - 发送 `@我是奶龙 help` 或 `@我是奶龙 帮助`，查看完整玩法。
-- 配置 `DOUYIN_VIDEO_URLS` 后，群聊普通消息有 40% 概率先触发一条奶龙/奶娃抖音视频链接。同一群按滚动一小时最多发送 2 条；链接发送成功时不会再触发本条消息的随机奶图。链接池为空时此功能关闭。
+- 配置 `DOUYIN_COOKIE_FILE` 后，机器人优先搜索“奶龙”和“奶娃”的抖音公开视频，缓存 15 分钟后随机选一条发送；Cookie 只保存在服务器受限路径，不进入仓库或日志。Cookie 搜索不可用时才使用 `DOUYIN_VIDEO_URLS` 固定链接池。群聊普通消息有 40% 概率触发视频链接，同一群按滚动一小时最多发送 2 条；链接发送成功时不会再触发本条消息的随机奶图。
 - 群聊普通消息有 3% 概率触发主动奶图，同一群冷却 2 小时，始终只发图片。其中默认 20% 的奶图转成带增益图的 Ultra HDR JPEG，目标高光 1000 尼特；转换失败发原图，原图库文件不覆盖。GIF 转为当前首帧静态图。
 - 发送 `HDR奶图`、`HDR奶龙` 或 `来张HDR奶图`，立即从奶龙/奶蛙图池选图转换并回复，不用等随机触发。编码或 HDR 上传失败时回退原图，发送日志记录 `hdr=True/False`。
 
@@ -101,7 +101,7 @@ uv run nailong-bot
 
 HDR 参数通过 `RANDOM_PUSH_HDR_PROBABILITY`（0~1，设 0 关闭接龙和主动推送的随机转换，手动指令仍可使用）和 `HDR_PEAK_NITS`（大于 203、不超过 10000）调整。HDR 目标亮度是编码参数，实际高亮取决于接收端屏幕、飞书客户端是否支持 HDR，以及上传后增益图是否被保留；普通客户端仍可显示 JPEG 底图。可用以下命令单独制作并保存图片：
 
-视频链接通过 `DOUYIN_VIDEO_URLS` 配置，使用英文逗号分隔的 `https://v.douyin.com/...` 或 `https://www.douyin.com/...` 分享链接。`DOUYIN_VIDEO_PUSH_PROBABILITY` 默认 `0.4`，`DOUYIN_VIDEO_PUSH_WINDOW_SECONDS` 默认 `3600`，`DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW` 默认 `2`。次数按群聊持久化记录，服务重启后仍会继续限流。
+视频链接优先通过 `DOUYIN_COOKIE_FILE` 配置的浏览器导出 Cookie 检索；`DOUYIN_SEARCH_CACHE_SECONDS` 默认 `900`。Cookie 搜索失败时可回退到 `DOUYIN_VIDEO_URLS`，使用英文逗号分隔的 `https://v.douyin.com/...` 或 `https://www.douyin.com/...` 分享链接。`DOUYIN_VIDEO_PUSH_PROBABILITY` 默认 `0.4`，`DOUYIN_VIDEO_PUSH_WINDOW_SECONDS` 默认 `3600`，`DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW` 默认 `2`。次数按群聊持久化记录，服务重启后仍会继续限流。
 
 ```bash
 uv run nailong-hdr path/to/milk.png /tmp/milk-hdr.jpg --peak-nits 1000

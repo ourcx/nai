@@ -12,6 +12,7 @@ from lark_channel.channel.errors import FeishuChannelErrorCode
 from PIL import Image
 
 import nailong_classifier.bot as bot
+from nailong_classifier.douyin import DouyinVideo
 from nailong_classifier.model import Prediction
 from nailong_classifier.storage import BotStore
 
@@ -40,6 +41,7 @@ def run_mock_bot(
     image: bool = False,
     hdr_probability: float = 1.0,
     douyin_video_urls: list[str] | None = None,
+    douyin_cookie_file: Path | None = None,
     first_error: FeishuChannelErrorCode | None = None,
 ):
     store = BotStore(tmp_path)
@@ -106,6 +108,7 @@ def run_mock_bot(
     args.random_push_probability = 1
     args.random_push_hdr_probability = hdr_probability
     args.douyin_video_urls = douyin_video_urls or []
+    args.douyin_cookie_file = douyin_cookie_file
     args.douyin_video_push_probability = 1
     asyncio.run(bot.run_bot(args))
     return calls, store
@@ -159,6 +162,32 @@ def test_normal_chat_video_link_push_takes_priority_over_random_image(
 
     assert calls == [
         ({"text": "来点奶：https://v.douyin.com/nailong-video/"}, None),
+    ]
+
+
+def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, monkeypatch) -> None:
+    cookie_file = tmp_path / "douyin-cookies.json"
+    cookie_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(
+        bot,
+        "search_douyin_videos",
+        lambda path: [
+            DouyinVideo(
+                url="https://www.douyin.com/video/123",
+                title="奶龙测试视频",
+            )
+        ],
+    )
+
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="随便聊聊",
+        douyin_cookie_file=cookie_file,
+    )
+
+    assert calls == [
+        ({"text": "来点奶：https://www.douyin.com/video/123"}, None),
     ]
 
 
