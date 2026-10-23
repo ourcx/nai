@@ -60,9 +60,10 @@ def _videos_from_payload(payload: dict[str, Any], keyword: str) -> list[DouyinVi
     for item in payload.get("data", []):
         if not isinstance(item, dict):
             continue
-        awemes = item.get("aweme_list", [])
+        awemes = item.get("aweme_list")
         if not isinstance(awemes, list):
-            continue
+            aweme_info = item.get("aweme_info")
+            awemes = [aweme_info] if isinstance(aweme_info, dict) else []
         for aweme in awemes:
             if not isinstance(aweme, dict):
                 continue

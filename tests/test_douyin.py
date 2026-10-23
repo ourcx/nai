@@ -58,7 +58,8 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
                         {"aweme_id": "123", "desc": f"{keyword}重复条"},
                         {"aweme_id": "456", "desc": "无关内容"},
                     ]
-                }
+                },
+                {"aweme_info": {"aweme_id": "789", "desc": f"{keyword}卡片视频"}},
             ],
         }
         return FakeResponse(json.dumps(payload).encode())
@@ -69,6 +70,7 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
 
     assert [video.url for video in videos] == [
         "https://www.douyin.com/video/123",
+        "https://www.douyin.com/video/789",
     ]
     assert len(requests) == 2
     assert requests[0].get_header("Cookie") == "sessionid=private-cookie-value"
