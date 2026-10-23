@@ -23,7 +23,13 @@ from lark_channel.core import LogLevel
 
 from .catalog_document import CatalogDocumentClient
 from .contact import ContactResolver
-from .douyin import DouyinSearchError, DouyinVideo, choose_douyin_video, search_douyin_videos
+from .douyin import (
+    SEARCH_KEYWORDS,
+    DouyinSearchError,
+    DouyinVideo,
+    choose_douyin_video,
+    search_douyin_videos,
+)
 from .hdr import (
     DEFAULT_HDR_PEAK_NITS,
     DEFAULT_HDR_PROBABILITY,
@@ -570,6 +576,30 @@ def parse_douyin_video_urls(value: str) -> list[str]:
                 "douyin video URLs must use HTTPS and a douyin.com domain"
             )
     return list(dict.fromkeys(urls))
+
+
+def parse_douyin_search_keywords(value: str) -> tuple[str, ...]:
+    """解析逗号或换行分隔的话题；# 前缀仅作展示习惯，不传入抖音搜索接口。"""
+    keywords = tuple(
+        dict.fromkeys(
+            item.strip().lstrip("#").strip()
+            for item in re.split(r"[\n,]+", value)
+            if item.strip().lstrip("#").strip()
+        )
+    )
+    if not keywords:
+        raise argparse.ArgumentTypeError("at least one Douyin search keyword is required")
+    if len(keywords) > 10:
+        raise argparse.ArgumentTypeError("at most 10 Douyin search keywords are allowed")
+    return keywords
+
+
+DOUYIN_TOPIC_PATTERN = re.compile(r"(?<!\S)#([^\s#，。！？、,.!?]{1,30})")
+
+
+def parse_douyin_topic_request(text: str) -> tuple[str, ...]:
+    """提取 @机器人消息中的 #话题；最多三项，避免一次请求过多搜索词。"""
+    return tuple(dict.fromkeys(match.group(1) for match in DOUYIN_TOPIC_PATTERN.finditer(text)))[:3]
 
 
 def has_direct_image(message) -> bool:
@@ -1341,6 +1371,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to a private browser-exported Douyin cookie JSON file.",
     )
     parser.add_argument(
+        "--douyin-search-keywords",
+        type=parse_douyin_search_keywords,
+        default=parse_douyin_search_keywords(
+            os.getenv("DOUYIN_SEARCH_KEYWORDS", ",".join(SEARCH_KEYWORDS))
+        ),
+        help="Comma-separated Douyin topics. A leading # is optional.",
+    )
+    parser.add_argument(
         "--douyin-search-cache-seconds",
         type=int,
         default=int(
@@ -1435,8 +1473,7 @@ async def run_bot(args: argparse.Namespace) -> None:
     # 每个群上次主动推送的单调时钟时间，用于冷却；进程内存着即可，重启清零无妨。
     last_random_push: dict[str, float] = {}
     douyin_search_lock = asyncio.Lock()
-    douyin_videos: list[DouyinVideo] = []
-    douyin_videos_fetched_at = 0.0
+    douyin_video_cache: dict[tuple[str, ...], tuple[float, list[DouyinVideo]]] = {}
     catalog_sync_event = asyncio.Event()
     catalog_sync_lock = asyncio.Lock()
     catalog_document: CatalogDocumentClient | None = None
@@ -1546,6 +1583,30 @@ async def run_bot(args: argparse.Namespace) -> None:
             )
         return result
 
+    async def cached_douyin_videos(keywords: tuple[str, ...]) -> list[DouyinVideo]:
+        if not args.douyin_cookie_file:
+            return []
+        async with douyin_search_lock:
+            now = time_module.monotonic()
+            fetched_at, videos = douyin_video_cache.get(keywords, (0.0, []))
+            if now - fetched_at >= args.douyin_search_cache_seconds:
+                try:
+                    videos = await asyncio.to_thread(
+                        search_douyin_videos,
+                        args.douyin_cookie_file,
+                        keywords=keywords,
+                    )
+                    douyin_video_cache[keywords] = (now, videos)
+                    LOGGER.info(
+                        "Douyin search cache refreshed topics=%s video_count=%d",
+                        ",".join(keywords),
+                        len(videos),
+                    )
+                except DouyinSearchError:
+                    LOGGER.warning("Douyin search failed; skipping video link push", exc_info=True)
+                    return []
+            return videos
+
     async def reply_catalog(
         message,
         assets: list[AssetRecord],
@@ -1581,6 +1642,16 @@ async def run_bot(args: argparse.Namespace) -> None:
         if message.raw_content_type not in {"text", "post"}:
             return False
         text = message.body_text or message.content_text
+
+        requested_topics = parse_douyin_topic_request(text)
+        if message.mentioned_bot and requested_topics:
+            videos = await cached_douyin_videos(requested_topics)
+            if not videos:
+                await reply(message, "这个话题暂时没有找到可用视频，换个 #话题 试试。")
+                return True
+            video = choose_douyin_video(videos, keywords=requested_topics)
+            await reply(message, f"来点#{video.keyword}：{video.url}")
+            return True
 
         if is_help_request(text, mentioned_bot=message.mentioned_bot):
             await reply(message, format_help_message(args.daily_report_time))
@@ -2110,29 +2181,16 @@ async def run_bot(args: argparse.Namespace) -> None:
             return False
         if secrets.SystemRandom().random() >= args.douyin_video_push_probability:
             return False
-        nonlocal douyin_videos_fetched_at
-        async with douyin_search_lock:
-            now = time_module.monotonic()
-            if (
-                args.douyin_cookie_file
-                and now - douyin_videos_fetched_at >= args.douyin_search_cache_seconds
-            ):
-                try:
-                    douyin_videos[:] = await asyncio.to_thread(
-                        search_douyin_videos,
-                        args.douyin_cookie_file,
-                    )
-                    douyin_videos_fetched_at = now
-                    LOGGER.info("Douyin search cache refreshed video_count=%d", len(douyin_videos))
-                except DouyinSearchError:
-                    LOGGER.warning("Douyin search failed; skipping video link push", exc_info=True)
-                    return False
-            if douyin_videos:
-                video_url = choose_douyin_video(douyin_videos).url
-            elif args.douyin_video_urls:
-                video_url = secrets.choice(args.douyin_video_urls)
-            else:
-                return False
+        douyin_videos = await cached_douyin_videos(args.douyin_search_keywords)
+        if douyin_videos:
+            video_url = choose_douyin_video(
+                douyin_videos,
+                keywords=args.douyin_search_keywords,
+            ).url
+        elif args.douyin_video_urls:
+            video_url = secrets.choice(args.douyin_video_urls)
+        else:
+            return False
         reservation_id = await asyncio.to_thread(
             store.reserve_video_link_push,
             message.chat_id,

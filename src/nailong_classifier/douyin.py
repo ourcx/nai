@@ -11,7 +11,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 SEARCH_ENDPOINT = "https://www.douyin.com/aweme/v1/web/general/search/single/"
-SEARCH_KEYWORDS = ("奶龙", "奶娃")
+SEARCH_KEYWORDS = ("奶蛙", "文艺复兴", "豆奶")
 COOKIE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 OFFICIAL_AUTHOR_NAMES = frozenset({"奶龙"})
 
@@ -149,7 +149,17 @@ def search_douyin_videos(
     return list(videos.values())
 
 
-def choose_douyin_video(videos: list[DouyinVideo]) -> DouyinVideo:
-    """优先发非官方奶娃视频；没有奶娃候选时才回退到其他非官方奶图。"""
-    naiwa_videos = [video for video in videos if video.keyword == "奶娃"]
-    return secrets.choice(naiwa_videos or videos)
+def choose_douyin_video(
+    videos: list[DouyinVideo],
+    *,
+    keywords: tuple[str, ...] = SEARCH_KEYWORDS,
+) -> DouyinVideo:
+    """先在有结果的话题之间等概率选择，再随机挑该话题的一条视频。"""
+    by_keyword = {
+        keyword: [video for video in videos if video.keyword == keyword]
+        for keyword in keywords
+    }
+    available_keywords = [keyword for keyword in keywords if by_keyword[keyword]]
+    if not available_keywords:
+        raise DouyinSearchError("Douyin search has no video for configured topics")
+    return secrets.choice(by_keyword[secrets.choice(available_keywords)])

@@ -92,7 +92,7 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
 
     monkeypatch.setattr("nailong_classifier.douyin.urlopen", fake_urlopen)
 
-    videos = search_douyin_videos(cookie_file, count=3)
+    videos = search_douyin_videos(cookie_file, keywords=("奶龙", "奶娃"), count=3)
 
     assert [video.url for video in videos] == [
         "https://www.douyin.com/video/123",
@@ -102,7 +102,9 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
     assert requests[0].get_header("Cookie") == "sessionid=private-cookie-value"
 
 
-def test_choose_douyin_video_prefers_naiwa(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_choose_douyin_video_selects_from_available_topics_equally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     videos = [
         DouyinVideo(
             url="https://www.douyin.com/video/1",
@@ -119,7 +121,9 @@ def test_choose_douyin_video_prefers_naiwa(monkeypatch: pytest.MonkeyPatch) -> N
     ]
     monkeypatch.setattr("nailong_classifier.douyin.secrets.choice", lambda values: values[0])
 
-    assert choose_douyin_video(videos).url == "https://www.douyin.com/video/2"
+    assert choose_douyin_video(videos, keywords=("奶龙", "奶娃")).url == (
+        "https://www.douyin.com/video/1"
+    )
 
 
 def test_search_douyin_videos_rejects_invalid_cookie_file(tmp_path: Path) -> None:

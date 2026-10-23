@@ -42,6 +42,7 @@ def run_mock_bot(
     hdr_probability: float = 1.0,
     douyin_video_urls: list[str] | None = None,
     douyin_cookie_file: Path | None = None,
+    mentioned_bot: bool = False,
     first_error: FeishuChannelErrorCode | None = None,
 ):
     store = BotStore(tmp_path)
@@ -71,7 +72,7 @@ def run_mock_bot(
                 raw_content_type="image" if image else "text",
                 resources=[SimpleNamespace(type="image", file_key="img_source")] if image else [],
                 reply_to_message_id=None,
-                mentioned_bot=False,
+                mentioned_bot=mentioned_bot,
                 message_id="source-id",
                 chat_id="chat-a",
                 chat_type="group",
@@ -171,11 +172,11 @@ def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, mon
     monkeypatch.setattr(
         bot,
         "search_douyin_videos",
-        lambda path: [
+        lambda path, *, keywords: [
             DouyinVideo(
                 url="https://www.douyin.com/video/123",
-                title="奶龙测试视频",
-                keyword="奶龙",
+                title="奶蛙测试视频",
+                keyword="奶蛙",
                 author_name="奶友",
             )
         ],
@@ -190,6 +191,35 @@ def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, mon
 
     assert calls == [
         ({"text": "来点奶：https://www.douyin.com/video/123"}, None),
+    ]
+
+
+def test_mentioned_topic_search_replies_with_requested_topic(tmp_path, monkeypatch) -> None:
+    cookie_file = tmp_path / "douyin-cookies.json"
+    cookie_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(
+        bot,
+        "search_douyin_videos",
+        lambda path, *, keywords: [
+            DouyinVideo(
+                url="https://www.douyin.com/video/456",
+                title="豆奶测试视频",
+                keyword="豆奶",
+                author_name="奶友",
+            )
+        ],
+    )
+
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="#豆奶",
+        douyin_cookie_file=cookie_file,
+        mentioned_bot=True,
+    )
+
+    assert calls == [
+        ({"text": "来点#豆奶：https://www.douyin.com/video/456"}, {"reply_to": "source-id"}),
     ]
 
 

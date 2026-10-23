@@ -30,6 +30,8 @@ from nailong_classifier.bot import (
     parse_correction_card_action,
     parse_correction_command,
     parse_daily_report_time,
+    parse_douyin_search_keywords,
+    parse_douyin_topic_request,
     parse_douyin_video_urls,
     should_reply_media_error,
 )
@@ -179,6 +181,24 @@ def test_parse_douyin_video_urls_accepts_share_domains_and_rejects_other_links()
     ]
     with pytest.raises(argparse.ArgumentTypeError):
         parse_douyin_video_urls("https://example.com/video")
+
+
+def test_parse_douyin_search_keywords_removes_hash_prefix_and_duplicates() -> None:
+    assert parse_douyin_search_keywords("#奶蛙, #文艺复兴\n豆奶,奶蛙") == (
+        "奶蛙",
+        "文艺复兴",
+        "豆奶",
+    )
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_douyin_search_keywords(" , \n ")
+
+
+def test_parse_douyin_topic_request_keeps_up_to_three_distinct_topics() -> None:
+    assert parse_douyin_topic_request("来点 #奶蛙 和 #文艺复兴，再来 #豆奶 #奶蛙 #多余") == (
+        "奶蛙",
+        "文艺复兴",
+        "豆奶",
+    )
 
 
 def test_chain_rotation_prefers_collected_assets_without_repeating(
