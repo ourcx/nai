@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from .data import (
+    DEFAULT_CLASS_BALANCE_POWER,
     build_evaluation_loader,
     build_train_val_loaders,
     validate_image_tree,
@@ -34,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Nailong and Naiwa CNN classifier")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    parser.add_argument(
+        "--initial-model",
+        type=Path,
+        help="Fine-tune an existing checkpoint instead of starting from ImageNet weights",
+    )
     parser.add_argument("--epochs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--image-size", type=int, default=224)
@@ -43,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--label-smoothing", type=float, default=0.15)
     parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument(
+        "--class-balance-power",
+        type=float,
+        default=DEFAULT_CLASS_BALANCE_POWER,
+        help="0 uses natural class frequency, 1 gives every class equal sampling weight",
+    )
     # 交叉验证中 0.65 比 0.60 少收进几张截图等非奶龙图，代价是少收录少量真奶龙/奶蛙。
     parser.add_argument("--threshold", type=float, default=0.65)
     parser.add_argument("--seed", type=int, default=20261017)
@@ -110,6 +122,7 @@ def train(args: argparse.Namespace) -> Path:
         val_fraction=args.val_fraction,
         seed=args.seed,
         num_workers=args.num_workers,
+        class_balance_power=args.class_balance_power,
     )
     test_loader = build_evaluation_loader(
         test_dir,
@@ -121,7 +134,26 @@ def train(args: argparse.Namespace) -> Path:
 
     device = select_device(args.device)
     print(f"device={device} classes={class_names}")
-    model = build_model(len(class_names), pretrained=True)
+    initial_metadata: dict[str, object] = {}
+    if args.initial_model is None:
+        model = build_model(len(class_names), pretrained=True)
+    else:
+        (
+            model,
+            initial_classes,
+            initial_image_size,
+            _initial_threshold,
+            initial_metadata,
+        ) = load_checkpoint(args.initial_model, device)
+        if initial_classes != class_names:
+            raise ValueError(
+                f"Initial model classes {initial_classes} do not match dataset {class_names}"
+            )
+        if initial_image_size != args.image_size:
+            raise ValueError(
+                f"Initial model image size {initial_image_size} does not match "
+                f"requested {args.image_size}"
+            )
     configure_for_finetuning(model)
     model.to(device)
 
@@ -199,6 +231,11 @@ def train(args: argparse.Namespace) -> Path:
                     "val_loss": best_loss,
                     "seed": args.seed,
                     "label_smoothing": args.label_smoothing,
+                    "class_balance_power": args.class_balance_power,
+                    "initial_model": (
+                        args.initial_model.name if args.initial_model is not None else None
+                    ),
+                    "fine_tuned_from_trained_at": initial_metadata.get("trained_at"),
                     "augmentation_profile": "color_invariant_v2",
                 },
             )

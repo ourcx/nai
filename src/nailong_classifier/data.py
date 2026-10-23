@@ -14,6 +14,7 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 SUPPORTED_SUFFIXES = {".gif", ".jpg", ".jpeg", ".png", ".webp"}
 ANIMATED_SAMPLE_WEIGHT = 4.0
+DEFAULT_CLASS_BALANCE_POWER = 1.0
 
 
 @dataclass(frozen=True)
@@ -149,8 +150,12 @@ def build_train_val_loaders(
     val_fraction: float,
     seed: int,
     num_workers: int,
+    class_balance_power: float = DEFAULT_CLASS_BALANCE_POWER,
 ) -> tuple[DataLoader, DataLoader, list[str]]:
     from sklearn.model_selection import train_test_split
+
+    if not 0.0 <= class_balance_power <= 1.0:
+        raise ValueError("class_balance_power must be between 0 and 1")
 
     index_dataset = _image_folder(train_dir)
     animated_indices = [
@@ -183,19 +188,28 @@ def build_train_val_loaders(
     if train_dataset.classes != class_names or val_dataset.classes != class_names:
         raise RuntimeError("Class order changed while building datasets")
 
-    # 线上收集的图里奶龙极少、其他图很多，按类别样本数倒数加权，
-    # 让每个类别每轮被抽到的总概率相同，避免模型只学会多数类。
-    # GIF 的额外权重叠加在类别权重之上，并按类别内总权重归一，不改变类别间的平衡。
+    # 线上收集的图里奶龙极少，完全按自然分布训练会忽略奶龙；但三类强制等概率也可能
+    # 过度重复少数类，增加相似黄色角色的误报。power 可在两者间连续调节：
+    # 0 为自然分布，1 为三类等概率，介于两者之间时保留部分真实类别分布。
+    # GIF 权重只改变同一类别内部的抽样，不改变该类别的总采样权重。
     animated_index_set = set(animated_indices)
     raw_weights = [
         ANIMATED_SAMPLE_WEIGHT if index in animated_index_set else 1.0
         for index in train_indices
     ]
-    class_weight_totals: Counter[int] = Counter()
+    class_raw_weight_totals: Counter[int] = Counter()
+    class_sample_counts: Counter[int] = Counter()
     for index, weight in zip(train_indices, raw_weights, strict=True):
-        class_weight_totals[index_dataset.targets[index]] += weight
+        target = index_dataset.targets[index]
+        class_raw_weight_totals[target] += weight
+        class_sample_counts[target] += 1
     sample_weights = [
-        weight / class_weight_totals[index_dataset.targets[index]]
+        (
+            weight
+            / class_raw_weight_totals[index_dataset.targets[index]]
+            * class_sample_counts[index_dataset.targets[index]]
+            ** (1.0 - class_balance_power)
+        )
         for index, weight in zip(train_indices, raw_weights, strict=True)
     ]
     sampler = WeightedRandomSampler(

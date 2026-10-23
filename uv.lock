@@ -107,6 +107,15 @@ wheels = [
 ]
 
 [[package]]
+name = "click"
+version = "8.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/0e/7fa0ef50764b67090eca4114772a2abf8b6148198475e54c660b97caeee6/click-8.5.0.tar.gz", hash = "sha256:ba0d2089de75ea0310e2dde03160e6ca10009947fb95a182f9b54021bb272e34", size = 382235, upload-time = "2026-08-26T13:33:14.56Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl", hash = "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360", size = 125251, upload-time = "2026-08-26T13:33:12.928Z" },
+]
+
+[[package]]
 name = "cloudpickle"
 version = "3.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -262,6 +271,50 @@ wheels = [
 ]
 
 [[package]]
+name = "imagecodecs"
+version = "2026.3.6"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.12'",
+]
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3b/8d/dc18623e5e926ad53c626e128c8baaf4ec42e41029cf0a07381cfef79289/imagecodecs-2026.3.6.tar.gz", hash = "sha256:471b8a4d1b3843cbf7179b45f7d7261f0c0b28809efc1ca6c47822477b143b85", size = 9565259, upload-time = "2026-03-07T01:26:41.183Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/db/873d063c99a726d772bf6f076288da59bb12e9f2af3518c2e4de5fde234d/imagecodecs-2026.3.6-cp311-abi3-macosx_10_15_x86_64.whl", hash = "sha256:44cfb3b609d941014f8ac7cf8611b15ccfd7119443bbb6b5e53916b242d31f9e", size = 13953250, upload-time = "2026-03-07T06:13:36.959Z" },
+    { url = "https://files.pythonhosted.org/packages/42/84/36c38a82f033ffbc9e706dad32be7148f130fc00e7bb417ab60e063897a0/imagecodecs-2026.3.6-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:e64037f22980a211b17bf6bdf03f14ff459a7432eec24f7a58c342f6992132fa", size = 11697496, upload-time = "2026-03-07T01:25:56.412Z" },
+    { url = "https://files.pythonhosted.org/packages/45/fa/f67c4e644fdf06503e120f9d1c8d8654b99066dea7093a674b67704fa4a4/imagecodecs-2026.3.6-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:30fa140bb1a112a889926af36977214ed52a22e4557356043259b5e2f79cfba5", size = 25604431, upload-time = "2026-03-07T01:26:00.703Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/29/93ea9cbab7f57b4e60480c51fc51d8e138e399d11797c981d5f6e79f9832/imagecodecs-2026.3.6-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:e30a14aa2e1c6c90e00375292726486c1d90bf003b1414d608ea4d1f62fd8a79", size = 26468592, upload-time = "2026-03-07T01:26:04.933Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/a7/e3a89b2c516eaca7446e8f1335daeec90764b50888af5e073a2b6a987fcf/imagecodecs-2026.3.6-cp311-abi3-win32.whl", hash = "sha256:c972a45dfee1befbac048ba3492607003e9a185811e8febdc1ed531d48c07e75", size = 15597722, upload-time = "2026-03-07T01:26:08.106Z" },
+    { url = "https://files.pythonhosted.org/packages/22/c7/2b37a7fe9a2eb21011e50f046d62e68ac4e0f8d6ad94d7a10e9f8e8d685f/imagecodecs-2026.3.6-cp311-abi3-win_amd64.whl", hash = "sha256:e8fba5b9ac7be109ed35070208bc1683fa17cc381ed9535a4eae200c6d883bd8", size = 19177403, upload-time = "2026-03-07T01:26:11.718Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/c7/94e930cef9e0a29a2df5e3ba3bacd2c2f1e34ca373fe48624b64af8ae91c/imagecodecs-2026.3.6-cp311-abi3-win_arm64.whl", hash = "sha256:fc4856913be6c8b3861223158920d934a0ae203149a435f585622dbbff8ed696", size = 15193605, upload-time = "2026-03-07T01:26:15.016Z" },
+]
+
+[[package]]
+name = "imagecodecs"
+version = "2026.10.10"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.12'",
+]
+dependencies = [
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/28/7d/1658ab284e024562f1fd3a684dded89b97125789743e0d1f57a494b64290/imagecodecs-2026.10.10.tar.gz", hash = "sha256:cde6914505668196b15e0f99dbc236b779e3b61217f04d2e498cbae790965f9f", size = 9685030, upload-time = "2026-10-09T22:45:38.598Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/29/df387ef1c428fd564274c742e0cc71a30506f278699528be1d3fa9e48ad5/imagecodecs-2026.10.10-cp312-abi3-macosx_12_0_arm64.whl", hash = "sha256:7e422e8fb55c717f90d5ead73374178546ad3372de584ee2b3c34f95ba6fa508", size = 13373607, upload-time = "2026-10-09T22:44:07.364Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/3c/80a0d3589a94348dee7904539c1d7a1e3ebd206a9b9ffc285c7352837a42/imagecodecs-2026.10.10-cp312-abi3-macosx_12_0_x86_64.whl", hash = "sha256:83a2b581868be7c3cbb095a300b1905639f3af4cd8ca6b59f84d176b5487ce27", size = 14983456, upload-time = "2026-10-09T22:44:10.899Z" },
+    { url = "https://files.pythonhosted.org/packages/29/33/a81db6af388919bbebcfc67eec127f7d91fbac0786497755989aa5b0d790/imagecodecs-2026.10.10-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:fe277d351622d4b53c637cf67c27202d485ee77aa33eaf99e9b55a79401831ab", size = 28763055, upload-time = "2026-10-09T22:44:16.009Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/3e/a3fadd95592572bd97d5034eecf31862ef921f977d96e4da542b6613d6b2/imagecodecs-2026.10.10-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:934ac2cd2d367cf6c891ee108627c47df85f21eea949adf3cf293d1fa8933e3f", size = 28350094, upload-time = "2026-10-09T22:44:20.646Z" },
+    { url = "https://files.pythonhosted.org/packages/17/80/3eedccc767d6ed2569ec2e1b759c1189d5db2fb09cfb542328778ef08ef3/imagecodecs-2026.10.10-cp312-abi3-pyemscripten_2025_0_wasm32.whl", hash = "sha256:a1d73a8962314ccf1ecf447c8646334f3084763c8f5c5610a30a61049d4fabbd", size = 4085560, upload-time = "2026-10-09T22:44:23.343Z" },
+    { url = "https://files.pythonhosted.org/packages/00/dd/9641540f5d34ad10aef4f44a6b4b919ef055e366a98c41e2b8f5decb6d6d/imagecodecs-2026.10.10-cp312-abi3-pyemscripten_2026_0_wasm32.whl", hash = "sha256:e9518d868cd862d17c9cb721435054c54671e30a01d385a8e263d07c2bbb83b8", size = 4068999, upload-time = "2026-10-09T22:44:25.302Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/81/728ab363b2677c45362f319b31fc442ad4e081425299546bc87b159e9a7f/imagecodecs-2026.10.10-cp312-abi3-win32.whl", hash = "sha256:dcc7098ab119fc7e9c8770f2305611f72cdc6c9c9bf5d157d3bca7a3a4e526ba", size = 14860487, upload-time = "2026-10-09T22:44:28.164Z" },
+    { url = "https://files.pythonhosted.org/packages/50/66/e83fe8867a4170b12a6a2a4721cbb764fd10f5a27291dc38dd9e1c2fa898/imagecodecs-2026.10.10-cp312-abi3-win_amd64.whl", hash = "sha256:6d02701315531283d6b6434dd871f17c1298c94be97dcd0ed590082d9a0b1f02", size = 19132594, upload-time = "2026-10-09T22:44:32.017Z" },
+    { url = "https://files.pythonhosted.org/packages/30/e7/24278542aef5e5afcb58fb13ec60ecb05f4c9c0c232156aeb9c4163fa42d/imagecodecs-2026.10.10-cp312-abi3-win_arm64.whl", hash = "sha256:250af78a96689ea9a23345dd9a7ef6579b7439887d7fe9fe76db5f97a5bbf8da", size = 15824882, upload-time = "2026-10-09T22:44:36.444Z" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -382,11 +435,17 @@ name = "nailong-naiwa-classifier"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "imagecodecs", version = "2026.3.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "imagecodecs", version = "2026.10.10", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "lark-channel-sdk" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pillow" },
     { name = "scikit-learn" },
+    { name = "starlette" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -397,13 +456,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "imagecodecs", specifier = ">=2025.3.30" },
     { name = "lark-channel-sdk", specifier = ">=1.1.0" },
+    { name = "numpy", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=11.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
     { name = "scikit-learn", specifier = ">=1.6" },
+    { name = "starlette", specifier = ">=0.48,<1" },
     { name = "torch", specifier = ">=2.6" },
     { name = "torchvision", specifier = ">=0.21" },
+    { name = "uvicorn", specifier = ">=0.35,<1" },
 ]
 provides-extras = ["dev"]
 
@@ -983,6 +1046,19 @@ wheels = [
 ]
 
 [[package]]
+name = "starlette"
+version = "0.52.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/0d/13d1d239a25cbfb19e740db83143e95c772a1fe10202dda4b76792b114dd/starlette-0.52.1-py3-none-any.whl", hash = "sha256:0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74", size = 74272, upload-time = "2026-01-18T13:34:09.188Z" },
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1093,6 +1169,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
+]
+
+[[package]]
+name = "uvicorn"
+version = "0.54.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/34/30e9280707135d2cfc589dfff3cb796bd07a3aeb1a3e415ba09dd89d7bb4/uvicorn-0.54.0.tar.gz", hash = "sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620", size = 112283, upload-time = "2026-09-25T06:52:37.601Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/0c/b54a4fdd7f90a3af8b02ebc9ce6712c2c208b7926a2f7bad95c33ebbe943/uvicorn-0.54.0-py3-none-any.whl", hash = "sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf", size = 87427, upload-time = "2026-09-25T06:52:35.829Z" },
 ]
 
 [[package]]

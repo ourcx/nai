@@ -4,6 +4,7 @@ set -euo pipefail
 HOST="${1:-tx}"
 REMOTE_DIR="${2:-/opt/nailong-bot}"
 SERVICE_NAME="nailong-bot"
+WEB_SERVICE_NAME="nailong-web"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -22,11 +23,12 @@ rsync -az --delete \
   --exclude='.pytest_cache/' \
   ./ "$HOST:$REMOTE_DIR/"
 
-ssh "$HOST" bash -s -- "$REMOTE_DIR" "$SERVICE_NAME" <<'REMOTE'
+ssh "$HOST" bash -s -- "$REMOTE_DIR" "$SERVICE_NAME" "$WEB_SERVICE_NAME" <<'REMOTE'
 set -euo pipefail
 
 REMOTE_DIR="$1"
 SERVICE_NAME="$2"
+WEB_SERVICE_NAME="$3"
 
 if ! id -u "$SERVICE_NAME" >/dev/null 2>&1; then
   useradd --system --home-dir "$REMOTE_DIR" --shell /sbin/nologin "$SERVICE_NAME"
@@ -37,6 +39,8 @@ python3 -m venv "$REMOTE_DIR/.venv"
 "$REMOTE_DIR/.venv/bin/python" -m pip install \
   lark-channel-sdk \
   Pillow \
+  "starlette>=0.48,<1" \
+  "uvicorn>=0.35,<1" \
   filelock \
   typing-extensions \
   "setuptools>=77" \
@@ -44,7 +48,8 @@ python3 -m venv "$REMOTE_DIR/.venv"
   networkx \
   jinja2 \
   fsspec \
-  numpy
+  "numpy>=2.0" \
+  "imagecodecs>=2025.3.30"
 "$REMOTE_DIR/.venv/bin/python" -m pip install \
   --no-deps \
   --index-url https://download.pytorch.org/whl/cpu \
@@ -56,6 +61,9 @@ chmod -R g+rX "$REMOTE_DIR"
 install -m 0644 \
   "$REMOTE_DIR/deploy/nailong-bot.service" \
   "/etc/systemd/system/$SERVICE_NAME.service"
+install -m 0644 \
+  "$REMOTE_DIR/deploy/nailong-web.service" \
+  "/etc/systemd/system/$WEB_SERVICE_NAME.service"
 systemctl daemon-reload
 
 if [[ -s "/etc/$SERVICE_NAME.env" ]]; then
@@ -63,9 +71,13 @@ if [[ -s "/etc/$SERVICE_NAME.env" ]]; then
   chmod 0640 "/etc/$SERVICE_NAME.env"
   systemctl enable --now "$SERVICE_NAME"
   systemctl restart "$SERVICE_NAME"
+  systemctl enable --now "$WEB_SERVICE_NAME"
+  systemctl restart "$WEB_SERVICE_NAME"
   systemctl --no-pager --full status "$SERVICE_NAME"
+  systemctl --no-pager --full status "$WEB_SERVICE_NAME"
 else
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl disable --now "$WEB_SERVICE_NAME" >/dev/null 2>&1 || true
   echo "Code deployed. Add /etc/$SERVICE_NAME.env before starting the service."
 fi
 REMOTE

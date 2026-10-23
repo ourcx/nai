@@ -1,0 +1,25 @@
+[Unit]
+Description=Nailong gallery development-box proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhuxinhap
+Group=zhuxinhap
+EnvironmentFile=/etc/nailong-gallery-proxy.env
+Environment=PROXY_CACHE_DIR=/var/cache/nailong-gallery-proxy
+ExecStart=/usr/bin/python3 /opt/nailong-gallery-proxy/proxy.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+CacheDirectory=nailong-gallery-proxy
+CacheDirectoryMode=0750
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,7 @@ from torch import nn
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 from .data import evaluation_transform
+from .milk import yellow_pixel_ratio
 
 ARCHITECTURE = "mobilenet_v3_small"
 
@@ -22,6 +23,8 @@ class Prediction:
     confidence: float
     accepted: bool
     scores: dict[str, float]
+    # 与分类概率分开保存，避免颜色占比改变模型置信度或入典门槛；旧调用可不提供。
+    yellow_ratio: float | None = None
 
 
 def select_device(requested: str = "auto") -> torch.device:
@@ -120,7 +123,9 @@ class NailongPredictor:
             return self.predict_image(image)
 
     def predict_image(self, image: Image.Image) -> Prediction:
-        prepared = ImageOps.exif_transpose(image).convert("RGB")
+        oriented = ImageOps.exif_transpose(image)
+        yellow_ratio = yellow_pixel_ratio(oriented)
+        prepared = oriented.convert("RGB")
         batch = self.transform(prepared).unsqueeze(0).to(self.device)
         with self._lock, torch.inference_mode():
             probabilities = torch.softmax(self.model(batch), dim=1)[0].cpu()
@@ -135,5 +140,5 @@ class NailongPredictor:
             confidence=confidence,
             accepted=confidence >= self.threshold,
             scores=scores,
+            yellow_ratio=yellow_ratio,
         )
-

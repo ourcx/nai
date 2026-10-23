@@ -5,7 +5,7 @@ import io
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,6 +38,8 @@ class AssetRecord:
     seen_count: int
     corrected: bool
     origin: str
+    # 首次入典时记下的发图者昵称；老库存量图或拿不到名字时为 None，图鉴不显示「首发」行。
+    discoverer_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,14 @@ class GuessRanking:
     score: int
 
 
+@dataclass(frozen=True)
+class HunterRanking:
+    """奶龙猎人榜上的一行：发图者昵称、首发入典的奶图数量。"""
+
+    display_name: str
+    discovered: int
+
+
 class BotStore:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -171,7 +181,11 @@ class BotStore:
                     origin TEXT NOT NULL DEFAULT 'collected',
                     -- 感知指纹：同一张表情不同版本的 phash 相近，用来数“撞脸数”算稀有度。
                     -- 为空表示这张图解析不了，统计时跳过。
-                    phash TEXT
+                    phash TEXT,
+                    -- 首发人：图片首次入典时记下发图者身份哈希和当时昵称（成就署名，定格）。
+                    -- 老库存量图这两列为 NULL，图鉴不显示「首发」行，无法补（哈希不可逆）。
+                    discoverer_hash TEXT,
+                    discoverer_name TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS observations (
@@ -223,6 +237,16 @@ class BotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_chain_replies_rotation
                 ON chain_replies(chat_hash, label, asset_id, sent_at);
+
+                -- 自动推送抖音链接：发送前先占位，保证并发消息和服务重启后仍按群限制滚动窗口次数。
+                CREATE TABLE IF NOT EXISTS video_link_pushes (
+                    id INTEGER PRIMARY KEY,
+                    chat_hash TEXT NOT NULL,
+                    reserved_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_video_link_pushes_window
+                ON video_link_pushes(chat_hash, reserved_at);
 
                 CREATE TABLE IF NOT EXISTS catalog_document_sync (
                     document_id TEXT NOT NULL,
@@ -305,6 +329,10 @@ class BotStore:
             }
             if "phash" not in asset_columns:
                 connection.execute("ALTER TABLE assets ADD COLUMN phash TEXT")
+            if "discoverer_hash" not in asset_columns:
+                connection.execute("ALTER TABLE assets ADD COLUMN discoverer_hash TEXT")
+            if "discoverer_name" not in asset_columns:
+                connection.execute("ALTER TABLE assets ADD COLUMN discoverer_name TEXT")
             chat_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -388,6 +416,7 @@ class BotStore:
         predicted_label: str,
         confidence: float,
         accepted: bool,
+        discoverer_name: str | None = None,
     ) -> ObservationRecord:
         self._validate_label(predicted_label)
         now = datetime.now(LOCAL_TIMEZONE)
@@ -441,9 +470,9 @@ class BotStore:
                 INSERT INTO assets (
                     sha256, label, confidence, file_name, first_seen_at,
                     first_seen_day, last_seen_at, seen_count, corrected, origin,
-                    phash
+                    phash, discoverer_hash, discoverer_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 'collected', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 'collected', ?, ?, ?)
                 ON CONFLICT(sha256) DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
                     seen_count = assets.seen_count + 1,
@@ -470,6 +499,8 @@ class BotStore:
                     day,
                     now_iso,
                     phash,
+                    sender_hash,
+                    discoverer_name,
                 ),
             )
             asset_row = connection.execute(
@@ -519,6 +550,36 @@ class BotStore:
                 (response_message_id, observation_id),
             )
 
+    def _apply_label_correction(
+        self,
+        connection: sqlite3.Connection,
+        observation: sqlite3.Row,
+        label: str,
+    ) -> CorrectionResult:
+        connection.execute(
+            """
+            UPDATE assets
+            SET label = ?, corrected = 1, confidence = 1.0
+            WHERE id = ?
+            """,
+            (label, observation["asset_id"]),
+        )
+        connection.execute(
+            """
+            UPDATE observations
+            SET final_label = ?
+            WHERE asset_id = ?
+            """,
+            (label, observation["asset_id"]),
+        )
+        return CorrectionResult(
+            observation_id=observation["id"],
+            asset_id=observation["asset_id"],
+            old_label=observation["label"],
+            new_label=label,
+            asset_path=self.assets_dir / observation["file_name"],
+        )
+
     def correct_label(self, reference_message_id: str, label: str) -> CorrectionResult | None:
         self._validate_label(label)
         with self._connect() as connection:
@@ -536,28 +597,51 @@ class BotStore:
             ).fetchone()
             if not observation:
                 return None
-            connection.execute(
+            return self._apply_label_correction(connection, observation, label)
+
+    def correct_card_label(
+        self,
+        response_message_id: str,
+        observation_id: int,
+        label: str,
+    ) -> CorrectionResult | None:
+        """只纠正与当前卡片消息绑定的识别记录，避免回调值跨卡片误用。"""
+        self._validate_label(label)
+        with self._connect() as connection:
+            observation = connection.execute(
                 """
-                UPDATE assets
-                SET label = ?, corrected = 1, confidence = 1.0
-                WHERE id = ?
+                SELECT observations.id, observations.asset_id, assets.label, assets.file_name
+                FROM observations
+                JOIN assets ON assets.id = observations.asset_id
+                WHERE observations.id = ?
+                  AND observations.response_message_id = ?
+                LIMIT 1
                 """,
-                (label, observation["asset_id"]),
-            )
-            connection.execute(
+                (observation_id, response_message_id),
+            ).fetchone()
+            if not observation:
+                return None
+            return self._apply_label_correction(connection, observation, label)
+
+    def observation_by_id(self, observation_id: int) -> ObservationRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
                 """
-                UPDATE observations
-                SET final_label = ?
-                WHERE asset_id = ?
+                SELECT assets.*, observations.id AS observation_id
+                FROM observations
+                JOIN assets ON assets.id = observations.asset_id
+                WHERE observations.id = ?
+                LIMIT 1
                 """,
-                (label, observation["asset_id"]),
-            )
-        return CorrectionResult(
-            observation_id=observation["id"],
-            asset_id=observation["asset_id"],
-            old_label=observation["label"],
-            new_label=label,
-            asset_path=self.assets_dir / observation["file_name"],
+                (observation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return ObservationRecord(
+            id=row["observation_id"],
+            asset=self._asset_from_row(row),
+            is_new_asset=False,
+            is_new_observation=False,
         )
 
     def random_asset(self, label: str, *, exclude_sha256: str | None = None) -> AssetRecord | None:
@@ -694,6 +778,60 @@ class BotStore:
                     response_message_id,
                     datetime.now(LOCAL_TIMEZONE).isoformat(),
                 ),
+            )
+
+    def reserve_video_link_push(
+        self,
+        chat_id: str,
+        *,
+        window_seconds: int,
+        max_pushes: int,
+        now: datetime | None = None,
+    ) -> int | None:
+        """为一条视频链接占用群聊额度；达到滚动窗口上限时返回 None。
+
+        在发送前占位，避免同一时刻收到多条消息时突破上限。发送失败时调用
+        release_video_link_push 释放这次占位。
+        """
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        if max_pushes <= 0:
+            raise ValueError("max_pushes must be positive")
+        reserved_at = now or datetime.now(LOCAL_TIMEZONE)
+        cutoff = reserved_at - timedelta(seconds=window_seconds)
+        chat_hash = self.identity_hash(chat_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM video_link_pushes WHERE reserved_at <= ?",
+                (cutoff.isoformat(),),
+            )
+            count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM video_link_pushes
+                WHERE chat_hash = ?
+                  AND reserved_at > ?
+                """,
+                (chat_hash, cutoff.isoformat()),
+            ).fetchone()["count"]
+            if count >= max_pushes:
+                return None
+            cursor = connection.execute(
+                """
+                INSERT INTO video_link_pushes (chat_hash, reserved_at)
+                VALUES (?, ?)
+                """,
+                (chat_hash, reserved_at.isoformat()),
+            )
+            return int(cursor.lastrowid)
+
+    def release_video_link_push(self, reservation_id: int) -> None:
+        """链接发送失败时释放预留额度。"""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM video_link_pushes WHERE id = ?",
+                (reservation_id,),
             )
 
     def daily_stats(self, chat_id: str, *, day: str | None = None) -> DailyStats:
@@ -1137,6 +1275,72 @@ class BotStore:
             for row in rows
         ]
 
+    def hunter_rankings(self, *, limit: int = 10) -> list[HunterRanking]:
+        """奶龙猎人榜：按「首发入典的收藏奶图数」排名。
+
+        只统计有首发人署名、且仍算作收藏奶图（奶龙/奶蛙）的图；老库无署名的图不计入。
+        同一人用 discoverer_hash 聚合，名字取最近一次记录到的昵称。
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH latest_predictions AS (
+                    SELECT
+                        observations.asset_id,
+                        observations.predicted_label,
+                        observations.accepted
+                    FROM observations
+                    JOIN (
+                        SELECT asset_id, MAX(id) AS latest_id
+                        FROM observations
+                        GROUP BY asset_id
+                    ) AS latest
+                      ON latest.latest_id = observations.id
+                ),
+                catalog_candidates AS (
+                    SELECT
+                        assets.discoverer_hash,
+                        assets.discoverer_name,
+                        assets.last_seen_at,
+                        CASE
+                            WHEN assets.corrected = 1 THEN assets.label
+                            WHEN latest_predictions.accepted = 1
+                                THEN latest_predictions.predicted_label
+                            ELSE 'other'
+                        END AS catalog_label
+                    FROM assets
+                    LEFT JOIN latest_predictions
+                      ON latest_predictions.asset_id = assets.id
+                    WHERE assets.origin = 'collected'
+                      AND assets.discoverer_hash IS NOT NULL
+                      AND assets.discoverer_name IS NOT NULL
+                )
+                SELECT
+                    discoverer_hash,
+                    COUNT(*) AS discovered,
+                    (
+                        SELECT inner_c.discoverer_name
+                        FROM catalog_candidates AS inner_c
+                        WHERE inner_c.discoverer_hash = catalog_candidates.discoverer_hash
+                        ORDER BY inner_c.last_seen_at DESC
+                        LIMIT 1
+                    ) AS display_name
+                FROM catalog_candidates
+                WHERE catalog_label IN ('nailong', 'naiwa')
+                GROUP BY discoverer_hash
+                ORDER BY discovered DESC, display_name ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            HunterRanking(
+                display_name=row["display_name"],
+                discovered=row["discovered"],
+            )
+            for row in rows
+        ]
+
     def mark_catalog_document_baseline(
         self,
         *,
@@ -1468,7 +1672,13 @@ class BotStore:
             seen_count=row["seen_count"],
             corrected=bool(row["corrected"]),
             origin=row["origin"],
+            discoverer_name=self._row_value(row, "discoverer_name"),
         )
+
+    @staticmethod
+    def _row_value(row: sqlite3.Row, key: str) -> str | None:
+        """安全读取某列，列不在本次查询结果里时返回 None（部分查询没 SELECT 该列）。"""
+        return row[key] if key in set(row.keys()) else None
 
     @staticmethod
     def _validate_label(label: str) -> None:

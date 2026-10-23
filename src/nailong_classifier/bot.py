@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
 from lark_channel.channel.errors import FeishuChannelErrorCode
@@ -21,7 +23,14 @@ from lark_channel.core import LogLevel
 
 from .catalog_document import CatalogDocumentClient
 from .contact import ContactResolver
+from .hdr import (
+    DEFAULT_HDR_PEAK_NITS,
+    DEFAULT_HDR_PROBABILITY,
+    random_milk_image_content,
+    validate_hdr_settings,
+)
 from .image_fingerprint import find_duplicate, try_content_hash, try_file_content_hash
+from .milk import combined_milk_concentration
 from .model import NailongPredictor, Prediction
 from .puzzle import try_make_puzzle_image
 from .rarity import Rarity
@@ -34,6 +43,7 @@ from .storage import (
     GuessRanking,
     GuessResult,
     GuessRound,
+    HunterRanking,
     ObservationRecord,
 )
 
@@ -44,6 +54,34 @@ DISPLAY_LABELS = {
     "naiwa": "奶蛙",
     "other": "其他",
 }
+# “其他”图按现有奶含量分档接梗；偏奶时怀疑漏识别，文字和卡片共用文案。
+OTHER_MILKY_THRESHOLD = 40
+OTHER_MILKY_REACTIONS = (
+    "这不是奶娃吧？！",
+    "别吓我，这不会真是奶龙吧？！",
+    "坏了，该不会是奶娃混进来了吧？！",
+    "等会儿，我怎么越看越像奶龙？！",
+    "救命，这奶味不对劲啊？！",
+    "嘶……你最好真不是奶龙！",
+    "完了，不会又让奶娃蒙混过关了吧？！",
+    "别吧？！奶龙已经藏成这样了？！",
+    "我有点慌，这张真不是奶娃？！",
+    "不敢细看了，怎么有股奶龙味？！",
+    "你别过来啊！该不会是奶娃吧？！",
+    "先别笑，我怕这真是没认出来的奶龙！",
+)
+OTHER_REACTIONS = (
+    "等等，奶龙呢？奶蛙呢？！",
+    "好家伙，奶龙奶蛙都没来？！",
+    "不是，怎么还混进来一张别的？！",
+    "嚯？！这位走错片场了吧！",
+    "嗯？！说好的奶龙奶蛙呢？",
+    "我奶呢？！那么大一口奶呢？！",
+    "啊这？！查无此奶！",
+    "等会儿？！奶龙奶蛙一个都没对上！",
+    "你管这叫奶图？！我得再看一眼！",
+    "救命？！奶龙奶蛙集体缺席！",
+)
 CORRECTION_PATTERN = re.compile(r"^(?:纠正(?:为|成)?|改成|这是)\s*(奶龙|奶蛙|其他)$")
 COMMAND_LABELS = {
     "奶龙": "nailong",
@@ -64,6 +102,11 @@ DAILY_REPORT_POLL_SECONDS = 60
 DEFAULT_RANDOM_PUSH_PROBABILITY = 0.03
 # 两次主动推送之间的最小间隔（秒），同一个群内生效，避免连着刷屏。默认 2 小时。
 DEFAULT_RANDOM_PUSH_COOLDOWN_SECONDS = 7200
+# 普通群消息触发抖音奶龙/奶娃视频链接的概率；链接池为空时功能自动关闭。
+DEFAULT_DOUYIN_VIDEO_PUSH_PROBABILITY = 0.4
+# 同一群在滚动一小时内最多发送两条链接。
+DEFAULT_DOUYIN_VIDEO_PUSH_WINDOW_SECONDS = 3600
+DEFAULT_DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW = 2
 
 
 @dataclass(frozen=True)
@@ -72,6 +115,17 @@ class ImageTarget:
     file_key: str | None = None
     resource_type: str | None = None
     reason: str = "missing"
+
+
+@dataclass(frozen=True)
+class MilkFortune:
+    score: int
+    banter: int
+    title: str
+    keyword: str
+    good: str
+    avoid: str
+    message: str
 
 
 def _decode_message_content(raw: dict[str, Any]) -> Any:
@@ -211,26 +265,44 @@ def format_prediction(prediction: Prediction) -> str:
     display_label = DISPLAY_LABELS.get(prediction.label, prediction.label)
     confidence = f"{prediction.confidence:.1%}"
     if not prediction.accepted:
-        return f"我不太确定。最高候选是「{display_label}」，置信度 {confidence}。"
+        uncertainty = f"我不太确定。最高候选是「{display_label}」，置信度 {confidence}。"
+        if is_milky_other(prediction):
+            return f"{other_reaction(prediction)} {uncertainty}"
+        return uncertainty
     if prediction.label == "other":
-        return f"识别结果：这张图不像奶龙或奶蛙。置信度 {confidence}。"
+        return f"{other_reaction(prediction)} 识别结果：其他。置信度 {confidence}。"
     return f"识别结果：{display_label}。置信度 {confidence}。"
 
 
 def milk_concentration(prediction: Prediction) -> int:
-    """把「奶龙 + 奶蛙」两类概率之和当作这张图的奶含量，取 0~100 的整数。
+    """用模型奶概率和可见黄色占比合成奶含量，所有文案与卡片使用同一读数。"""
+    return combined_milk_concentration(prediction.scores, prediction.yellow_ratio)
 
-    用两类之和而不是单一置信度，是为了让“偏奶但两类拿不准”的图也能有高浓度读数。
+
+def is_milky_other(prediction: Prediction) -> bool:
+    """沿用“有点奶”的分界，以模型奶概率和黄色占比的加权读数判断疑似漏识别。
+
+    “其他”也可能因置信度不足而未被接受，所以不以 accepted 限制这类怀疑语气。
     """
-    milk = prediction.scores.get("nailong", 0.0) + prediction.scores.get("naiwa", 0.0)
-    return max(0, min(100, round(milk * 100)))
+    return prediction.label == "other" and milk_concentration(prediction) >= OTHER_MILKY_THRESHOLD
 
 
-def format_concentration(prediction: Prediction) -> str:
+def other_reaction(prediction: Prediction) -> str:
+    reactions = OTHER_MILKY_REACTIONS if is_milky_other(prediction) else OTHER_REACTIONS
+    return secrets.choice(reactions)
+
+
+def format_concentration(prediction: Prediction, *, corrected: bool = False) -> str:
     """奶龙浓度检测仪：把识别置信度包装成一句分级吐槽，仅用于 @机器人 的娱乐回复。"""
     percent = milk_concentration(prediction)
     display_label = DISPLAY_LABELS.get(prediction.label, prediction.label)
-    if percent >= 90:
+    if is_milky_other(prediction):
+        verdict = (
+            "奶含量是娱乐读数，分类以人工纠正为准。"
+            if corrected
+            else "奶味有点可疑，可能是没认出来的奶龙或奶蛙。"
+        )
+    elif percent >= 90:
         verdict = f"纯度爆表！纯正{display_label}血统，建议立刻收藏。"
     elif percent >= 65:
         verdict = f"奶味浓郁，{display_label}认证通过。"
@@ -256,9 +328,12 @@ def format_mention_reply(
 ) -> str:
     """@机器人识别一张图时的完整回复：识别结论 + 奶龙浓度，奶图再附稀有度。
 
-    识别结论沿用既有文案（已确认图/模型不确定提示都不变），浓度和稀有度作为附加娱乐信息。
+    识别结论尊重人工纠正和模型置信度，浓度和稀有度作为附加娱乐信息。
     """
-    lines = [format_existing_observation(observation, prediction), format_concentration(prediction)]
+    lines = [
+        format_existing_observation(observation, prediction),
+        format_concentration(prediction, corrected=observation.asset.corrected),
+    ]
     if rarity is not None:
         lines.append(format_rarity(rarity))
     return "\n".join(lines)
@@ -275,6 +350,10 @@ def is_daily_stats_command(text: str) -> bool:
 
 def is_catalog_command(text: str) -> bool:
     return text.strip() in {"奶龙图鉴", "查看奶龙图鉴", "打开奶龙图鉴"}
+
+
+def is_hdr_milk_command(text: str) -> bool:
+    return text.strip().lower() in {"hdr奶图", "hdr奶龙", "来张hdr奶图"}
 
 
 def is_help_command(text: str) -> bool:
@@ -295,6 +374,95 @@ def is_guess_reveal_command(text: str) -> bool:
 
 def is_guess_ranking_command(text: str) -> bool:
     return text.strip() in {"猜图榜", "猜图排行榜", "猜图积分榜"}
+
+
+def is_hunter_ranking_command(text: str) -> bool:
+    return text.strip() in {"奶龙猎人榜", "猎人榜", "奶图猎人榜"}
+
+
+def is_milk_fortune_command(text: str) -> bool:
+    return text.strip() in {"今日奶运", "奶运", "奶龙签", "抽奶签"}
+
+
+MILK_FORTUNE_GOOD = (
+    "主动接住群友的梗",
+    "发一张压箱底奶图",
+    "夸群友一句真心话",
+    "猜图时相信第一直觉",
+    "忙里偷闲摸鱼五分钟",
+    "给今天定个小目标",
+)
+MILK_FORTUNE_AVOID = (
+    "把奶蛙认成奶龙",
+    "连续刷屏十张表情",
+    "空腹参加长会议",
+    "把群聊聊成工单群",
+    "为了最后一句争输赢",
+    "潜水到大家以为你掉线",
+)
+MILK_FORTUNE_KEYWORDS = (
+    "接梗",
+    "松弛",
+    "好奇",
+    "开怀",
+    "摸鱼",
+    "行动",
+    "分享",
+    "好运",
+)
+MILK_FORTUNE_MESSAGES = (
+    "今天的快乐藏在第一句主动开口里。",
+    "别急着证明自己，先把群里的气氛接住。",
+    "适合做一点不费劲、但能让人开心的小事。",
+    "你的好运来得很轻，可能就是一个刚好的表情包。",
+    "先完成最小的一步，剩下的奶气会自己跟上。",
+    "今天很适合把严肃的话说得稍微可爱一点。",
+)
+
+
+def make_milk_fortune(
+    *,
+    chat_id: str,
+    sender_id: str,
+    day: str,
+) -> MilkFortune:
+    """同一群、同一用户、同一天得到相同奶运，不落库也不会重复刷随机值。"""
+    digest = hashlib.sha256(f"{day}\0{chat_id}\0{sender_id}".encode()).digest()
+    score = int.from_bytes(digest[0:4], "big") % 101
+    banter = int.from_bytes(digest[4:8], "big") % 101
+    if score >= 95:
+        title = "天选奶龙"
+    elif score >= 80:
+        title = "群聊锦鲤"
+    elif score >= 60:
+        title = "元气奶龙"
+    elif score >= 40:
+        title = "稳稳奶友"
+    elif score >= 20:
+        title = "慢热奶龙"
+    else:
+        title = "潜水奶苗"
+    return MilkFortune(
+        score=score,
+        banter=banter,
+        title=title,
+        keyword=MILK_FORTUNE_KEYWORDS[digest[8] % len(MILK_FORTUNE_KEYWORDS)],
+        good=MILK_FORTUNE_GOOD[digest[9] % len(MILK_FORTUNE_GOOD)],
+        avoid=MILK_FORTUNE_AVOID[digest[10] % len(MILK_FORTUNE_AVOID)],
+        message=MILK_FORTUNE_MESSAGES[digest[11] % len(MILK_FORTUNE_MESSAGES)],
+    )
+
+
+def format_milk_fortune(fortune: MilkFortune, *, day: str) -> str:
+    return (
+        f"今日奶运：{fortune.title}\n"
+        f"奶气值 {fortune.score} · 接梗力 {fortune.banter}\n"
+        f"宜：{fortune.good}\n"
+        f"忌：{fortune.avoid}\n"
+        f"今日关键词：{fortune.keyword}\n"
+        f"{fortune.message}\n"
+        f"{day}，同一群同一天签固定。"
+    )
 
 
 GUESS_ANSWER_PATTERN = re.compile(r"^(?:猜|是|答案是?)?\s*(奶龙|奶蛙|其他)$")
@@ -351,6 +519,17 @@ def format_guess_ranking(rankings: list[GuessRanking]) -> str:
     return "\n".join(lines)
 
 
+def format_hunter_ranking(rankings: list[HunterRanking]) -> str:
+    if not rankings:
+        return "还没有人上榜。发奶龙或奶蛙图被收进图鉴，就能成为首发猎人。"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏹 奶龙猎人榜（首发入典数）"]
+    for index, ranking in enumerate(rankings):
+        prefix = medals[index] if index < len(medals) else f"{index + 1}."
+        lines.append(f"{prefix} {ranking.display_name}：{ranking.discovered} 张")
+    return "\n".join(lines)
+
+
 def parse_daily_report_time(value: str) -> time:
     try:
         return datetime.strptime(value, "%H:%M").time()
@@ -372,6 +551,23 @@ def parse_asset_ids(value: str) -> list[int]:
             "catalog baseline asset IDs must be positive integers"
         )
     return list(dict.fromkeys(asset_ids))
+
+
+def parse_douyin_video_urls(value: str) -> list[str]:
+    """解析逗号或换行分隔的抖音分享链接，拒绝非 HTTPS 或非抖音域名。"""
+    urls = [item.strip() for item in re.split(r"[\s,]+", value) if item.strip()]
+    for url in urls:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or not (hostname == "douyin.com" or hostname.endswith(".douyin.com"))
+        ):
+            raise argparse.ArgumentTypeError(
+                "douyin video URLs must use HTTPS and a douyin.com domain"
+            )
+    return list(dict.fromkeys(urls))
 
 
 def has_direct_image(message) -> bool:
@@ -406,6 +602,592 @@ def format_daily_stats(stats: DailyStats) -> str:
     )
 
 
+CARD_THEME_COLORS = {
+    "wb_handdrawn_vibes_canvas": {
+        "light_mode": "rgba(255,250,238,1)",
+        "dark_mode": "rgba(255,250,238,1)",
+    },
+    "wb_handdrawn_vibes_body": {
+        "light_mode": "rgba(255,250,238,1)",
+        "dark_mode": "rgba(255,250,238,1)",
+    },
+    "wb_handdrawn_vibes_panel": {
+        "light_mode": "rgba(255,255,246,1)",
+        "dark_mode": "rgba(255,255,246,1)",
+    },
+    "wb_handdrawn_vibes_ink": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_muted": {
+        "light_mode": "rgba(95,94,90,1)",
+        "dark_mode": "rgba(95,94,90,1)",
+    },
+    "wb_handdrawn_vibes_secondary": {
+        "light_mode": "rgba(221,214,200,1)",
+        "dark_mode": "rgba(221,214,200,1)",
+    },
+    "wb_handdrawn_vibes_accent": {
+        "light_mode": "rgba(173,222,255,1)",
+        "dark_mode": "rgba(173,222,255,1)",
+    },
+    "wb_handdrawn_vibes_accent_2": {
+        "light_mode": "rgba(254,197,84,1)",
+        "dark_mode": "rgba(254,197,84,1)",
+    },
+    "wb_handdrawn_vibes_button": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_button_text": {
+        "light_mode": "rgba(255,250,238,1)",
+        "dark_mode": "rgba(255,250,238,1)",
+    },
+    "wb_handdrawn_vibes_button_secondary": {
+        "light_mode": "rgba(255,255,246,1)",
+        "dark_mode": "rgba(255,255,246,1)",
+    },
+    "wb_handdrawn_vibes_button_secondary_text": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_icon_surface": {
+        "light_mode": "rgba(255,250,238,1)",
+        "dark_mode": "rgba(255,250,238,1)",
+    },
+    "wb_handdrawn_vibes_icon_border": {
+        "light_mode": "rgba(31,35,41,0.10)",
+        "dark_mode": "rgba(31,35,41,0.10)",
+    },
+    "wb_handdrawn_vibes_on_canvas": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_on_body": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_on_panel": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_on_accent": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+    "wb_handdrawn_vibes_on_accent_2": {
+        "light_mode": "rgba(15,15,14,1)",
+        "dark_mode": "rgba(15,15,14,1)",
+    },
+}
+
+
+def _theme_token(name: str) -> str:
+    return f"wb_handdrawn_vibes_{name}"
+
+
+def _theme_text(
+    text: str,
+    *,
+    color: str = "on_canvas",
+    size: str = "normal",
+    bold: bool = False,
+    align: str = "left",
+    margin: str | None = None,
+) -> dict[str, Any]:
+    content = f"<font color='{_theme_token(color)}'>{text}</font>"
+    if bold:
+        content = f"**{content}**"
+    node: dict[str, Any] = {
+        "tag": "markdown",
+        "content": content,
+        "text_align": align,
+        "text_size": size,
+    }
+    if margin:
+        node["margin"] = margin
+    return node
+
+
+def _theme_pill(text: str) -> dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [
+                    {
+                        "tag": "interactive_container",
+                        "behaviors": [],
+                        "width": "auto",
+                        "height": "auto",
+                        "corner_radius": "999px",
+                        "has_border": True,
+                        "border_color": _theme_token("icon_border"),
+                        "background_style": _theme_token("panel"),
+                        "padding": "3px 8px 3px 8px",
+                        "horizontal_align": "center",
+                        "disabled": False,
+                        "elements": [
+                            _theme_text(
+                                text,
+                                color="muted",
+                                size="notation",
+                                align="center",
+                            )
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _theme_highlights(items: list[tuple[str, str, str, str]]) -> dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "bisect" if len(items) == 2 else "trisect",
+        "horizontal_spacing": "8px",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": _theme_token(background),
+                "padding": "14px 12px 14px 12px",
+                "horizontal_align": "left",
+                "vertical_spacing": "0px",
+                "elements": [
+                    _theme_text(label, color=foreground, size="notation"),
+                    _theme_text(
+                        value,
+                        color=foreground,
+                        size="heading-2",
+                        bold=True,
+                        margin="4px 0px 0px 0px",
+                    ),
+                ],
+            }
+            for label, value, background, foreground in items
+        ],
+    }
+
+
+def _theme_image(image_key: str, *, alt: str) -> dict[str, Any]:
+    return {
+        "tag": "img",
+        "img_key": image_key,
+        "alt": {"tag": "plain_text", "content": alt, "text_align": "left"},
+        "preview": True,
+        "transparent": False,
+        "scale_type": "crop_center",
+        "corner_radius": "16px",
+    }
+
+
+def _theme_panel(lines: list[tuple[str, str, bool]]) -> dict[str, Any]:
+    return {
+        "tag": "interactive_container",
+        "behaviors": [],
+        "background_style": _theme_token("panel"),
+        "has_border": True,
+        "border_color": _theme_token("icon_border"),
+        "corner_radius": "14px",
+        "padding": "12px 14px 12px 14px",
+        "vertical_spacing": "0px",
+        "disabled": False,
+        "elements": [
+            _theme_text(
+                text,
+                color=color,
+                size="normal" if bold else "notation",
+                bold=bold,
+                margin="4px 0px 0px 0px" if index else None,
+            )
+            for index, (text, color, bold) in enumerate(lines)
+        ],
+    }
+
+
+def _handdrawn_card(
+    *,
+    summary: str,
+    pill: str,
+    title: str,
+    subtitle: str,
+    elements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    shell_elements = [
+        _theme_pill(pill),
+        _theme_text(title, size="heading", bold=True, margin="4px 0px 0px 0px"),
+        _theme_text(subtitle, color="muted", size="notation", margin="2px 0px 8px 0px"),
+        *elements,
+    ]
+    return {
+        "schema": "2.0",
+        "config": {
+            "compact_width": False,
+            "enable_forward": True,
+            "summary": {"content": summary},
+            "style": {"color": CARD_THEME_COLORS},
+        },
+        "body": {
+            "padding": "0px 0px 0px 0px",
+            "elements": [
+                {
+                    "tag": "interactive_container",
+                    "behaviors": [],
+                    "background_style": _theme_token("canvas"),
+                    "padding": "18px 18px 18px 18px",
+                    "corner_radius": "0px",
+                    "has_border": False,
+                    "direction": "vertical",
+                    "vertical_spacing": "10px",
+                    "disabled": False,
+                    "elements": shell_elements,
+                }
+            ],
+        },
+    }
+
+
+def _milk_progress_chart(percent: int | float, *, accent: str) -> dict[str, Any]:
+    """用 Card 2.0 原生图表画一条奶含量进度条。"""
+    value = max(0.0, min(100.0, float(percent)))
+    return {
+        "tag": "chart",
+        "height": "48px",
+        "color_theme": "primary",
+        "preview": False,
+        "chart_spec": {
+            "type": "bar",
+            "background": "rgba(255,250,238,1)",
+            "direction": "horizontal",
+            "data": {
+                "values": [
+                    {"metric": "奶含量", "segment": "奶含量", "value": value},
+                    {"metric": "奶含量", "segment": "剩余", "value": 100.0 - value},
+                ]
+            },
+            "xField": "value",
+            "yField": "metric",
+            "seriesField": "segment",
+            "stack": True,
+            "color": [accent, "rgba(143,149,158,0.18)"],
+            "bar": {"style": {"cornerRadius": 12}},
+            "label": {"visible": False},
+            "axes": [
+                {"orient": "bottom", "visible": False, "min": 0, "max": 100},
+                {"orient": "left", "visible": False},
+            ],
+            "legends": {"visible": False},
+            "tooltip": {"visible": False},
+            "padding": {"top": 2, "right": 0, "bottom": 2, "left": 0},
+        },
+    }
+
+
+def build_daily_stats_card(
+    stats: DailyStats,
+    *,
+    title: str = "今日含奶量",
+    image_key: str | None = None,
+) -> dict[str, Any]:
+    percent = f"{stats.milk_percent}"
+    summary = f"{title} {percent}%，共识别 {stats.total} 张"
+    elements: list[dict[str, Any]] = [
+        _theme_highlights(
+            [
+                ("今日含奶量", f"{percent}%", "accent_2", "on_accent_2"),
+                ("今日奶图", f"{stats.milk} 张", "accent", "on_accent"),
+            ]
+        )
+    ]
+    if image_key:
+        elements.append(_theme_image(image_key, alt="奶龙图鉴主视觉"))
+    elements.extend(
+        [
+            _milk_progress_chart(float(stats.milk_percent), accent="#FEC554"),
+            _theme_highlights(
+                [
+                    ("奶龙", str(stats.nailong), "accent_2", "on_accent_2"),
+                    ("奶蛙", str(stats.naiwa), "accent", "on_accent"),
+                    ("其他", str(stats.other), "panel", "on_panel"),
+                ]
+            ),
+            _theme_panel(
+                [
+                    (f"今日新收录奶龙 {stats.new_nailong} 张", "muted", False),
+                ]
+            ),
+        ]
+    )
+    return _handdrawn_card(
+        summary=summary,
+        pill="MILK DAILY",
+        title=title,
+        subtitle=f"今日共识别 {stats.total} 张图片或表情",
+        elements=elements,
+    )
+
+
+def build_milk_fortune_card(
+    fortune: MilkFortune,
+    *,
+    day: str,
+) -> dict[str, Any]:
+    advice = {
+        "tag": "column_set",
+        "flex_mode": "bisect",
+        "horizontal_spacing": "8px",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": _theme_token(background),
+                "padding": "12px 10px 12px 10px",
+                "vertical_spacing": "0px",
+                "elements": [
+                    _theme_text(label, color=foreground, size="notation"),
+                    _theme_text(
+                        value,
+                        color=foreground,
+                        size="normal",
+                        bold=True,
+                        margin="4px 0px 0px 0px",
+                    ),
+                ],
+            }
+            for label, value, background, foreground in (
+                ("宜", fortune.good, "accent", "on_accent"),
+                ("忌", fortune.avoid, "panel", "on_panel"),
+            )
+        ],
+    }
+    return _handdrawn_card(
+        summary=f"今日奶运 {fortune.score} 分，称号是{fortune.title}",
+        pill="每日一签",
+        title=f"今日奶运：{fortune.title}",
+        subtitle=f"{day} · 同一群同一天签固定",
+        elements=[
+            _theme_highlights(
+                [
+                    ("奶气值", str(fortune.score), "accent_2", "on_accent_2"),
+                    ("接梗力", str(fortune.banter), "accent", "on_accent"),
+                ]
+            ),
+            advice,
+            _theme_panel(
+                [
+                    (f"今日关键词：{fortune.keyword}", "on_panel", True),
+                    (fortune.message, "muted", False),
+                ]
+            ),
+        ],
+    )
+
+
+def _correction_buttons(
+    observation_id: int,
+    *,
+    image_key: str | None,
+) -> dict[str, Any]:
+    buttons: list[tuple[str, str, str, str]] = [
+        ("奶龙", "nailong", "accent_2", "on_accent_2"),
+        ("奶蛙", "naiwa", "accent", "on_accent"),
+        ("其他", "other", "button", "button_text"),
+    ]
+    columns: list[dict[str, Any]] = []
+    for text, label, background, foreground in buttons:
+        value: dict[str, Any] = {
+            "action": "correct_label",
+            "observation_id": observation_id,
+            "label": label,
+        }
+        if image_key:
+            value["image_key"] = image_key
+        columns.append(
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                    {
+                        "tag": "interactive_container",
+                        "behaviors": [{"type": "callback", "value": value}],
+                        "background_style": _theme_token(background),
+                        "has_border": True,
+                        "border_color": _theme_token("icon_border"),
+                        "corner_radius": "14px",
+                        "padding": "10px 8px 10px 8px",
+                        "horizontal_align": "center",
+                        "disabled": False,
+                        "confirm": {
+                            "title": {"tag": "plain_text", "content": f"确认是{text}？"},
+                            "text": {
+                                "tag": "plain_text",
+                                "content": "确认后会更新图鉴与后续统计。",
+                            },
+                        },
+                        "elements": [
+                            _theme_text(
+                                text,
+                                color=foreground,
+                                size="normal",
+                                bold=True,
+                                align="center",
+                            )
+                        ],
+                    }
+                ],
+            }
+        )
+    return {
+        "tag": "column_set",
+        "flex_mode": "trisect",
+        "horizontal_spacing": "8px",
+        "margin": "6px 0px 0px 0px",
+        "columns": columns,
+    }
+
+
+def build_prediction_card(
+    observation: ObservationRecord,
+    prediction: Prediction,
+    rarity: Rarity | None,
+    *,
+    image_key: str | None = None,
+) -> dict[str, Any]:
+    label = DISPLAY_LABELS.get(prediction.label, prediction.label)
+    confidence = f"{prediction.confidence:.1%}"
+    concentration = milk_concentration(prediction)
+
+    if observation.asset.corrected:
+        title = f"已确认是{DISPLAY_LABELS[observation.asset.label]}"
+        conclusion = f"图鉴编号 #{observation.asset.id:04d}"
+    elif not prediction.accepted:
+        if is_milky_other(prediction):
+            title = other_reaction(prediction)
+            conclusion = f"识别结果暂不确定，最高候选是「{label}」，可能漏识别了奶龙或奶蛙"
+        else:
+            title = "识别结果暂不确定"
+            conclusion = f"最高候选是「{label}」"
+    elif prediction.label == "other":
+        title = other_reaction(prediction)
+        conclusion = (
+            "识别结果：其他，可能漏识别了奶龙或奶蛙"
+            if is_milky_other(prediction)
+            else "识别结果：其他，这张图不像奶龙或奶蛙"
+        )
+    else:
+        title = f"识别结果：{label}"
+        conclusion = f"这是一张{label}图"
+
+    summary = f"{title}，置信度 {confidence}，奶含量 {concentration}%"
+    elements: list[dict[str, Any]] = [
+        _theme_highlights(
+            [
+                ("模型置信度", confidence, "accent", "on_accent"),
+                ("奶含量", f"{concentration}%", "accent_2", "on_accent_2"),
+            ]
+        ),
+    ]
+    if image_key:
+        elements.append(_theme_image(image_key, alt="本次识别的图片"))
+    elements.extend(
+        [
+            _theme_panel([(conclusion, "on_panel", True)]),
+            _milk_progress_chart(concentration, accent="#FEC554"),
+        ]
+    )
+    if rarity is not None:
+        elements.append(
+            _theme_panel(
+                [
+                    (f"稀有度：{rarity.stars_text} {rarity.name}", "on_panel", True),
+                    (f"{rarity.note} · 群里出现过 {rarity.seen_count} 次", "muted", False),
+                ]
+            )
+        )
+    if not observation.asset.corrected:
+        elements.extend(
+            [
+                _theme_text("识别不对？点一下直接纠正", color="muted", size="notation"),
+                _correction_buttons(observation.id, image_key=image_key),
+            ]
+        )
+    return _handdrawn_card(
+        summary=summary,
+        pill="AI 识别",
+        title=title,
+        subtitle=f"置信度 {confidence} · 奶含量 {concentration}%",
+        elements=elements,
+    )
+
+
+def build_correction_confirmation_card(
+    observation: ObservationRecord,
+    rarity: Rarity | None,
+    *,
+    image_key: str | None = None,
+) -> dict[str, Any]:
+    label = DISPLAY_LABELS[observation.asset.label]
+    elements: list[dict[str, Any]] = [
+        _theme_highlights(
+            [
+                ("确认分类", label, "accent_2", "on_accent_2"),
+                ("图鉴编号", f"#{observation.asset.id:04d}", "accent", "on_accent"),
+            ]
+        )
+    ]
+    if image_key:
+        elements.append(_theme_image(image_key, alt=f"已确认是{label}的图片"))
+    if rarity is not None:
+        elements.append(
+            _theme_panel(
+                [
+                    (f"稀有度：{rarity.stars_text} {rarity.name}", "on_panel", True),
+                    (f"{rarity.note} · 群里出现过 {rarity.seen_count} 次", "muted", False),
+                ]
+            )
+        )
+    elements.append(
+        _theme_panel(
+            [
+                ("人工校正已生效", "on_panel", True),
+                ("后续识别、图鉴和统计会使用新分类。", "muted", False),
+            ]
+        )
+    )
+    return _handdrawn_card(
+        summary=f"图鉴 #{observation.asset.id:04d} 已确认是{label}",
+        pill="已确认",
+        title=f"已确认：{label}",
+        subtitle=f"图鉴 #{observation.asset.id:04d} · 分类已更新",
+        elements=elements,
+    )
+
+
+def parse_correction_card_action(
+    value: Any,
+) -> tuple[int, str, str | None] | None:
+    if not isinstance(value, dict) or value.get("action") != "correct_label":
+        return None
+    observation_id = value.get("observation_id")
+    label = value.get("label")
+    if isinstance(observation_id, bool) or not isinstance(observation_id, int):
+        return None
+    if observation_id <= 0 or label not in COMMAND_LABELS.values():
+        return None
+    image_key = value.get("image_key")
+    if not isinstance(image_key, str) or not image_key.startswith("img_"):
+        image_key = None
+    return observation_id, label, image_key
+
+
 def format_help_message(report_time: time) -> str:
     return (
         "我是奶龙，可以这样玩：\n"
@@ -415,8 +1197,11 @@ def format_help_message(report_time: time) -> str:
         "4. 发送“奶龙图鉴”：查看最近收录的奶龙图。\n"
         "5. 发送“今日含奶量”：立即查看；"
         f"每天 {report_time.strftime('%H:%M')} 也会自动播报。\n"
-        "6. 发送“猜图”：开一局盲盒猜图，抢答“奶龙/奶蛙”得分；"
-        "“公布答案”揭晓本局，“猜图榜”看积分排行。"
+        "6. 发送“猜图”：开一局盲盒猜图，抢答“奶龙/奶蛙/其他”得分；"
+        "“公布答案”揭晓本局，“猜图榜”看积分排行。\n"
+        "7. 发送“奶龙猎人榜”：看谁首发收进图鉴的奶图最多。\n"
+        "8. 发送“今日奶运”：抽当天固定奶签，看看奶气值、宜忌和称号。\n"
+        "9. 发送“HDR奶图”：立即来一张高亮奶图；自动接龙也会随机转成 HDR。"
     )
 
 
@@ -442,17 +1227,11 @@ def build_catalog_post(
     for asset, image_key in zip(assets, image_keys, strict=True):
         display_label = DISPLAY_LABELS[asset.label]
         rows.append([{"tag": "img", "image_key": image_key}])
-        rows.append(
-            [
-                {
-                    "tag": "text",
-                    "text": (
-                        f"#{asset.id:04d} · {display_label} · "
-                        f"出现 {asset.seen_count} 次"
-                    ),
-                }
-            ]
-        )
+        caption = f"#{asset.id:04d} · {display_label} · 出现 {asset.seen_count} 次"
+        # 有首发人署名的新图才加这一句；老库存量图没有署名，保持原样不加。
+        if asset.discoverer_name:
+            caption += f" · 首发：{asset.discoverer_name}"
+        rows.append([{"tag": "text", "text": caption}])
     return {"zh_cn": {"title": "奶龙图鉴", "content": rows}}
 
 
@@ -545,7 +1324,64 @@ def parse_args() -> argparse.Namespace:
             )
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--douyin-video-urls",
+        type=parse_douyin_video_urls,
+        default=parse_douyin_video_urls(os.getenv("DOUYIN_VIDEO_URLS", "")),
+        help="Comma-separated Douyin video URLs. Empty disables video link pushes.",
+    )
+    parser.add_argument(
+        "--douyin-video-push-probability",
+        type=float,
+        default=float(
+            os.getenv(
+                "DOUYIN_VIDEO_PUSH_PROBABILITY",
+                str(DEFAULT_DOUYIN_VIDEO_PUSH_PROBABILITY),
+            )
+        ),
+    )
+    parser.add_argument(
+        "--douyin-video-push-window-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                "DOUYIN_VIDEO_PUSH_WINDOW_SECONDS",
+                str(DEFAULT_DOUYIN_VIDEO_PUSH_WINDOW_SECONDS),
+            )
+        ),
+    )
+    parser.add_argument(
+        "--douyin-video-push-max-per-window",
+        type=int,
+        default=int(
+            os.getenv(
+                "DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW",
+                str(DEFAULT_DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW),
+            )
+        ),
+    )
+    parser.add_argument(
+        "--random-push-hdr-probability",
+        type=float,
+        default=float(os.getenv("RANDOM_PUSH_HDR_PROBABILITY", str(DEFAULT_HDR_PROBABILITY))),
+    )
+    parser.add_argument(
+        "--hdr-peak-nits",
+        type=float,
+        default=float(os.getenv("HDR_PEAK_NITS", str(DEFAULT_HDR_PEAK_NITS))),
+    )
+    args = parser.parse_args()
+    try:
+        validate_hdr_settings(args.random_push_hdr_probability, args.hdr_peak_nits)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not 0 <= args.douyin_video_push_probability <= 1:
+        parser.error("douyin video push probability must be between 0 and 1")
+    if args.douyin_video_push_window_seconds <= 0:
+        parser.error("douyin video push window seconds must be positive")
+    if args.douyin_video_push_max_per_window <= 0:
+        parser.error("douyin video push max per window must be positive")
+    return args
 
 
 async def run_bot(args: argparse.Namespace) -> None:
@@ -612,6 +1448,20 @@ async def run_bot(args: argparse.Namespace) -> None:
             LOGGER.error("Failed to reply: %s", result.error)
         return result
 
+    async def reply_card(message, card: dict[str, Any], fallback_text: str):
+        result = await channel.send(
+            message.chat_id,
+            {"card": card},
+            {"reply_to": message.message_id},
+        )
+        if result.success:
+            return result
+        LOGGER.error("Failed to reply with card: %s", result.error)
+        if result.error and result.error.code == FeishuChannelErrorCode.TARGET_REVOKED:
+            return result
+        LOGGER.info("Falling back to plain-text reply after card send failure")
+        return await reply(message, fallback_text)
+
     async def reply_image(message, source: bytes | Path, caption: str):
         image_source = source if isinstance(source, bytes) else str(source)
         result = await channel.send(
@@ -621,6 +1471,54 @@ async def run_bot(args: argparse.Namespace) -> None:
         )
         if not result.success:
             LOGGER.error("Failed to reply with image: %s", result.error)
+        return result
+
+    async def send_milk_image(
+        message,
+        asset: AssetRecord,
+        *,
+        hdr_probability: float,
+        reply_to: bool,
+        caption: str | None = None,
+    ):
+        """接龙、主动推送和点名 HDR 共用发送入口；HDR 不附文字，发送结果单独留证据。"""
+        content = await asyncio.to_thread(
+            random_milk_image_content,
+            asset.path,
+            probability=hdr_probability,
+            peak_nits=args.hdr_peak_nits,
+        )
+        is_hdr = isinstance(content["image"]["source"], bytes)
+        if caption and not is_hdr:
+            content["caption"] = caption
+        options = {"reply_to": message.message_id} if reply_to else None
+        result = await channel.send(message.chat_id, content, options)
+        # HDR 上传失败时只回退一次原图；群已撤销或发送结果不确定时不重复发。
+        if (
+            not result.success
+            and is_hdr
+            and result.error
+            and result.error.code == FeishuChannelErrorCode.UPLOAD_FAILED
+        ):
+            LOGGER.warning("HDR upload failed, falling back to original asset_id=%d", asset.id)
+            result = await channel.send(
+                message.chat_id, {"image": {"source": str(asset.path)}}, options
+            )
+            is_hdr = False
+        if result.success:
+            LOGGER.info(
+                "Milk image sent chat_hash=%s asset_id=%d hdr=%s message_id=%s",
+                store.identity_hash(message.chat_id),
+                asset.id,
+                is_hdr,
+                result.message_id,
+            )
+        elif result.error and result.error.code == FeishuChannelErrorCode.TARGET_REVOKED:
+            await asyncio.to_thread(store.deactivate_chat, message.chat_id)
+        else:
+            LOGGER.error(
+                "Milk image send failed asset_id=%d hdr=%s error=%s", asset.id, is_hdr, result.error
+            )
         return result
 
     async def reply_catalog(
@@ -663,6 +1561,28 @@ async def run_bot(args: argparse.Namespace) -> None:
             await reply(message, format_help_message(args.daily_report_time))
             return True
 
+        if is_hdr_milk_command(text):
+            asset = await asyncio.to_thread(store.random_milk_asset)
+            if asset:
+                await send_milk_image(message, asset, hdr_probability=1.0, reply_to=True)
+            else:
+                await reply(message, "还没有可用奶图，先发几张奶龙或奶蛙吧。")
+            return True
+
+        if is_milk_fortune_command(text):
+            day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+            fortune = make_milk_fortune(
+                chat_id=message.chat_id,
+                sender_id=message.sender_id,
+                day=day,
+            )
+            await reply_card(
+                message,
+                build_milk_fortune_card(fortune, day=day),
+                format_milk_fortune(fortune, day=day),
+            )
+            return True
+
         corrected_label = parse_correction_command(text)
         if corrected_label:
             reference_id = message.reply_to_message_id or _raw_parent_id(message)
@@ -693,7 +1613,11 @@ async def run_bot(args: argparse.Namespace) -> None:
 
         if is_daily_stats_command(text):
             stats = await asyncio.to_thread(store.daily_stats, message.chat_id)
-            await reply(message, format_daily_stats(stats))
+            await reply_card(
+                message,
+                build_daily_stats_card(stats),
+                format_daily_stats(stats),
+            )
             return True
 
         if is_catalog_command(text):
@@ -732,6 +1656,11 @@ async def run_bot(args: argparse.Namespace) -> None:
                 chat_id=message.chat_id,
             )
             await reply(message, format_guess_ranking(rankings))
+            return True
+
+        if is_hunter_ranking_command(text):
+            hunters = await asyncio.to_thread(store.hunter_rankings)
+            await reply(message, format_hunter_ranking(hunters))
             return True
 
         guess_label = parse_guess_answer(text)
@@ -810,10 +1739,12 @@ async def run_bot(args: argparse.Namespace) -> None:
                     await reply(message, format_prediction(prediction))
                 return
 
-            result = await reply_image(
+            result = await send_milk_image(
                 message,
-                reply_asset.path,
-                format_chain_caption(observation),
+                reply_asset,
+                hdr_probability=args.random_push_hdr_probability,
+                reply_to=True,
+                caption=format_chain_caption(observation),
             )
             if result.success and result.message_id:
                 await asyncio.to_thread(
@@ -829,15 +1760,31 @@ async def run_bot(args: argparse.Namespace) -> None:
                     response_message_id=result.message_id,
                 )
 
-    async def build_mention_reply(
+    async def reply_mention_result(
+        message,
         observation: ObservationRecord,
         prediction: Prediction,
-    ) -> str:
+    ):
         # 稀有度只对真正入典的奶龙/奶蛙图有意义，“其他”不算稀有度。
         rarity = None
         if observation.asset.label in {"nailong", "naiwa"}:
             rarity = await asyncio.to_thread(store.asset_rarity, observation.asset.id)
-        return format_mention_reply(observation, prediction, rarity)
+        result = await reply_card(
+            message,
+            build_prediction_card(
+                observation,
+                prediction,
+                rarity,
+            ),
+            format_mention_reply(observation, prediction, rarity),
+        )
+        if result.success and result.message_id:
+            await asyncio.to_thread(
+                store.attach_response,
+                observation.id,
+                result.message_id,
+            )
+        return result
 
     async def send_pending_daily_reports(report_day: str) -> bool:
         targets = await asyncio.to_thread(
@@ -860,8 +1807,30 @@ async def run_bot(args: argparse.Namespace) -> None:
                 )
                 result = await channel.send(
                     target.chat_id,
-                    {"text": f"每日含奶量播报\n{format_daily_stats(stats)}"},
+                    {
+                        "card": build_daily_stats_card(
+                            stats,
+                            title="每日含奶量播报",
+                        )
+                    },
                 )
+                if (
+                    not result.success
+                    and not (
+                        result.error
+                        and result.error.code == FeishuChannelErrorCode.TARGET_REVOKED
+                    )
+                ):
+                    LOGGER.warning(
+                        "Daily report card failed; falling back to plain text "
+                        "chat_hash=%s error=%s",
+                        store.identity_hash(target.chat_id),
+                        result.error,
+                    )
+                    result = await channel.send(
+                        target.chat_id,
+                        {"text": f"每日含奶量播报\n{format_daily_stats(stats)}"},
+                    )
                 if not result.success:
                     all_sent = False
                     if (
@@ -1106,6 +2075,42 @@ async def run_bot(args: argparse.Namespace) -> None:
                     LOGGER.exception("Daily report polling failed report_day=%s", report_day)
             await asyncio.sleep(DAILY_REPORT_POLL_SECONDS)
 
+    async def maybe_douyin_video_push(message) -> bool:
+        """按配置概率发送抖音奶龙/奶娃链接，并按群限制滚动窗口内的发送次数。"""
+        if message.chat_type not in {"group", "topic"} or not args.douyin_video_urls:
+            return False
+        if args.douyin_video_push_probability <= 0:
+            return False
+        if secrets.SystemRandom().random() >= args.douyin_video_push_probability:
+            return False
+        reservation_id = await asyncio.to_thread(
+            store.reserve_video_link_push,
+            message.chat_id,
+            window_seconds=args.douyin_video_push_window_seconds,
+            max_pushes=args.douyin_video_push_max_per_window,
+        )
+        if reservation_id is None:
+            return False
+        video_url = secrets.choice(args.douyin_video_urls)
+        result = await channel.send(message.chat_id, {"text": f"来点奶：{video_url}"})
+        if result.success:
+            LOGGER.info(
+                "Douyin video link sent chat_hash=%s reservation_id=%d",
+                store.identity_hash(message.chat_id),
+                reservation_id,
+            )
+            return True
+        await asyncio.to_thread(store.release_video_link_push, reservation_id)
+        if result.error and result.error.code == FeishuChannelErrorCode.TARGET_REVOKED:
+            await asyncio.to_thread(store.deactivate_chat, message.chat_id)
+            LOGGER.warning(
+                "Deactivated revoked chat chat_hash=%s",
+                store.identity_hash(message.chat_id),
+            )
+        else:
+            LOGGER.error("Douyin video link push failed error=%s", result.error)
+        return False
+
     async def maybe_random_push(message) -> None:
         """群聊有人说话时，按概率+冷却冷不丁丢一张抽象奶图，只发图不说话。
 
@@ -1126,9 +2131,8 @@ async def run_bot(args: argparse.Namespace) -> None:
             return
         # 先占住冷却，避免并发消息同时触发多张。
         last_random_push[message.chat_id] = now
-        result = await channel.send(
-            message.chat_id,
-            {"image": {"source": str(asset.path)}},
+        result = await send_milk_image(
+            message, asset, hdr_probability=args.random_push_hdr_probability, reply_to=False
         )
         if result.success:
             LOGGER.info(
@@ -1162,6 +2166,9 @@ async def run_bot(args: argparse.Namespace) -> None:
             if await handle_command(message):
                 return
             if not has_direct_image(message) and not message.mentioned_bot:
+                # 普通聊天最多触发一种主动内容，避免一条消息连发视频和奶图。
+                if await maybe_douyin_video_push(message):
+                    return
                 # 群里有人正常聊天（没发图、没 @），按概率冷不丁丢一张抽象奶图。
                 await maybe_random_push(message)
                 return
@@ -1210,6 +2217,13 @@ async def run_bot(args: argparse.Namespace) -> None:
                     await reply(message, "图片超过 20 MB，暂时无法识别。")
                 return
             prediction = await asyncio.to_thread(predictor.predict_bytes, image_bytes)
+            # 首发署名：发图者昵称为空时按 open_id 反查，拿不到就留空（图鉴不显示该行）。
+            discoverer_name = message.sender_name
+            if not discoverer_name:
+                discoverer_name = await contact_resolver.resolve(
+                    message.sender_id,
+                    fallback="",
+                )
             observation = await asyncio.to_thread(
                 store.record_observation,
                 image_bytes=image_bytes,
@@ -1220,6 +2234,7 @@ async def run_bot(args: argparse.Namespace) -> None:
                 predicted_label=prediction.label,
                 confidence=prediction.confidence,
                 accepted=prediction.accepted,
+                discoverer_name=discoverer_name or None,
             )
             if catalog_document:
                 catalog_sync_event.set()
@@ -1229,10 +2244,7 @@ async def run_bot(args: argparse.Namespace) -> None:
                     target.message_id or message.message_id,
                 )
                 if message.mentioned_bot:
-                    await reply(
-                        message,
-                        await build_mention_reply(observation, prediction),
-                    )
+                    await reply_mention_result(message, observation, prediction)
                 return
 
             response_mode = media_response_mode(
@@ -1241,10 +2253,10 @@ async def run_bot(args: argparse.Namespace) -> None:
                 label=observation.asset.label,
             )
             if response_mode == "prediction":
-                await reply(
-                    message,
-                    await build_mention_reply(observation, prediction),
-                )
+                if message.mentioned_bot:
+                    await reply_mention_result(message, observation, prediction)
+                else:
+                    await reply(message, format_prediction(prediction))
             elif response_mode == "chain":
                 await continue_chain(message, observation, prediction)
         except Exception:
@@ -1258,21 +2270,77 @@ async def run_bot(args: argparse.Namespace) -> None:
     async def on_error(error) -> None:
         LOGGER.error("Feishu channel error: %s", error)
 
+    async def on_card_action(event) -> None:
+        parsed = parse_correction_card_action(event.action.value)
+        if parsed is None:
+            LOGGER.info("Ignored unknown card action tag=%s", event.action.tag)
+            return
+        observation_id, label, image_key = parsed
+        correction = await asyncio.to_thread(
+            store.correct_card_label,
+            event.message_id,
+            observation_id,
+            label,
+        )
+        if correction is None:
+            LOGGER.warning(
+                "Rejected stale card correction message_id=%s observation_id=%s",
+                event.message_id,
+                observation_id,
+            )
+            return
+        if catalog_document and correction.new_label in {"nailong", "naiwa"}:
+            catalog_sync_event.set()
+        observation = await asyncio.to_thread(store.observation_by_id, observation_id)
+        if observation is None:
+            LOGGER.error("Corrected observation disappeared id=%s", observation_id)
+            return
+        rarity = None
+        if observation.asset.label in {"nailong", "naiwa"}:
+            rarity = await asyncio.to_thread(store.asset_rarity, observation.asset.id)
+        updated = build_correction_confirmation_card(
+            observation,
+            rarity,
+            image_key=image_key,
+        )
+        result = await channel.update_card(event.message_id, updated)
+        if result.success:
+            LOGGER.info(
+                "Updated correction card message_id=%s asset_id=%s label=%s",
+                event.message_id,
+                observation.asset.id,
+                observation.asset.label,
+            )
+        else:
+            LOGGER.error("Failed to update correction card: %s", result.error)
+
     async def on_reject(event) -> None:
         LOGGER.info("Message rejected reason=%s", event.reason)
 
     channel.on("message", on_message)
+    channel.on("cardAction", on_card_action)
     channel.on("error", on_error)
     channel.on("reject", on_reject)
     LOGGER.info(
         "Starting bot with model=%s device=%s threshold=%.3f state_dir=%s "
-        "daily_report_time=%s catalog_document_sync=%s",
+        "daily_report_time=%s catalog_document_sync=%s hdr_probability=%.2f hdr_peak_nits=%.0f "
+        "random_push_probability=%.2f random_push_cooldown_seconds=%d "
+        "douyin_video_urls=%d douyin_video_push_probability=%.2f "
+        "douyin_video_push_window_seconds=%d douyin_video_push_max_per_window=%d",
         args.model,
         predictor.device,
         predictor.threshold,
         args.state_dir,
         args.daily_report_time.strftime("%H:%M"),
         bool(catalog_document),
+        args.random_push_hdr_probability,
+        args.hdr_peak_nits,
+        args.random_push_probability,
+        args.random_push_cooldown_seconds,
+        len(args.douyin_video_urls),
+        args.douyin_video_push_probability,
+        args.douyin_video_push_window_seconds,
+        args.douyin_video_push_max_per_window,
     )
     report_task = asyncio.create_task(daily_report_loop())
     catalog_sync_task = (

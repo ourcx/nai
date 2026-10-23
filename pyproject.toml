@@ -9,11 +9,15 @@ description = "CNN classifier and Feishu bot for Nailong and Naiwa images"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+  "imagecodecs>=2025.3.30",
   "lark-channel-sdk>=1.1.0",
+  "numpy>=2.0",
   "pillow>=11.0",
   "scikit-learn>=1.6",
+  "starlette>=0.48,<1",
   "torch>=2.6",
   "torchvision>=0.21",
+  "uvicorn>=0.35,<1",
 ]
 
 [project.optional-dependencies]
@@ -26,8 +30,10 @@ dev = [
 nailong-train = "nailong_classifier.train:main"
 nailong-evaluate = "nailong_classifier.evaluate:main"
 nailong-predict = "nailong_classifier.predict:main"
+nailong-hdr = "nailong_classifier.hdr:main"
 nailong-bot = "nailong_classifier.bot:main"
 nailong-seed = "nailong_classifier.seed:main"
+nailong-web = "nailong_classifier.web:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nailong_classifier"]

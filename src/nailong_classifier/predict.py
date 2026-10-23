@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .milk import combined_milk_concentration
 from .model import NailongPredictor
 
 
@@ -31,6 +32,10 @@ def main() -> None:
                 "confidence": prediction.confidence,
                 "accepted": prediction.accepted,
                 "scores": prediction.scores,
+                "yellow_ratio": prediction.yellow_ratio,
+                "milk_concentration": combined_milk_concentration(
+                    prediction.scores, prediction.yellow_ratio
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -40,4 +45,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

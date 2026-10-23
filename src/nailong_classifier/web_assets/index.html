@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#fff8dc" />
+    <title>奶龙奶蛙图鉴</title>
+    <link rel="stylesheet" href="static/app.css?v=2" />
+    <script src="static/app.js?v=2" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">MILK CREATURE ARCHIVE</p>
+          <h1>奶龙奶蛙图鉴</h1>
+          <p class="hero-description">把群里遇见的奶龙和奶蛙，安安静静地收在这里。</p>
+        </div>
+        <div class="mascot" aria-hidden="true">
+          <span class="mascot-eye mascot-eye-left"></span>
+          <span class="mascot-eye mascot-eye-right"></span>
+          <span class="mascot-mouth"></span>
+        </div>
+      </header>
+
+      <main>
+        <section class="stats" aria-label="图鉴统计">
+          <button class="stat-card stat-all is-active" data-label="" type="button">
+            <span class="stat-name">全部收藏</span>
+            <strong class="stat-value" data-stat="total">—</strong>
+          </button>
+          <button class="stat-card stat-nailong" data-label="nailong" type="button">
+            <span class="stat-name">奶龙</span>
+            <strong class="stat-value" data-stat="nailong">—</strong>
+          </button>
+          <button class="stat-card stat-naiwa" data-label="naiwa" type="button">
+            <span class="stat-name">奶蛙</span>
+            <strong class="stat-value" data-stat="naiwa">—</strong>
+          </button>
+        </section>
+
+        <section class="collection" aria-labelledby="collection-title">
+          <div class="toolbar">
+            <div>
+              <p class="section-kicker">COLLECTION</p>
+              <h2 id="collection-title">全部收藏</h2>
+              <p class="result-count" aria-live="polite"><span id="result-count">—</span> 张图片</p>
+            </div>
+            <label class="sort-control">
+              <span>排序</span>
+              <select id="sort-select">
+                <option value="newest">最近收录</option>
+                <option value="oldest">最早收录</option>
+                <option value="popular">出现最多</option>
+                <option value="rare">稀有优先</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="gallery" class="gallery" aria-live="polite"></div>
+          <div id="empty-state" class="empty-state" hidden>
+            <div class="empty-face" aria-hidden="true">·ᴗ·</div>
+            <h3>这一格还是空的</h3>
+            <p>等机器人再遇见几张新图吧。</p>
+          </div>
+          <div class="load-more-wrap">
+            <button id="load-more" class="load-more" type="button" hidden>再看一些</button>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <span class="cache-dot" aria-hidden="true"></span>
+        列表只加载压缩缩略图，点开图片时才读取原图；浏览器会自动复用缓存。
+      </footer>
+    </div>
+
+    <dialog id="image-dialog" class="image-dialog">
+      <button id="dialog-close" class="dialog-close" type="button" aria-label="关闭">×</button>
+      <div class="dialog-layout">
+        <div class="dialog-image-wrap">
+          <div id="dialog-loader" class="dialog-loader">原图加载中…</div>
+          <img id="dialog-image" alt="" />
+        </div>
+        <div class="dialog-details">
+          <span id="dialog-label" class="dialog-label"></span>
+          <h2 id="dialog-title"></h2>
+          <dl>
+            <div>
+              <dt>收录时间</dt>
+              <dd id="dialog-date"></dd>
+            </div>
+            <div>
+              <dt>出现次数</dt>
+              <dd id="dialog-seen"></dd>
+            </div>
+            <div id="dialog-discoverer-row">
+              <dt>首发</dt>
+              <dd id="dialog-discoverer"></dd>
+            </div>
+            <div>
+              <dt>分类依据</dt>
+              <dd id="dialog-source"></dd>
+            </div>
+          </dl>
+          <a id="dialog-original" class="original-link" target="_blank" rel="noopener">在新窗口查看原图</a>
+        </div>
+      </div>
+    </dialog>
+  </body>
+</html>

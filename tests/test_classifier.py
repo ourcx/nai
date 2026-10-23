@@ -14,6 +14,7 @@ from nailong_classifier.bot import (
 )
 from nailong_classifier.data import (
     ANIMATED_SAMPLE_WEIGHT,
+    DEFAULT_CLASS_BALANCE_POWER,
     build_train_val_loaders,
     validate_image_tree,
 )
@@ -60,15 +61,22 @@ def test_gif_hard_negatives_are_loaded_only_for_training() -> None:
     assert any(path.suffix.lower() == ".gif" for path in train_paths)
     assert all(path.suffix.lower() != ".gif" for path in val_paths)
 
-    # 每个类别的总采样权重相同；同一类别内 GIF 的权重是静态图的 ANIMATED_SAMPLE_WEIGHT 倍。
+    # 默认让每个类别的总采样权重相同；同一类别内 GIF 的权重仍是静态图的
+    # ANIMATED_SAMPLE_WEIGHT 倍。
     weights = train_loader.sampler.weights.tolist()
     targets_by_position = [
         train_subset.dataset.targets[index] for index in train_subset.indices
     ]
     class_totals: dict[int, float] = {}
+    class_counts: dict[int, int] = {}
     for target, weight in zip(targets_by_position, weights, strict=True):
         class_totals[target] = class_totals.get(target, 0.0) + weight
-    assert all(abs(total - 1.0) < 1e-9 for total in class_totals.values())
+        class_counts[target] = class_counts.get(target, 0) + 1
+    normalized_totals = [
+        total / class_counts[target] ** (1.0 - DEFAULT_CLASS_BALANCE_POWER)
+        for target, total in class_totals.items()
+    ]
+    assert max(normalized_totals) - min(normalized_totals) < 1e-9
     for target in class_totals:
         gif_weights = {
             round(weight, 12)

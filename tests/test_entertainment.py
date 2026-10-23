@@ -3,9 +3,13 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from nailong_classifier.bot import (
+    OTHER_MILKY_REACTIONS,
+    OTHER_REACTIONS,
+    build_prediction_card,
     format_concentration,
     format_guess_already_settled,
     format_guess_correct,
@@ -16,6 +20,7 @@ from nailong_classifier.bot import (
     format_guess_reveal,
     format_guess_wrong,
     format_mention_reply,
+    format_prediction,
     format_rarity,
     is_guess_ranking_command,
     is_guess_reveal_command,
@@ -104,6 +109,79 @@ def test_format_concentration_tiers() -> None:
     assert "有点奶" in format_concentration(low)
     dry = make_prediction(0.05, 0.05, label="other", accepted=False)
     assert "查无此奶" in format_concentration(dry)
+
+
+@pytest.mark.parametrize(
+    ("nailong", "naiwa", "accepted", "suspected"),
+    [
+        (0.30, 0.09, False, False),
+        (0.30, 0.10, False, True),
+        (0.30, 0.30, False, True),
+        (0.30, 0.10, True, True),
+        (0.04, 0.05, True, False),
+    ],
+)
+def test_other_replies_suspect_missed_milk_without_losing_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    nailong: float,
+    naiwa: float,
+    accepted: bool,
+    suspected: bool,
+) -> None:
+    # “其他”最高也可能奶龙+奶蛙合计更高，默认置信度门槛会拒绝这类图。
+    prediction = make_prediction(nailong, naiwa, label="other", accepted=accepted)
+    store = BotStore(tmp_path)
+    observation = record(
+        store, make_gradient_bytes(), message_id="suspected-other", label="other"
+    )
+    monkeypatch.setattr("nailong_classifier.bot.secrets.choice", lambda choices: choices[0])
+
+    text = format_prediction(prediction)
+    card = build_prediction_card(observation, prediction, None)
+    card_content = str(card)
+    concentration = format_concentration(prediction)
+
+    assert f"置信度 {prediction.confidence:.1%}" in text
+    assert observation.asset.label == "other"
+    if suspected:
+        assert text.startswith(OTHER_MILKY_REACTIONS[0])
+        assert card["config"]["summary"]["content"].startswith(OTHER_MILKY_REACTIONS[0])
+        assert "可能漏识别了奶龙或奶蛙" in card_content
+        assert "可能是没认出来的奶龙或奶蛙" in concentration
+        assert "查无此奶" not in concentration
+        assert "不像奶龙或奶蛙" not in card_content
+    elif accepted:
+        assert text.startswith(OTHER_REACTIONS[0])
+        assert "不像奶龙或奶蛙" in card_content
+    else:
+        assert text.startswith("我不太确定。")
+        assert "可能漏识别" not in card_content
+    if not accepted:
+        assert "我不太确定。最高候选是「其他」" in text
+        assert "识别结果暂不确定" in card_content
+
+
+def test_corrected_other_does_not_get_suspected_milk_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BotStore(tmp_path)
+    original = record(store, make_gradient_bytes(), message_id="confirmed-other", label="other")
+    assert store.correct_label("confirmed-other", "other") is not None
+    observation = store.observation_by_id(original.id)
+    assert observation is not None
+    prediction = make_prediction(0.3, 0.3, label="other", accepted=False)
+
+    def unexpected_reaction(choices):
+        raise AssertionError("人工确认的图片不应使用随机怀疑文案")
+
+    monkeypatch.setattr("nailong_classifier.bot.secrets.choice", unexpected_reaction)
+
+    reply = format_mention_reply(observation, prediction, None)
+    assert reply.startswith("这张图已经确认是其他")
+    assert "可能是没认出来" not in reply
+    assert "分类以人工纠正为准" in reply
+    assert "已确认是其他" in str(build_prediction_card(observation, prediction, None))
 
 
 def test_format_mention_reply_appends_concentration_and_rarity(tmp_path: Path) -> None:
@@ -401,3 +479,108 @@ def test_random_milk_asset_only_milk_and_balanced(tmp_path: Path) -> None:
     assert "other" not in labels
 
 
+def test_discoverer_recorded_on_first_capture_only(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    first = store.record_observation(
+        image_bytes=make_image_bytes("yellow"),
+        source_message_id="m-1",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-finder",
+        predicted_label="nailong",
+        confidence=0.9,
+        accepted=True,
+        discoverer_name="首发哥",
+    )
+    assert first.asset.discoverer_name == "首发哥"
+
+    # 同一张图第二次由别人发：首发人保持不变（成就归第一个发现者）。
+    again = store.record_observation(
+        image_bytes=make_image_bytes("yellow"),
+        source_message_id="m-2",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-latecomer",
+        predicted_label="nailong",
+        confidence=0.9,
+        accepted=True,
+        discoverer_name="后来者",
+    )
+    assert again.asset.id == first.asset.id
+    assert again.asset.discoverer_name == "首发哥"
+
+
+def test_legacy_asset_without_discoverer_shows_no_line(tmp_path: Path) -> None:
+    from nailong_classifier.bot import build_catalog_post
+
+    store = BotStore(tmp_path)
+    # 不传 discoverer_name，模拟老图：图鉴条目不含「首发」。
+    record(store, make_image_bytes("yellow"), message_id="m-1", label="nailong")
+    record(store, make_image_bytes("pink"), message_id="m-2", label="naiwa")
+    store.record_observation(
+        image_bytes=make_image_bytes("gold"),
+        source_message_id="m-3",
+        chat_id="chat-a",
+        chat_type="group",
+        sender_id="user-a",
+        predicted_label="nailong",
+        confidence=0.9,
+        accepted=True,
+        discoverer_name="金牌发现者",
+    )
+
+    assets = store.catalog_assets()
+    stats = store.catalog_stats()
+    post = build_catalog_post(assets, [f"img_{i}" for i in range(len(assets))], stats)
+    captions = [
+        node["text"]
+        for row in post["zh_cn"]["content"]
+        for node in row
+        if node["tag"] == "text"
+    ]
+    credit_lines = [c for c in captions if "首发" in c]
+    # 只有带署名的那张图出现「首发」行，另两张老图不出现。
+    assert len(credit_lines) == 1
+    assert "首发：金牌发现者" in credit_lines[0]
+
+
+def test_hunter_rankings_counts_catalog_discoveries(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    # A 首发两张入典奶图，B 首发一张，无署名的不计入。
+    for index, name in enumerate(["猎人A", "猎人A", "猎人B"]):
+        store.record_observation(
+            image_bytes=make_image_bytes(f"#{index:02x}00{index:02x}"),
+            source_message_id=f"m-{index}",
+            chat_id="chat-a",
+            chat_type="group",
+            sender_id=f"user-{name}",
+            predicted_label="nailong",
+            confidence=0.9,
+            accepted=True,
+            discoverer_name=name,
+        )
+    record(store, make_image_bytes("teal"), message_id="legacy", label="naiwa")
+
+    rankings = store.hunter_rankings()
+    assert [(r.display_name, r.discovered) for r in rankings] == [
+        ("猎人A", 2),
+        ("猎人B", 1),
+    ]
+
+
+def test_hunter_ranking_command_and_formatter() -> None:
+    from nailong_classifier.bot import format_hunter_ranking, is_hunter_ranking_command
+    from nailong_classifier.storage import HunterRanking
+
+    assert is_hunter_ranking_command("奶龙猎人榜") is True
+    assert is_hunter_ranking_command("猎人榜") is True
+    assert is_hunter_ranking_command("猜图榜") is False
+    assert "还没有人上榜" in format_hunter_ranking([])
+    text = format_hunter_ranking(
+        [
+            HunterRanking(display_name="甲", discovered=5),
+            HunterRanking(display_name="乙", discovered=2),
+        ]
+    )
+    assert "🥇 甲：5 张" in text
+    assert "🥈 乙：2 张" in text

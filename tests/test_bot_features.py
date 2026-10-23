@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +12,9 @@ from PIL import Image
 
 from nailong_classifier.bot import (
     build_catalog_post,
+    build_correction_confirmation_card,
+    build_daily_stats_card,
+    build_prediction_card,
     format_catalog_caption,
     format_chain_caption,
     format_daily_stats,
@@ -24,18 +27,38 @@ from nailong_classifier.bot import (
     is_help_request,
     media_response_mode,
     parse_asset_ids,
+    parse_correction_card_action,
     parse_correction_command,
     parse_daily_report_time,
+    parse_douyin_video_urls,
     should_reply_media_error,
 )
 from nailong_classifier.model import Prediction
-from nailong_classifier.storage import LOCAL_TIMEZONE, BotStore
+from nailong_classifier.storage import LOCAL_TIMEZONE, BotStore, DailyStats
 
 
 def make_image_bytes(color: str, *, image_format: str = "PNG") -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (48, 48), color).save(output, format=image_format)
     return output.getvalue()
+
+
+def walk_card(value):
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from walk_card(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from walk_card(nested)
+
+
+def card_text(card: dict) -> str:
+    return "\n".join(
+        node["content"]
+        for node in walk_card(card)
+        if isinstance(node.get("content"), str)
+    )
 
 
 def record(
@@ -107,6 +130,55 @@ def test_store_migrates_existing_catalog_document_sync_table(tmp_path: Path) -> 
         }
     assert "parent_block_id" in columns
     assert "duplicate_of" in columns
+
+
+def test_video_link_pushes_use_a_persistent_rolling_per_chat_limit(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    start = datetime(2026, 10, 23, 10, 0, tzinfo=LOCAL_TIMEZONE)
+
+    first = store.reserve_video_link_push(
+        "chat-a", window_seconds=3600, max_pushes=2, now=start
+    )
+    second = store.reserve_video_link_push(
+        "chat-a", window_seconds=3600, max_pushes=2, now=start + timedelta(minutes=30)
+    )
+    blocked = store.reserve_video_link_push(
+        "chat-a", window_seconds=3600, max_pushes=2, now=start + timedelta(minutes=40)
+    )
+    other_chat = store.reserve_video_link_push(
+        "chat-b", window_seconds=3600, max_pushes=2, now=start + timedelta(minutes=40)
+    )
+
+    assert first is not None
+    assert second is not None
+    assert blocked is None
+    assert other_chat is not None
+    store.release_video_link_push(second)
+    assert (
+        store.reserve_video_link_push(
+            "chat-a", window_seconds=3600, max_pushes=2, now=start + timedelta(minutes=40)
+        )
+        is not None
+    )
+    assert (
+        store.reserve_video_link_push(
+            "chat-a", window_seconds=3600, max_pushes=2, now=start + timedelta(hours=1)
+        )
+        is not None
+    )
+
+
+def test_parse_douyin_video_urls_accepts_share_domains_and_rejects_other_links() -> None:
+    urls = parse_douyin_video_urls(
+        "https://v.douyin.com/example-one/, https://www.douyin.com/video/123"
+    )
+
+    assert urls == [
+        "https://v.douyin.com/example-one/",
+        "https://www.douyin.com/video/123",
+    ]
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_douyin_video_urls("https://example.com/video")
 
 
 def test_chain_rotation_prefers_collected_assets_without_repeating(
@@ -493,6 +565,186 @@ def test_commands_are_exact_and_support_correction_aliases() -> None:
         )
         == "prediction"
     )
+
+
+def test_daily_stats_card_uses_card2_metrics_and_native_progress_chart() -> None:
+    stats = DailyStats(total=10, nailong=4, naiwa=3, other=3, new_nailong=2)
+
+    card = build_daily_stats_card(stats)
+
+    assert card["schema"] == "2.0"
+    assert "header" not in card
+    assert card["config"]["summary"]["content"] == "今日含奶量 70.0%，共识别 10 张"
+    root = card["body"]["elements"][0]
+    assert root["tag"] == "interactive_container"
+    assert root["background_style"] == "wb_handdrawn_vibes_canvas"
+    chart = next(node for node in walk_card(card) if node.get("tag") == "chart")
+    assert chart["chart_spec"]["type"] == "bar"
+    assert [row["value"] for row in chart["chart_spec"]["data"]["values"]] == [
+        70.0,
+        30.0,
+    ]
+    text = card_text(card)
+    assert "今日含奶量" in text
+    assert "奶龙" in text and ">4<" in text
+    assert "奶蛙" in text and ">3<" in text
+    assert "其他" in text
+
+
+def test_prediction_card_shows_confidence_concentration_and_rarity(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    observation = record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="card-nailong",
+        label="nailong",
+    )
+    prediction = Prediction(
+        label="nailong",
+        confidence=0.61,
+        accepted=True,
+        scores={"nailong": 0.61, "naiwa": 0.30, "other": 0.09},
+    )
+
+    card = build_prediction_card(
+        observation,
+        prediction,
+        store.asset_rarity(observation.asset.id),
+        image_key="img_preview",
+    )
+
+    assert card["schema"] == "2.0"
+    assert "header" not in card
+    assert card["config"]["summary"]["content"] == (
+        "识别结果：奶龙，置信度 61.0%，奶含量 91%"
+    )
+    text = card_text(card)
+    assert "识别结果：奶龙" in text
+    assert "这是一张奶龙图" in text
+    assert "稀有度：⭐⭐⭐⭐⭐ 传说" in text
+    assert "群里出现过 1 次" in text
+    images = [node for node in walk_card(card) if node.get("tag") == "img"]
+    assert [image["img_key"] for image in images] == ["img_preview"]
+    correction_controls = [
+        node
+        for node in walk_card(card)
+        if node.get("tag") == "interactive_container"
+        and node.get("behaviors")
+        and node["behaviors"][0].get("type") == "callback"
+    ]
+    assert len(correction_controls) == 3
+    assert {
+        control["behaviors"][0]["value"]["label"] for control in correction_controls
+    } == {"nailong", "naiwa", "other"}
+    chart = next(node for node in walk_card(card) if node.get("tag") == "chart")
+    assert [row["value"] for row in chart["chart_spec"]["data"]["values"]] == [
+        91.0,
+        9.0,
+    ]
+
+
+def test_uncertain_prediction_card_uses_warning_header_without_rarity(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    observation = record(
+        store,
+        make_image_bytes("pink"),
+        message_id="card-uncertain",
+        label="naiwa",
+    )
+    prediction = Prediction(
+        label="naiwa",
+        confidence=0.52,
+        accepted=False,
+        scores={"nailong": 0.31, "naiwa": 0.52, "other": 0.17},
+    )
+
+    card = build_prediction_card(observation, prediction, None)
+
+    assert "识别结果暂不确定" in card_text(card)
+    assert all(node.get("tag") != "hr" for node in walk_card(card))
+
+
+def test_corrected_prediction_card_uses_confirmed_label_color(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    image_bytes = make_image_bytes("yellow")
+    record(
+        store,
+        image_bytes,
+        message_id="card-before-correction",
+        label="naiwa",
+    )
+    store.correct_label("card-before-correction", "nailong")
+    observation = record(
+        store,
+        image_bytes,
+        message_id="card-after-correction",
+        label="naiwa",
+    )
+    prediction = Prediction(
+        label="naiwa",
+        confidence=0.52,
+        accepted=False,
+        scores={"nailong": 0.31, "naiwa": 0.52, "other": 0.17},
+    )
+
+    card = build_prediction_card(observation, prediction, None)
+
+    assert "已确认是奶龙" in card_text(card)
+    assert not any(
+        node.get("behaviors")
+        and node["behaviors"][0].get("type") == "callback"
+        for node in walk_card(card)
+    )
+
+
+def test_correction_action_parser_rejects_invalid_payloads() -> None:
+    assert parse_correction_card_action(None) is None
+    assert parse_correction_card_action({"action": "other"}) is None
+    assert parse_correction_card_action(
+        {"action": "correct_label", "observation_id": True, "label": "nailong"}
+    ) is None
+    assert parse_correction_card_action(
+        {"action": "correct_label", "observation_id": 1, "label": "bad"}
+    ) is None
+    assert parse_correction_card_action(
+        {
+            "action": "correct_label",
+            "observation_id": 3,
+            "label": "naiwa",
+            "image_key": "img_card",
+        }
+    ) == (3, "naiwa", "img_card")
+
+
+def test_card_correction_is_bound_to_sent_message_and_builds_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = BotStore(tmp_path)
+    observation = record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="source-card",
+        label="naiwa",
+    )
+    store.attach_response(observation.id, "response-card")
+
+    assert store.correct_card_label("wrong-card", observation.id, "nailong") is None
+    correction = store.correct_card_label("response-card", observation.id, "nailong")
+    assert correction is not None
+    updated = store.observation_by_id(observation.id)
+    assert updated is not None
+    assert updated.asset.label == "nailong"
+    assert updated.asset.corrected is True
+
+    card = build_correction_confirmation_card(
+        updated,
+        store.asset_rarity(updated.asset.id),
+        image_key="img_confirmed",
+    )
+    text = card_text(card)
+    assert "已确认：奶龙" in text
+    assert "人工校正已生效" in text
+    assert "img_confirmed" in str(card)
 
 
 def test_uncorrected_duplicate_keeps_the_model_uncertainty_message(tmp_path: Path) -> None:
