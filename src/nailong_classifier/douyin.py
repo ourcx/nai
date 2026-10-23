@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 SEARCH_ENDPOINT = "https://www.douyin.com/aweme/v1/web/general/search/single/"
@@ -113,7 +113,7 @@ def search_douyin_videos(
             headers={
                 "Accept": "application/json, text/plain, */*",
                 "Cookie": cookie_header,
-                "Referer": f"https://www.douyin.com/search/{keyword}",
+                "Referer": f"https://www.douyin.com/search/{quote(keyword)}",
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
