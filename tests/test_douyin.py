@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from nailong_classifier.douyin import DouyinSearchError, search_douyin_videos
+from nailong_classifier.douyin import (
+    DouyinSearchError,
+    DouyinVideo,
+    choose_douyin_video,
+    search_douyin_videos,
+)
 
 
 class FakeResponse(io.BytesIO):
@@ -54,12 +59,33 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
             "data": [
                 {
                     "aweme_list": [
-                        {"aweme_id": "123", "desc": f"{keyword}第一条"},
-                        {"aweme_id": "123", "desc": f"{keyword}重复条"},
+                        {
+                            "aweme_id": "123",
+                            "desc": f"{keyword}第一条",
+                            "author": {"nickname": "奶友"},
+                        },
+                        {
+                            "aweme_id": "123",
+                            "desc": f"{keyword}重复条",
+                            "author": {"nickname": "奶友"},
+                        },
                         {"aweme_id": "456", "desc": "无关内容"},
                     ]
                 },
-                {"aweme_info": {"aweme_id": "789", "desc": f"{keyword}卡片视频"}},
+                {
+                    "aweme_info": {
+                        "aweme_id": "789",
+                        "desc": f"{keyword}卡片视频",
+                        "author": {"nickname": "奶友"},
+                    }
+                },
+                {
+                    "aweme_info": {
+                        "aweme_id": "999",
+                        "desc": f"{keyword}官方视频",
+                        "author": {"nickname": "奶龙"},
+                    }
+                },
             ],
         }
         return FakeResponse(json.dumps(payload).encode())
@@ -74,6 +100,26 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
     ]
     assert len(requests) == 2
     assert requests[0].get_header("Cookie") == "sessionid=private-cookie-value"
+
+
+def test_choose_douyin_video_prefers_naiwa(monkeypatch: pytest.MonkeyPatch) -> None:
+    videos = [
+        DouyinVideo(
+            url="https://www.douyin.com/video/1",
+            title="奶龙视频",
+            keyword="奶龙",
+            author_name="奶友甲",
+        ),
+        DouyinVideo(
+            url="https://www.douyin.com/video/2",
+            title="奶娃视频",
+            keyword="奶娃",
+            author_name="奶友乙",
+        ),
+    ]
+    monkeypatch.setattr("nailong_classifier.douyin.secrets.choice", lambda values: values[0])
+
+    assert choose_douyin_video(videos).url == "https://www.douyin.com/video/2"
 
 
 def test_search_douyin_videos_rejects_invalid_cookie_file(tmp_path: Path) -> None:

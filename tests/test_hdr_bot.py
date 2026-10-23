@@ -175,6 +175,8 @@ def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, mon
             DouyinVideo(
                 url="https://www.douyin.com/video/123",
                 title="奶龙测试视频",
+                keyword="奶龙",
+                author_name="奶友",
             )
         ],
     )

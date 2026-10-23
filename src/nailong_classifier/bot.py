@@ -23,7 +23,7 @@ from lark_channel.core import LogLevel
 
 from .catalog_document import CatalogDocumentClient
 from .contact import ContactResolver
-from .douyin import DouyinSearchError, DouyinVideo, search_douyin_videos
+from .douyin import DouyinSearchError, DouyinVideo, choose_douyin_video, search_douyin_videos
 from .hdr import (
     DEFAULT_HDR_PEAK_NITS,
     DEFAULT_HDR_PROBABILITY,
@@ -2128,7 +2128,7 @@ async def run_bot(args: argparse.Namespace) -> None:
                     LOGGER.warning("Douyin search failed; skipping video link push", exc_info=True)
                     return False
             if douyin_videos:
-                video_url = secrets.choice(douyin_videos).url
+                video_url = choose_douyin_video(douyin_videos).url
             elif args.douyin_video_urls:
                 video_url = secrets.choice(args.douyin_video_urls)
             else:

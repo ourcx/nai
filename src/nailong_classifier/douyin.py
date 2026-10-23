@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from urllib.request import Request, urlopen
 SEARCH_ENDPOINT = "https://www.douyin.com/aweme/v1/web/general/search/single/"
 SEARCH_KEYWORDS = ("奶龙", "奶娃")
 COOKIE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+OFFICIAL_AUTHOR_NAMES = frozenset({"奶龙"})
 
 
 class DouyinSearchError(RuntimeError):
@@ -22,6 +24,8 @@ class DouyinSearchError(RuntimeError):
 class DouyinVideo:
     url: str
     title: str
+    keyword: str
+    author_name: str
 
 
 def _cookie_header(cookie_file: Path) -> str:
@@ -69,12 +73,20 @@ def _videos_from_payload(payload: dict[str, Any], keyword: str) -> list[DouyinVi
                 continue
             aweme_id = str(aweme.get("aweme_id", ""))
             title = str(aweme.get("desc", "")).strip()
+            author = aweme.get("author")
+            author_name = (
+                str(author.get("nickname", "")).strip() if isinstance(author, dict) else ""
+            )
             if not aweme_id.isdigit() or keyword not in title:
+                continue
+            if author_name in OFFICIAL_AUTHOR_NAMES:
                 continue
             videos.append(
                 DouyinVideo(
                     url=f"https://www.douyin.com/video/{aweme_id}",
                     title=title,
+                    keyword=keyword,
+                    author_name=author_name,
                 )
             )
     return videos
@@ -135,3 +147,9 @@ def search_douyin_videos(
     if not videos:
         raise DouyinSearchError("Douyin search returned no matching videos")
     return list(videos.values())
+
+
+def choose_douyin_video(videos: list[DouyinVideo]) -> DouyinVideo:
+    """优先发非官方奶娃视频；没有奶娃候选时才回退到其他非官方奶图。"""
+    naiwa_videos = [video for video in videos if video.keyword == "奶娃"]
+    return secrets.choice(naiwa_videos or videos)
