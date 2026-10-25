@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 SEARCH_ENDPOINT = "https://www.douyin.com/aweme/v1/web/general/search/single/"
 SEARCH_KEYWORDS = ("奶蛙", "文艺复兴", "豆奶")
 COOKIE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 OFFICIAL_AUTHOR_NAMES = frozenset({"奶龙"})
+MILK_TAGS = frozenset({"奶龙", "奶蛙"})
+MAX_COVER_BYTES = 5 * 1024 * 1024
 
 
 class DouyinSearchError(RuntimeError):
@@ -26,6 +28,8 @@ class DouyinVideo:
     title: str
     keyword: str
     author_name: str
+    cover_url: str | None = None
+    tags: tuple[str, ...] = ()
 
 
 def _cookie_header(cookie_file: Path) -> str:
@@ -77,7 +81,12 @@ def _videos_from_payload(payload: dict[str, Any], keyword: str) -> list[DouyinVi
             author_name = (
                 str(author.get("nickname", "")).strip() if isinstance(author, dict) else ""
             )
-            if not aweme_id.isdigit() or keyword not in title:
+            tags = _tags_from_aweme(aweme)
+            if (
+                not aweme_id.isdigit()
+                or keyword not in title
+                or not any(tag in MILK_TAGS for tag in tags)
+            ):
                 continue
             if author_name in OFFICIAL_AUTHOR_NAMES:
                 continue
@@ -87,9 +96,87 @@ def _videos_from_payload(payload: dict[str, Any], keyword: str) -> list[DouyinVi
                     title=title,
                     keyword=keyword,
                     author_name=author_name,
+                    cover_url=_cover_url_from_aweme(aweme),
+                    tags=tags,
                 )
             )
     return videos
+
+
+def _tags_from_aweme(aweme: dict[str, Any]) -> tuple[str, ...]:
+    """读取抖音结构化话题字段，不从标题或普通文本猜测标签。"""
+    tags: list[str] = []
+    challenge_list = aweme.get("cha_list")
+    if isinstance(challenge_list, list):
+        for challenge in challenge_list:
+            if isinstance(challenge, dict):
+                tag = challenge.get("cha_name")
+                if isinstance(tag, str) and tag.strip():
+                    tags.append(tag.strip().lstrip("#"))
+    text_extra = aweme.get("text_extra")
+    if isinstance(text_extra, list):
+        for extra in text_extra:
+            if isinstance(extra, dict):
+                tag = extra.get("hashtag_name")
+                if isinstance(tag, str) and tag.strip():
+                    tags.append(tag.strip().lstrip("#"))
+    return tuple(dict.fromkeys(tags))
+
+
+def _cover_url_from_aweme(aweme: dict[str, Any]) -> str | None:
+    video = aweme.get("video")
+    if not isinstance(video, dict):
+        return None
+    for cover_key in ("origin_cover", "cover", "dynamic_cover"):
+        cover = video.get(cover_key)
+        if not isinstance(cover, dict):
+            continue
+        urls = cover.get("url_list")
+        if not isinstance(urls, list):
+            continue
+        for url in urls:
+            if isinstance(url, str) and _is_https_url(url):
+                return url
+    return None
+
+
+def _is_https_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and bool(parsed.hostname)
+
+
+def download_douyin_cover(
+    cover_url: str,
+    *,
+    timeout_seconds: float = 10,
+    max_bytes: int = MAX_COVER_BYTES,
+) -> bytes:
+    """下载搜索结果封面供本地分类，不跟随视频页且限制响应体大小。"""
+    if not _is_https_url(cover_url):
+        raise DouyinSearchError("Douyin cover URL must be HTTPS")
+    request = Request(
+        cover_url,
+        headers={
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Referer": "https://www.douyin.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                raise DouyinSearchError("Douyin cover exceeds maximum size")
+            image_bytes = response.read(max_bytes + 1)
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        raise DouyinSearchError("Douyin cover download failed") from error
+    if not image_bytes or len(image_bytes) > max_bytes:
+        raise DouyinSearchError("Douyin cover exceeds maximum size")
+    return image_bytes
 
 
 def search_douyin_videos(

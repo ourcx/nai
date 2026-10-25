@@ -40,8 +40,8 @@ def run_mock_bot(
     text: str,
     image: bool = False,
     hdr_probability: float = 1.0,
-    douyin_video_urls: list[str] | None = None,
     douyin_cookie_file: Path | None = None,
+    random_push_probability: float = 1.0,
     mentioned_bot: bool = False,
     first_error: FeishuChannelErrorCode | None = None,
 ):
@@ -106,9 +106,8 @@ def run_mock_bot(
     monkeypatch.setattr(bot, "download_target", download)
     args = bot.parse_args()
     args.state_dir = tmp_path
-    args.random_push_probability = 1
+    args.random_push_probability = random_push_probability
     args.random_push_hdr_probability = hdr_probability
-    args.douyin_video_urls = douyin_video_urls or []
     args.douyin_cookie_file = douyin_cookie_file
     args.douyin_video_push_probability = 1
     asyncio.run(bot.run_bot(args))
@@ -151,24 +150,23 @@ def test_normal_chat_random_push_uses_shared_hdr_sender(tmp_path, monkeypatch) -
     assert imagecodecs.ultrahdr_check(content["image"]["source"])
 
 
-def test_normal_chat_video_link_push_takes_priority_over_random_image(
+def test_normal_chat_does_not_send_unverified_static_douyin_urls(
     tmp_path, monkeypatch
 ) -> None:
     calls, _ = run_mock_bot(
         tmp_path,
         monkeypatch,
         text="随便聊聊",
-        douyin_video_urls=["https://v.douyin.com/nailong-video/"],
+        random_push_probability=0,
     )
 
-    assert calls == [
-        ({"text": "来点奶：https://v.douyin.com/nailong-video/"}, None),
-    ]
+    assert calls == []
 
 
 def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, monkeypatch) -> None:
     cookie_file = tmp_path / "douyin-cookies.json"
     cookie_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(bot, "download_douyin_cover", lambda url: b"cover")
     monkeypatch.setattr(
         bot,
         "search_douyin_videos",
@@ -178,6 +176,7 @@ def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, mon
                 title="奶蛙测试视频",
                 keyword="奶蛙",
                 author_name="奶友",
+                cover_url="https://p3.douyinpic.com/test-cover.webp",
             )
         ],
     )
@@ -197,6 +196,7 @@ def test_normal_chat_searches_douyin_when_cookie_search_is_enabled(tmp_path, mon
 def test_mentioned_topic_search_replies_with_requested_topic(tmp_path, monkeypatch) -> None:
     cookie_file = tmp_path / "douyin-cookies.json"
     cookie_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(bot, "download_douyin_cover", lambda url: b"cover")
     monkeypatch.setattr(
         bot,
         "search_douyin_videos",
@@ -206,6 +206,7 @@ def test_mentioned_topic_search_replies_with_requested_topic(tmp_path, monkeypat
                 title="豆奶测试视频",
                 keyword="豆奶",
                 author_name="奶友",
+                cover_url="https://p3.douyinpic.com/test-cover.webp",
             )
         ],
     )
@@ -221,6 +222,44 @@ def test_mentioned_topic_search_replies_with_requested_topic(tmp_path, monkeypat
     assert calls == [
         ({"text": "来点#豆奶：https://www.douyin.com/video/456"}, {"reply_to": "source-id"}),
     ]
+
+
+def test_douyin_cover_filter_requires_accepted_milk_prediction(monkeypatch) -> None:
+    videos = [
+        DouyinVideo(
+            url="https://www.douyin.com/video/keep",
+            title="奶蛙视频",
+            keyword="奶蛙",
+            author_name="奶友甲",
+            cover_url="https://p3.douyinpic.com/keep.webp",
+        ),
+        DouyinVideo(
+            url="https://www.douyin.com/video/drop",
+            title="无关视频",
+            keyword="奶蛙",
+            author_name="奶友乙",
+            cover_url="https://p3.douyinpic.com/drop.webp",
+        ),
+        DouyinVideo(
+            url="https://www.douyin.com/video/no-cover",
+            title="无封面视频",
+            keyword="奶蛙",
+            author_name="奶友丙",
+        ),
+    ]
+    monkeypatch.setattr(bot, "download_douyin_cover", lambda url: url.encode())
+
+    def predict_bytes(data: bytes) -> Prediction:
+        return Prediction(
+            label="naiwa" if data.endswith(b"keep.webp") else "other",
+            confidence=0.9,
+            accepted=True,
+            scores={"nailong": 0.05, "naiwa": 0.9, "other": 0.05},
+        )
+
+    predictor = SimpleNamespace(predict_bytes=predict_bytes)
+
+    assert bot.filter_douyin_videos_by_cover(videos, predictor) == [videos[0]]
 
 
 def test_hdr_upload_rejection_falls_back_once_to_original(tmp_path, monkeypatch) -> None:

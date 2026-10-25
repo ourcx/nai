@@ -32,7 +32,6 @@ from nailong_classifier.bot import (
     parse_daily_report_time,
     parse_douyin_search_keywords,
     parse_douyin_topic_request,
-    parse_douyin_video_urls,
     should_reply_media_error,
 )
 from nailong_classifier.model import Prediction
@@ -168,19 +167,6 @@ def test_video_link_pushes_use_a_persistent_rolling_per_chat_limit(tmp_path: Pat
         )
         is not None
     )
-
-
-def test_parse_douyin_video_urls_accepts_share_domains_and_rejects_other_links() -> None:
-    urls = parse_douyin_video_urls(
-        "https://v.douyin.com/example-one/, https://www.douyin.com/video/123"
-    )
-
-    assert urls == [
-        "https://v.douyin.com/example-one/",
-        "https://www.douyin.com/video/123",
-    ]
-    with pytest.raises(argparse.ArgumentTypeError):
-        parse_douyin_video_urls("https://example.com/video")
 
 
 def test_parse_douyin_search_keywords_removes_hash_prefix_and_duplicates() -> None:

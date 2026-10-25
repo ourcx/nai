@@ -14,7 +14,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
 from lark_channel.channel.errors import FeishuChannelErrorCode
@@ -28,6 +27,7 @@ from .douyin import (
     DouyinSearchError,
     DouyinVideo,
     choose_douyin_video,
+    download_douyin_cover,
     search_douyin_videos,
 )
 from .hdr import (
@@ -109,7 +109,7 @@ DAILY_REPORT_POLL_SECONDS = 60
 DEFAULT_RANDOM_PUSH_PROBABILITY = 0.03
 # 两次主动推送之间的最小间隔（秒），同一个群内生效，避免连着刷屏。默认 2 小时。
 DEFAULT_RANDOM_PUSH_COOLDOWN_SECONDS = 7200
-# 普通群消息触发抖音奶龙/奶娃视频链接的概率；链接池为空时功能自动关闭。
+# 普通群消息触发抖音奶龙/奶娃视频链接的概率；未配置 Cookie 搜索时功能关闭。
 DEFAULT_DOUYIN_VIDEO_PUSH_PROBABILITY = 0.4
 # 同一群在滚动一小时内最多发送两条链接。
 DEFAULT_DOUYIN_VIDEO_PUSH_WINDOW_SECONDS = 3600
@@ -298,6 +298,34 @@ def is_milky_other(prediction: Prediction) -> bool:
 def other_reaction(prediction: Prediction) -> str:
     reactions = OTHER_MILKY_REACTIONS if is_milky_other(prediction) else OTHER_REACTIONS
     return secrets.choice(reactions)
+
+
+def filter_douyin_videos_by_cover(
+    videos: list[DouyinVideo],
+    predictor: NailongPredictor,
+) -> list[DouyinVideo]:
+    """只保留封面被本地模型高置信判为奶龙或奶蛙的搜索结果。"""
+    verified: list[DouyinVideo] = []
+    for video in videos:
+        if not video.cover_url:
+            LOGGER.info("Skipping Douyin video without cover URL url=%s", video.url)
+            continue
+        try:
+            prediction = predictor.predict_bytes(download_douyin_cover(video.cover_url))
+        except (DouyinSearchError, OSError, ValueError):
+            LOGGER.info("Skipping Douyin video with unavailable cover url=%s", video.url)
+            continue
+        if prediction.accepted and prediction.label in {"nailong", "naiwa"}:
+            verified.append(video)
+        else:
+            LOGGER.info(
+                "Skipping non-milk Douyin cover url=%s label=%s confidence=%.3f accepted=%s",
+                video.url,
+                prediction.label,
+                prediction.confidence,
+                prediction.accepted,
+            )
+    return verified
 
 
 def format_concentration(prediction: Prediction, *, corrected: bool = False) -> str:
@@ -559,23 +587,6 @@ def parse_asset_ids(value: str) -> list[int]:
             "catalog baseline asset IDs must be positive integers"
         )
     return list(dict.fromkeys(asset_ids))
-
-
-def parse_douyin_video_urls(value: str) -> list[str]:
-    """解析逗号或换行分隔的抖音分享链接，拒绝非 HTTPS 或非抖音域名。"""
-    urls = [item.strip() for item in re.split(r"[\s,]+", value) if item.strip()]
-    for url in urls:
-        parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
-        if (
-            parsed.scheme != "https"
-            or not hostname
-            or not (hostname == "douyin.com" or hostname.endswith(".douyin.com"))
-        ):
-            raise argparse.ArgumentTypeError(
-                "douyin video URLs must use HTTPS and a douyin.com domain"
-            )
-    return list(dict.fromkeys(urls))
 
 
 def parse_douyin_search_keywords(value: str) -> tuple[str, ...]:
@@ -1357,12 +1368,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--douyin-video-urls",
-        type=parse_douyin_video_urls,
-        default=parse_douyin_video_urls(os.getenv("DOUYIN_VIDEO_URLS", "")),
-        help="Fallback comma-separated Douyin video URLs when cookie search is disabled.",
-    )
-    parser.add_argument(
         "--douyin-cookie-file",
         type=Path,
         default=Path(os.getenv("DOUYIN_COOKIE_FILE"))
@@ -1596,10 +1601,18 @@ async def run_bot(args: argparse.Namespace) -> None:
                         args.douyin_cookie_file,
                         keywords=keywords,
                     )
+                    searched_count = len(videos)
+                    videos = await asyncio.to_thread(
+                        filter_douyin_videos_by_cover,
+                        videos,
+                        predictor,
+                    )
                     douyin_video_cache[keywords] = (now, videos)
                     LOGGER.info(
-                        "Douyin search cache refreshed topics=%s video_count=%d",
+                        "Douyin search cache refreshed topics=%s searched_count=%d "
+                        "verified_count=%d",
                         ",".join(keywords),
+                        searched_count,
                         len(videos),
                     )
                 except DouyinSearchError:
@@ -2175,22 +2188,19 @@ async def run_bot(args: argparse.Namespace) -> None:
         """按配置概率发送抖音奶龙/奶娃链接，并按群限制滚动窗口内的发送次数。"""
         if message.chat_type not in {"group", "topic"}:
             return False
-        if not args.douyin_cookie_file and not args.douyin_video_urls:
+        if not args.douyin_cookie_file:
             return False
         if args.douyin_video_push_probability <= 0:
             return False
         if secrets.SystemRandom().random() >= args.douyin_video_push_probability:
             return False
         douyin_videos = await cached_douyin_videos(args.douyin_search_keywords)
-        if douyin_videos:
-            video_url = choose_douyin_video(
-                douyin_videos,
-                keywords=args.douyin_search_keywords,
-            ).url
-        elif args.douyin_video_urls:
-            video_url = secrets.choice(args.douyin_video_urls)
-        else:
+        if not douyin_videos:
             return False
+        video_url = choose_douyin_video(
+            douyin_videos,
+            keywords=args.douyin_search_keywords,
+        ).url
         reservation_id = await asyncio.to_thread(
             store.reserve_video_link_push,
             message.chat_id,
@@ -2432,7 +2442,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         "Starting bot with model=%s device=%s threshold=%.3f state_dir=%s "
         "daily_report_time=%s catalog_document_sync=%s hdr_probability=%.2f hdr_peak_nits=%.0f "
         "random_push_probability=%.2f random_push_cooldown_seconds=%d "
-        "douyin_video_urls=%d douyin_cookie_search=%s douyin_video_push_probability=%.2f "
+        "douyin_cookie_search=%s douyin_video_push_probability=%.2f "
         "douyin_video_push_window_seconds=%d douyin_video_push_max_per_window=%d",
         args.model,
         predictor.device,
@@ -2444,7 +2454,6 @@ async def run_bot(args: argparse.Namespace) -> None:
         args.hdr_peak_nits,
         args.random_push_probability,
         args.random_push_cooldown_seconds,
-        len(args.douyin_video_urls),
         bool(args.douyin_cookie_file),
         args.douyin_video_push_probability,
         args.douyin_video_push_window_seconds,
