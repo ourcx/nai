@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from nailong_classifier.bot import (
+    CARD_THEME_COLORS,
     build_catalog_post,
     build_correction_confirmation_card,
     build_daily_stats_card,
@@ -20,12 +21,16 @@ from nailong_classifier.bot import (
     format_daily_stats,
     format_existing_observation,
     format_help_message,
+    format_milk_family_check,
+    format_milk_name_welcome,
     has_direct_image,
     is_catalog_command,
     is_daily_stats_command,
     is_help_command,
     is_help_request,
+    make_milk_name,
     media_response_mode,
+    mentioned_user_ids,
     parse_asset_ids,
     parse_correction_card_action,
     parse_correction_command,
@@ -98,6 +103,198 @@ def test_hash_deduplicates_assets_and_message_events(tmp_path: Path) -> None:
     assert duplicate_event.is_new_observation is False
     assert duplicate_event.asset.seen_count == 2
     assert len(list((tmp_path / "assets").iterdir())) == 1
+
+
+def test_refresh_cnn_candidates_updates_catalog_without_losing_corrections_or_counts(
+    tmp_path: Path,
+) -> None:
+    store = BotStore(tmp_path)
+    image_bytes = make_image_bytes("yellow")
+    first = store.record_observation(
+        image_bytes=image_bytes, source_message_id="first", chat_id="chat", chat_type="group",
+        sender_id="sender", predicted_label="naiwa", confidence=0.54, accepted=False,
+    )
+    second = store.record_observation(
+        image_bytes=image_bytes, source_message_id="second", chat_id="chat", chat_type="group",
+        sender_id="sender", predicted_label="naiwa", confidence=0.52, accepted=False,
+    )
+    manual = store.register_seed(make_image_bytes("blue"), "other")
+    before = store.observation_by_id(first.id).asset
+    predictions = [
+        (first.asset.sha256, "naiwa", 0.58, True),
+        (manual.sha256, "nailong", 0.99, True),
+        ("missing-sha", "other", 0.99, True),
+    ]
+    stats = store.refresh_asset_predictions(predictions)
+    assert stats == {"updated": 1, "reclassified": 1, "manual_preserved": 1, "missing": 1}
+    after = store.observation_by_id(first.id).asset
+    assert after.label == "naiwa"
+    assert after.corrected is False
+    assert after.seen_count == before.seen_count == 2
+    assert after.first_seen_at == before.first_seen_at
+    assert store.observation_by_id(second.id).asset.label == "naiwa"
+    assert store.catalog_stats().naiwa == 1
+    with sqlite3.connect(tmp_path / "bot.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT label, confidence, corrected FROM assets WHERE sha256 = ?", (manual.sha256,)
+        ).fetchone() == ("other", 1.0, 1)
+        rows = connection.execute(
+            "SELECT final_label, accepted, confidence FROM observations ORDER BY id"
+        ).fetchall()
+    assert rows == [("naiwa", 0, 0.54), ("naiwa", 1, 0.58)]
+    assert store.refresh_asset_predictions(predictions)["reclassified"] == 0
+
+
+def test_refresh_and_concurrent_manual_correction_do_not_overwrite_each_other(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    store = BotStore(tmp_path)
+    observation = record(
+        store, make_image_bytes("yellow"), message_id="race", label="other"
+    )
+    correction_store = BotStore(tmp_path)
+    correction_connect = correction_store._connect
+    refresh_connect = store._connect
+    competing_writes = []
+
+    def immediate_correction_connection():
+        connection = correction_connect()
+        connection.execute("PRAGMA busy_timeout = 0")
+        return connection
+
+    def attempt_correction_at_refresh_write(statement):
+        if " ".join(statement.split()).startswith("UPDATE assets SET label"):
+            # 插在模型检查 corrected 与写入之间，复现群友同时点击纠正的竞争。
+            try:
+                correction_store.correct_label("race", "other")
+            except sqlite3.OperationalError as error:
+                competing_writes.append(str(error))
+
+    def traced_refresh_connection():
+        connection = refresh_connect()
+        connection.set_trace_callback(attempt_correction_at_refresh_write)
+        return connection
+
+    monkeypatch.setattr(correction_store, "_connect", immediate_correction_connection)
+    monkeypatch.setattr(store, "_connect", traced_refresh_connection)
+    predictions = [(observation.asset.sha256, "naiwa", 0.8, True)]
+    store.refresh_asset_predictions(predictions)
+    assert competing_writes == ["database is locked"]
+    # 线上纠正会等待写锁；此处零等待模拟后重试，人工结果应最终胜出。
+    correction_store.correct_label("race", "other")
+    assert store.refresh_asset_predictions(predictions)["manual_preserved"] == 1
+    assert store.observation_by_id(observation.id).asset.label == "other"
+
+
+def test_milk_family_member_uses_hashed_identity_and_keeps_first_seen(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+
+    assert store.milk_family_member("ou_nai") is None
+    store.record_milk_family_member("ou_nai", display_name="奶小王")
+    store.record_milk_family_member("ou_nai", display_name=None)
+
+    member = store.milk_family_member("ou_nai")
+    assert member is not None
+    assert member.display_name == "奶小王"
+    with sqlite3.connect(tmp_path / "bot.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT user_hash FROM milk_family_members"
+        ).fetchone()
+    assert row == (store.identity_hash("ou_nai"),)
+    assert "ou_nai" not in row[0]
+
+
+def test_milk_name_keeps_identity_and_does_not_force_existing_milk() -> None:
+    assert make_milk_name("王小明") in {"奶小明", "王奶明", "王小奶", "奶王小明", "王小明奶"}
+    assert make_milk_name("李雷") in {"奶雷", "李奶", "奶李雷", "李雷奶"}
+    assert make_milk_name("李") == "奶李"
+    assert make_milk_name(" 张雪奶 ") == "张雪奶"
+    assert make_milk_name("   ") is None
+
+
+def test_milk_name_welcome_batches_newcomers_without_losing_names() -> None:
+    assert "王小明" in format_milk_name_welcome([("王小明", "王小奶")])
+    message = format_milk_name_welcome(
+        [(f"奶友{index}", f"奶名{index}") for index in range(6)]
+    )
+    assert "奶友0→奶名0" in message
+    assert "等 6 位" in message
+
+
+def test_group_members_can_be_registered_in_one_batch(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+
+    assert store.record_milk_family_members(
+        [("ou_nai", "奶小王"), ("ou_frog", "奶小李"), ("", "忽略")]
+    ) == 2
+    assert store.milk_family_member("ou_nai") is not None
+    assert store.milk_family_member("ou_frog") is not None
+
+
+def test_milk_name_welcome_claim_is_idempotent_per_chat_and_user(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+
+    assert store.claim_milk_name_welcome("group-a", "ou_nai")
+    assert not store.claim_milk_name_welcome("group-a", "ou_nai")
+    assert store.claim_milk_name_welcome("group-b", "ou_nai")
+
+
+def test_active_group_chat_ids_include_text_only_chats(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    store.record_chat("group-a", "group")
+    store.record_chat("p2p-a", "p2p")
+
+    assert store.active_group_chat_ids() == ["group-a"]
+
+
+def test_group_quiet_mode_stops_proactive_daily_reports(tmp_path: Path) -> None:
+    store = BotStore(tmp_path)
+    report_day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+    record(
+        store,
+        make_image_bytes("yellow"),
+        message_id="group-message",
+        label="nailong",
+        chat_id="group-a",
+    )
+
+    assert store.proactive_enabled("group-a")
+    store.set_proactive_enabled("group-a", False)
+
+    assert not store.proactive_enabled("group-a")
+    assert store.pending_daily_report_targets(report_day) == []
+
+    store.set_proactive_enabled("group-a", True)
+    assert store.proactive_enabled("group-a")
+    assert [target.chat_id for target in store.pending_daily_report_targets(report_day)] == [
+        "group-a"
+    ]
+
+
+def test_mentioned_user_ids_excludes_bot_and_deduplicates() -> None:
+    message = SimpleNamespace(
+        mentioned_bot=True,
+        body_text="@奶小王",
+        mentions=[
+            # 飞书某些事件没有把当前机器人标为 is_bot，body_text 已移除它。
+            SimpleNamespace(open_id="ou_bot", name="我是奶龙", is_bot=False),
+            SimpleNamespace(open_id="ou_nai", name="奶小王", is_bot=False),
+            SimpleNamespace(open_id="ou_nai", name="改名也不重复", is_bot=False),
+            SimpleNamespace(open_id=None, name="没有 ID", is_bot=False),
+        ]
+    )
+
+    assert mentioned_user_ids(message, body_text=message.body_text) == [
+        ("ou_nai", "奶小王")
+    ]
+
+
+def test_milk_family_check_text_distinguishes_member_and_newcomer() -> None:
+    assert "是奶家人" in format_milk_family_check(
+        "奶小王",
+        SimpleNamespace(display_name="奶小王"),
+    )
+    assert "还没被我认到" in format_milk_family_check("奶新人", None)
 
 
 def test_store_migrates_existing_catalog_document_sync_table(tmp_path: Path) -> None:
@@ -647,6 +844,15 @@ def test_prediction_card_shows_confidence_concentration_and_rarity(tmp_path: Pat
         91.0,
         9.0,
     ]
+    assert chart["chart_spec"]["background"] == "rgba(0,0,0,0)"
+
+
+def test_card_theme_uses_low_luminance_dark_mode_colors() -> None:
+    assert CARD_THEME_COLORS["wb_handdrawn_vibes_canvas"]["dark_mode"] == "rgba(25,25,24,1)"
+    assert CARD_THEME_COLORS["wb_handdrawn_vibes_panel"]["dark_mode"] == "rgba(38,38,36,1)"
+    assert CARD_THEME_COLORS["wb_handdrawn_vibes_canvas"]["dark_mode"] != (
+        CARD_THEME_COLORS["wb_handdrawn_vibes_canvas"]["light_mode"]
+    )
 
 
 def test_uncertain_prediction_card_uses_warning_header_without_rarity(tmp_path: Path) -> None:

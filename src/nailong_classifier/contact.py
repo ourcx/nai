@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from lark_channel.client import Client
 from lark_channel.core.enum import AccessTokenType, HttpMethod
@@ -25,9 +26,20 @@ class ContactResolver:
     def __init__(self, client: Client) -> None:
         self.client = client
         self._cache: dict[str, str] = {}
+        self._failed_until: dict[str, float] = {}
         self._lock = asyncio.Lock()
         # 没权限时只告警一次，避免刷屏日志。
         self._warned_permission = False
+
+    def remember(self, open_id: str, name: str | None) -> None:
+        """缓存消息/@/群成员接口提供的昵称，拿到真实显示名后清除失败缓存。"""
+        name = name.strip() if isinstance(name, str) else ""
+        if open_id and name:
+            self._cache[open_id] = name
+            self._failed_until.pop(open_id, None)
+
+    def cached_name(self, open_id: str) -> str | None:
+        return self._cache.get(open_id)
 
     async def resolve(self, open_id: str, *, fallback: str = FALLBACK_DISPLAY_NAME) -> str:
         """返回这个 open_id 对应的昵称；查不到或没权限时返回 fallback。"""
@@ -41,10 +53,17 @@ class ContactResolver:
             cached = self._cache.get(open_id)
             if cached is not None:
                 return cached
+            if time.monotonic() < self._failed_until.get(open_id, 0):
+                return fallback
             name = await self._fetch_name(open_id)
+            # 网络查询期间也可能收到带昵称的消息，优先使用刚收到的显示名。
+            cached = self._cache.get(open_id)
+            if cached is not None:
+                return cached
             if name:
-                self._cache[open_id] = name
+                self.remember(open_id, name)
                 return name
+            self._failed_until[open_id] = time.monotonic() + 300
         return fallback
 
     async def _fetch_name(self, open_id: str) -> str | None:
@@ -62,7 +81,8 @@ class ContactResolver:
                 self._warned_permission = True
                 LOGGER.warning(
                     "Contact lookup returned code=%s msg=%s; "
-                    "检查机器人是否开通 contact:user.base:readonly 权限",
+                    "检查 contact:user.base:readonly 权限与通讯录可见范围；"
+                    "外部成员可能无法通过通讯录读取",
                     code,
                     payload.get("msg"),
                 )

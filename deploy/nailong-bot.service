@@ -1,5 +1,5 @@
 [Unit]
-Description=Nailong and Naiwa Feishu image classifier
+Description=Nailong and Naiwa Feishu and QQ image classifier
 After=network-online.target
 Wants=network-online.target
 
@@ -11,7 +11,9 @@ WorkingDirectory=/opt/nailong-bot
 EnvironmentFile=/etc/nailong-bot.env
 Environment=MODEL_PATH=/opt/nailong-bot/artifacts/model.pt
 Environment=MODEL_DEVICE=cpu
-Environment=MODEL_THRESHOLD=0.65
+Environment=MODEL_THRESHOLD=0.50
+Environment=MILK_MODEL_PATH=/opt/nailong-bot/artifacts/milk-release-20261031/manifest.json
+Environment=DOUBAO_MODEL_PATH=/opt/nailong-bot/artifacts/doubao-detector-20261026/model.pt
 Environment=BOT_STATE_DIR=/var/lib/nailong-bot
 Environment=DAILY_REPORT_TIME=23:55
 Environment=PYTHONUNBUFFERED=1

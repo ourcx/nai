@@ -87,8 +87,10 @@ def random_milk_image_content(
     probability: float = DEFAULT_HDR_PROBABILITY,
     peak_nits: float = DEFAULT_HDR_PEAK_NITS,
 ) -> dict:
-    """为主动推送选择原图或 HDR 衍生图，始终只发图片；转换失败继续发原图。
+    """为主动推送选择原图或聊天内可播放的闪亮 GIF，始终只发图片。
 
+    飞书会过滤或丢失 Ultra HDR 的 gain map，因此群聊不再直接上传 HDR JPEG。
+    保留原配置名和触发概率，命中后生成普通 GIF，在客户端用亮度脉冲模拟闪亮。
     文件读取与编码由调用方放到工作线程中，避免阻塞群聊消息处理。
     """
     validate_hdr_settings(probability, peak_nits)
@@ -96,12 +98,36 @@ def random_milk_image_content(
     if probability <= 0 or secrets.SystemRandom().random() >= probability:
         return content
     try:
-        encoded = make_hdr_image(source.read_bytes(), peak_nits=peak_nits)
+        encoded = make_flash_gif(source.read_bytes())
     except Exception:
-        LOGGER.exception("HDR conversion failed, sending original image path=%s", source)
+        LOGGER.exception("Flash GIF conversion failed, sending original image path=%s", source)
         return content
-    LOGGER.info("Prepared HDR milk image peak_nits=%.0f bytes=%d", peak_nits, len(encoded))
+    LOGGER.info("Prepared flash milk GIF bytes=%d", len(encoded))
     return {"image": {"source": encoded}}
+
+
+def make_flash_gif(image_bytes: bytes) -> bytes:
+    """把一张奶图做成客户端可播放的短 GIF，模拟高光闪一下的效果。"""
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        frame = ImageOps.exif_transpose(image).convert("RGBA")
+        frame.thumbnail(HDR_MAX_SIZE, Image.Resampling.LANCZOS)
+        background = Image.new("RGBA", frame.size, "white")
+        base = Image.alpha_composite(background, frame).convert("RGB")
+
+    # 三帧短循环：原图 -> 高亮闪白 -> 原图。使用 SDR GIF，避免飞书过滤 HDR gain map。
+    flash = Image.blend(base, Image.new("RGB", base.size, "white"), 0.38)
+    output = io.BytesIO()
+    base.save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=[flash, base],
+        duration=[300, 120, 600],
+        loop=0,
+        disposal=2,
+        optimize=True,
+    )
+    return output.getvalue()
 
 
 def main() -> None:

@@ -6,12 +6,13 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import imagecodecs
 import pytest
 from lark_channel.channel.errors import FeishuChannelErrorCode
 from PIL import Image
 
+import nailong_classifier.adapters.feishu as feishu
 import nailong_classifier.bot as bot
+from nailong_classifier.adapters.config import create_adapter
 from nailong_classifier.douyin import DouyinVideo
 from nailong_classifier.model import Prediction
 from nailong_classifier.storage import BotStore
@@ -43,7 +44,10 @@ def run_mock_bot(
     douyin_cookie_file: Path | None = None,
     random_push_probability: float = 1.0,
     mentioned_bot: bool = False,
+    mentions: list[object] | None = None,
+    quoted_image: bool = False,
     first_error: FeishuChannelErrorCode | None = None,
+    doubao_detected: bool = False,
 ):
     store = BotStore(tmp_path)
     store.register_seed(image_bytes("yellow"), "nailong")
@@ -58,6 +62,23 @@ def run_mock_bot(
         def on(self, event, handler):
             self.handlers[event] = handler
 
+        def on_raw_event(self, event_type, handler):
+            self.handlers[f"raw:{event_type}"] = handler
+
+        async def resolve_quoted_contexts(self, messages, **kwargs):
+            if not quoted_image:
+                return {}
+            return {
+                messages[0].message_id: SimpleNamespace(
+                    decision="resolved",
+                    context=SimpleNamespace(
+                        content_type="image",
+                        message_id="quoted-image-id",
+                        raw={"body": {"content": '{"image_key":"quoted-image-key"}'}},
+                    ),
+                )
+            }
+
         async def send(self, chat_id, content, options=None):
             calls.append((content, options))
             if len(calls) == 1 and first_error is not None:
@@ -71,17 +92,21 @@ def run_mock_bot(
                 sender_is_bot=False,
                 raw_content_type="image" if image else "text",
                 resources=[SimpleNamespace(type="image", file_key="img_source")] if image else [],
-                reply_to_message_id=None,
+                reply_to_message_id="quoted-image-id" if quoted_image else None,
                 mentioned_bot=mentioned_bot,
                 message_id="source-id",
                 chat_id="chat-a",
                 chat_type="group",
                 sender_id="user-a",
                 sender_name="奶友",
+                mentions=mentions or [],
                 body_text=text,
                 content_text=text,
             )
             await self.handlers["message"](message)
+
+        async def disconnect(self):
+            pass
 
     async def download(*args):
         return image_bytes("blue")
@@ -100,35 +125,57 @@ def run_mock_bot(
     monkeypatch.setenv("LARK_APP_SECRET", "test-secret")
     monkeypatch.delenv("CATALOG_DOCUMENT_ID", raising=False)
     monkeypatch.delenv("CATALOG_SECTION_BLOCK_ID", raising=False)
+    monkeypatch.delenv("DOUBAO_MODEL_PATH", raising=False)
+    monkeypatch.delenv("DOUBAO_MODEL_THRESHOLD", raising=False)
     monkeypatch.setattr(sys, "argv", ["nailong-bot"])
-    monkeypatch.setattr(bot, "FeishuChannel", Channel)
+    monkeypatch.setattr(feishu, "FeishuChannel", Channel)
+    # 这些业务回归使用进程内假 SDK；真实进程边界由 test_adapters 覆盖，
+    # 不能把未打补丁的子进程连接到真实飞书网络。
+    monkeypatch.setattr(
+        bot, "create_adapter",
+        lambda config, **kwargs: create_adapter(config, isolate_feishu=False),
+    )
     monkeypatch.setattr(bot, "NailongPredictor", lambda *args, **kwargs: predictor)
     monkeypatch.setattr(bot, "download_target", download)
+    if doubao_detected:
+        doubao_detector = SimpleNamespace(
+            threshold=0.3,
+            predict_bytes=lambda data: SimpleNamespace(detected=True, confidence=0.9),
+            predict_path=lambda path: SimpleNamespace(detected=True, confidence=0.9),
+        )
+        monkeypatch.setattr(bot, "DoubaoDetector", lambda *args, **kwargs: doubao_detector)
     args = bot.parse_args()
     args.state_dir = tmp_path
     args.random_push_probability = random_push_probability
     args.random_push_hdr_probability = hdr_probability
     args.douyin_cookie_file = douyin_cookie_file
     args.douyin_video_push_probability = 1
+    args.doubao_model = Path("doubao-detector.pt") if doubao_detected else None
     asyncio.run(bot.run_bot(args))
     return calls, store
 
 
-def test_manual_hdr_sends_image_even_when_random_hdr_is_disabled(tmp_path, monkeypatch) -> None:
+def _assert_flash_gif(source: bytes) -> None:
+    with Image.open(io.BytesIO(source)) as image:
+        assert image.format == "GIF"
+        assert image.n_frames == 3
+
+
+def test_manual_hdr_sends_flash_gif_even_when_random_hdr_is_disabled(tmp_path, monkeypatch) -> None:
     calls, _ = run_mock_bot(tmp_path, monkeypatch, text="HDR奶图", hdr_probability=0)
     assert len(calls) == 1
     content, options = calls[0]
     assert set(content) == {"image"}
     assert options == {"reply_to": "source-id"}
-    assert imagecodecs.ultrahdr_check(content["image"]["source"])
+    _assert_flash_gif(content["image"]["source"])
 
 
-def test_chain_reply_runs_hdr_conversion_and_preserves_response_tracking(tmp_path, monkeypatch):
+def test_chain_reply_runs_flash_conversion_and_preserves_response_tracking(tmp_path, monkeypatch):
     calls, store = run_mock_bot(tmp_path, monkeypatch, text="", image=True)
     assert len(calls) == 1
     content, options = calls[0]
     assert set(content) == {"image"}
-    assert imagecodecs.ultrahdr_check(content["image"]["source"])
+    _assert_flash_gif(content["image"]["source"])
     assert options == {"reply_to": "source-id"}
     correction = store.correct_label("response-id", "naiwa")
     assert correction is not None
@@ -141,13 +188,93 @@ def test_chain_without_hdr_keeps_existing_caption(tmp_path, monkeypatch) -> None
     assert "奶龙接上了" in content["caption"]
 
 
-def test_normal_chat_random_push_uses_shared_hdr_sender(tmp_path, monkeypatch) -> None:
+def test_normal_chat_random_push_uses_shared_flash_sender(tmp_path, monkeypatch) -> None:
     calls, _ = run_mock_bot(tmp_path, monkeypatch, text="随便聊聊")
     assert len(calls) == 1
     content, options = calls[0]
     assert set(content) == {"image"}
     assert options is None
-    assert imagecodecs.ultrahdr_check(content["image"]["source"])
+    _assert_flash_gif(content["image"]["source"])
+
+
+def test_mentioning_a_registered_milk_family_member_returns_public_milk_name(
+    tmp_path, monkeypatch
+) -> None:
+    store = BotStore(tmp_path)
+    store.record_milk_family_member("user-b", display_name="奶小王")
+
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="@奶小王",
+        mentioned_bot=True,
+        mentions=[
+            SimpleNamespace(open_id="bot-id", name="我是奶龙", is_bot=True),
+            SimpleNamespace(open_id="user-b", name="奶小王", is_bot=False),
+        ],
+        random_push_probability=0,
+    )
+
+    assert len(calls) == 1
+    content, options = calls[0]
+    assert content["text"].startswith("奶小王 是奶家人，是你【")
+    assert options == {"reply_to": "source-id"}
+
+
+def test_mentioning_an_unregistered_user_explains_how_to_join(tmp_path, monkeypatch) -> None:
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="@奶新人",
+        mentioned_bot=True,
+        mentions=[SimpleNamespace(open_id="user-new", name="奶新人", is_bot=False)],
+        random_push_probability=0,
+    )
+
+    assert calls == [
+        (
+            {"text": "奶新人 还没被我认到是奶家人，先在群里冒个泡吧。"},
+            {"reply_to": "source-id"},
+        )
+    ]
+
+
+def test_replying_to_an_image_and_mentioning_bot_still_runs_recognition(
+    tmp_path, monkeypatch
+) -> None:
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="",
+        mentioned_bot=True,
+        mentions=[SimpleNamespace(open_id="bot-id", name="我是奶龙", is_bot=True)],
+        quoted_image=True,
+        random_push_probability=0,
+    )
+
+    assert len(calls) == 1
+    content, options = calls[0]
+    assert "card" in content
+    assert options == {"reply_to": "source-id"}
+
+
+def test_mentioning_bot_in_same_message_as_image_still_runs_recognition(
+    tmp_path, monkeypatch
+) -> None:
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="@我是奶龙",
+        image=True,
+        mentioned_bot=True,
+        mentions=[SimpleNamespace(open_id="bot-id", name="我是奶龙", is_bot=True)],
+        random_push_probability=0,
+    )
+
+    assert len(calls) == 1
+    content, options = calls[0]
+    assert "card" in content
+    assert options == {"reply_to": "source-id"}
 
 
 def test_normal_chat_does_not_send_unverified_static_douyin_urls(
@@ -158,6 +285,29 @@ def test_normal_chat_does_not_send_unverified_static_douyin_urls(
         monkeypatch,
         text="随便聊聊",
         random_push_probability=0,
+    )
+
+    assert calls == []
+
+
+def test_doubao_image_is_silently_rejected_before_collection(tmp_path, monkeypatch) -> None:
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="",
+        image=True,
+        doubao_detected=True,
+    )
+
+    assert calls == []
+
+
+def test_doubao_asset_is_not_sent_by_random_push(tmp_path, monkeypatch) -> None:
+    calls, _ = run_mock_bot(
+        tmp_path,
+        monkeypatch,
+        text="正常聊天",
+        doubao_detected=True,
     )
 
     assert calls == []

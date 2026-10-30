@@ -4,6 +4,8 @@ import hashlib
 import io
 import secrets
 import sqlite3
+from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -16,6 +18,7 @@ from .image_fingerprint import try_content_hash
 from .rarity import Rarity, classify_rarity
 
 LABELS = {"nailong", "naiwa", "other"}
+LEGACY_NAME_FALLBACKS = {"神秘奶友", "新朋友"}
 # 盲盒猜图在奶龙/奶蛙/其他三类之间出题。
 GUESS_LABELS = {"nailong", "naiwa", "other"}
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -142,6 +145,26 @@ class HunterRanking:
 
     display_name: str
     discovered: int
+
+
+@dataclass(frozen=True)
+class MilkFamilyMember:
+    """一个被机器人见过并登记过的奶家人。"""
+
+    display_name: str | None
+    first_seen_at: str
+    last_seen_at: str
+
+
+@dataclass(frozen=True)
+class MilkName:
+    """首次原昵称与最新奶名；日常改昵称和服务重启不改名，明确求赐名才更新。"""
+
+    original_name: str
+    milk_name: str
+    assigned_at: str
+    # 兜底称呼不算真实原昵称；之后得到真实昵称可补全对应关系，不改已赐奶名。
+    original_name_known: bool = True
 
 
 class BotStore:
@@ -301,6 +324,40 @@ class BotStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (chat_hash, sender_hash)
                 );
+
+                -- 奶家人：只保存用户 open_id 的不可逆哈希，不保存原始飞书用户标识。
+                -- 用户发过一条可被机器人收到的消息后登记；昵称为空时后续拿到再补。
+                CREATE TABLE IF NOT EXISTS milk_family_members (
+                    user_hash TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+
+                -- 奶名绑定平台适配层的用户身份哈希，不按昵称匹配，避免重名串号。
+                -- 原昵称保留赐名时的快照；日常成员昵称更新不会覆盖已赐的奶名。
+                CREATE TABLE IF NOT EXISTS milk_names (
+                    user_hash TEXT PRIMARY KEY REFERENCES milk_family_members(user_hash),
+                    original_name TEXT NOT NULL,
+                    milk_name TEXT NOT NULL,
+                    assigned_at TEXT NOT NULL,
+                    original_name_known INTEGER NOT NULL DEFAULT 1
+                );
+
+                -- 入群事件会重投，同一个人在同一个群只起一次奶名。
+                CREATE TABLE IF NOT EXISTS milk_name_welcomes (
+                    chat_hash TEXT NOT NULL,
+                    user_hash TEXT NOT NULL,
+                    welcomed_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_hash, user_hash)
+                );
+
+                -- 默认允许机器人参与群聊；关闭后只响应明确 @ 或命令，不再主动发图、接龙或欢迎新人。
+                CREATE TABLE IF NOT EXISTS chat_bot_settings (
+                    chat_hash TEXT PRIMARY KEY REFERENCES chat_targets(chat_hash),
+                    proactive_enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             sync_columns = {
@@ -343,6 +400,63 @@ class BotStore:
                 connection.execute(
                     "ALTER TABLE chat_targets ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
                 )
+            # 旧版本允许同昵称用户撞奶名：只调整重复组里较晚的记录，再建立唯一索引。
+            # 迁移和多实例启动共用写锁，不会出现清理完重复、建索引前又插入重复的窗口。
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            name_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(milk_names)")
+            }
+            if "original_name_known" not in name_columns:
+                connection.execute(
+                    "ALTER TABLE milk_names ADD COLUMN "
+                    "original_name_known INTEGER NOT NULL DEFAULT 1"
+                )
+                # 老版本只有两个固定兜底称呼，首次迁移时将它们标为待补昵称。
+                connection.executemany(
+                    "UPDATE milk_names SET original_name_known = 0 WHERE original_name = ?",
+                    [(name,) for name in LEGACY_NAME_FALLBACKS],
+                )
+            connection.execute(
+                """
+                UPDATE milk_names SET
+                    original_name = (
+                        SELECT display_name FROM milk_family_members
+                        WHERE user_hash = milk_names.user_hash
+                    ),
+                    original_name_known = 1
+                WHERE original_name_known = 0 AND user_hash IN (
+                    SELECT user_hash FROM milk_family_members
+                    WHERE TRIM(COALESCE(display_name, '')) != ''
+                    AND display_name NOT IN ('神秘奶友', '新朋友')
+                )
+                """
+            )
+            duplicates = connection.execute(
+                """
+                SELECT user_hash, milk_name FROM milk_names
+                WHERE milk_name IN (
+                    SELECT milk_name FROM milk_names GROUP BY milk_name HAVING COUNT(*) > 1
+                )
+                ORDER BY assigned_at, user_hash
+                """
+            ).fetchall()
+            retained: set[str] = set()
+            for row in duplicates:
+                name = row["milk_name"]
+                if name not in retained:
+                    retained.add(name)
+                    continue
+                unique_name = self._available_milk_name(
+                    connection, candidates=(), fallback_name=name
+                )
+                connection.execute(
+                    "UPDATE milk_names SET milk_name = ? WHERE user_hash = ?",
+                    (unique_name, row["user_hash"]),
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_milk_names_unique ON milk_names(milk_name)"
+            )
         # 老库新增 phash 列后为存量图回填一次指纹，让稀有度统计立刻可用。
         self._backfill_phashes()
 
@@ -539,6 +653,57 @@ class BotStore:
             is_new_observation=True,
         )
 
+    def refresh_asset_predictions(
+        self, predictions: list[tuple[str, str, float, bool]]
+    ) -> dict[str, int]:
+        """把新 CNN 的判定应用到存量图，不新增发图记录、不改人工确认标签。
+
+        按图片 SHA 匹配，避免下载期间新增素材导致 ID 对错。最新观察保存本次
+        模型候选，其余观察保留原候选；最终分类与图鉴一致，沿用人工纠正的
+        统计口径。时间、出现次数、发送历史和首发信息均保留。
+        """
+        for _digest, label, confidence, _accepted in predictions:
+            self._validate_label(label)
+            if not 0 <= confidence <= 1:
+                raise ValueError("Prediction confidence must be between 0 and 1")
+        stats: Counter[str] = Counter(
+            updated=0, reclassified=0, manual_preserved=0, missing=0
+        )
+        with self._connect() as connection:
+            # 先拿写锁，再检查 corrected；群友同时纠正时不能在检查与更新之间被覆盖。
+            connection.execute("BEGIN IMMEDIATE")
+            for digest, label, confidence, accepted in predictions:
+                asset = connection.execute(
+                    "SELECT id, label, corrected FROM assets WHERE sha256 = ?", (digest,)
+                ).fetchone()
+                if asset is None:
+                    stats.update(missing=1)
+                    continue
+                if asset["corrected"]:
+                    stats.update(manual_preserved=1)
+                    continue
+                final_label = label if accepted else "other"
+                connection.execute(
+                    "UPDATE assets SET label = ?, confidence = ? WHERE id = ?",
+                    (final_label, confidence, asset["id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE observations
+                    SET predicted_label = ?, confidence = ?, accepted = ?
+                    WHERE id = (SELECT MAX(id) FROM observations WHERE asset_id = ?)
+                    """,
+                    (label, confidence, int(accepted), asset["id"]),
+                )
+                connection.execute(
+                    "UPDATE observations SET final_label = ? WHERE asset_id = ?",
+                    (final_label, asset["id"]),
+                )
+                stats.update(updated=1)
+                if asset["label"] != final_label:
+                    stats.update(reclassified=1)
+        return dict(stats)
+
     def attach_response(self, observation_id: int, response_message_id: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -681,6 +846,320 @@ class BotStore:
                 return None
             label = secrets.choice(sorted(by_label))
         return self._asset_from_row(secrets.choice(by_label[label]))
+
+    def record_milk_family_member(
+        self,
+        user_id: str,
+        *,
+        display_name: str | None = None,
+    ) -> None:
+        """登记一位发过消息的奶家人，保留最早和最近被见到的时间。
+
+        用户标识只以哈希形式落库。昵称是展示用快照，不拿空值覆盖已有昵称。
+        """
+        if not user_id:
+            return
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        name = (display_name.strip() or None) if display_name else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO milk_family_members (
+                    user_hash, display_name, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_hash) DO UPDATE SET
+                    display_name = COALESCE(excluded.display_name, display_name),
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (self.identity_hash(user_id), name, now, now),
+            )
+            if name:
+                self._fill_original_name(connection, self.identity_hash(user_id), name)
+
+    def record_milk_family_members(
+        self,
+        members: list[tuple[str, str | None]],
+    ) -> int:
+        """批量登记群成员，返回实际写入的非空用户数。"""
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        rows = [
+            (
+                self.identity_hash(user_id),
+                (display_name.strip() or None) if display_name else None,
+                now,
+                now,
+            )
+            for user_id, display_name in members
+            if user_id
+        ]
+        if not rows:
+            return 0
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO milk_family_members (
+                    user_hash, display_name, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_hash) DO UPDATE SET
+                    display_name = COALESCE(excluded.display_name, display_name),
+                    last_seen_at = excluded.last_seen_at
+                """,
+                rows,
+            )
+            for digest, name, _, _ in rows:
+                if name:
+                    self._fill_original_name(connection, digest, name)
+        return len(rows)
+
+    def remember_milk_family_names(self, members: list[tuple[str, str | None]]) -> None:
+        """@ 显示名只补已有成员资料，不把“被提及”当作本人发言或认领奶家人。"""
+        with self._connect() as connection:
+            for user_id, display_name in members:
+                name = display_name.strip() if display_name else ""
+                if not user_id or not name:
+                    continue
+                digest = self.identity_hash(user_id)
+                connection.execute(
+                    "UPDATE milk_family_members SET display_name = ? WHERE user_hash = ?",
+                    (name, digest),
+                )
+                self._fill_original_name(connection, digest, name)
+
+    @staticmethod
+    def _fill_original_name(connection: sqlite3.Connection, digest: str, name: str) -> None:
+        """只补系统兜底留下的空缺；正常用户改昵称不覆盖首次原昵称，也不换奶名。"""
+        connection.execute(
+            """
+            UPDATE milk_names SET original_name = ?, original_name_known = 1
+            WHERE user_hash = ? AND original_name_known = 0
+            """,
+            (name, digest),
+        )
+
+    @staticmethod
+    def _milk_name_from_row(row: sqlite3.Row) -> MilkName:
+        return MilkName(
+            original_name=row["original_name"], milk_name=row["milk_name"],
+            assigned_at=row["assigned_at"], original_name_known=bool(row["original_name_known"]),
+        )
+
+    def milk_name_for_user(self, user_id: str) -> MilkName | None:
+        """按用户身份查已赐奶名，不把原始平台用户标识写入数据库。"""
+        if not user_id:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM milk_names WHERE user_hash = ?",
+                (self.identity_hash(user_id),),
+            ).fetchone()
+        return self._milk_name_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _available_milk_name(
+        connection: sqlite3.Connection, *, candidates: Iterable[str],
+        fallback_name: str, previous_name: str | None = None,
+    ) -> str:
+        """在已持有的数据库写锁内查重；词库被占满时追加随机短标记继续查重。"""
+        def available(name: str) -> bool:
+            return bool(name) and name != previous_name and connection.execute(
+                "SELECT 1 FROM milk_names WHERE milk_name = ?", (name,)
+            ).fetchone() is None
+
+        for candidate in candidates:
+            name = candidate.strip()
+            if available(name):
+                return name
+        # 有限词库或随机反复撞到同一个词时仍能赐名；兜底也须通过查重才能落库。
+        for _ in range(64):
+            name = f"{fallback_name}·{secrets.token_hex(4)}"
+            if available(name):
+                return name
+        raise RuntimeError("Unable to allocate a unique milk name")
+
+    def assign_milk_name(
+        self, user_id: str, *, original_name: str, milk_name: str,
+        name_options: Callable[[str], Iterable[str]] | None = None,
+        original_name_known: bool = True,
+        replace_existing: bool = True,
+    ) -> MilkName:
+        """原子登记奶名；入群欢迎也随机生成，但 replace_existing=False 保留已有名。
+
+        取得写锁后才读取旧名、生成候选并排除旧名，避免同时求名读到同一旧值。
+        候选函数使用库中首次原昵称，昵称改变或并发首授也不会让主体发生漂移。
+        所有用户共用同一奶名空间，候选被占用时重抽，数据库唯一索引再兜底。
+        返回本次实际保存的映射，之后入群欢迎不会覆盖主动更换过的名字。
+        """
+        original_name, milk_name = original_name.strip(), milk_name.strip()
+        if not user_id or not original_name or not milk_name:
+            raise ValueError("User identity, original name and milk name must not be empty")
+        digest = self.identity_hash(user_id)
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if original_name_known:
+                self._fill_original_name(connection, digest, original_name)
+            existing = connection.execute(
+                "SELECT original_name, milk_name FROM milk_names WHERE user_hash = ?",
+                (digest,),
+            ).fetchone()
+            should_replace = name_options is not None and replace_existing
+            if existing is None or should_replace:
+                candidates = (
+                    name_options(existing["original_name"] if existing else original_name)
+                    if name_options is not None else (milk_name,)
+                )
+                milk_name = self._available_milk_name(
+                    connection,
+                    candidates=candidates,
+                    fallback_name=milk_name,
+                    previous_name=existing["milk_name"] if existing else None,
+                )
+            connection.execute(
+                """
+                INSERT INTO milk_family_members (
+                    user_hash, display_name, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_hash) DO UPDATE SET
+                    -- 消息处理已更新当前昵称；使用首次原昵称换奶名时不要把它改回去。
+                    display_name = COALESCE(display_name, excluded.display_name),
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (digest, original_name, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO milk_names (
+                    user_hash, original_name, milk_name, assigned_at, original_name_known
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_hash) DO NOTHING
+                """,
+                (digest, original_name, milk_name, now, int(original_name_known)),
+            )
+            if existing is not None and should_replace:
+                connection.execute(
+                    "UPDATE milk_names SET milk_name = ?, assigned_at = ? WHERE user_hash = ?",
+                    (milk_name, now, digest),
+                )
+            row = connection.execute(
+                "SELECT * FROM milk_names WHERE user_hash = ?",
+                (digest,),
+            ).fetchone()
+        return self._milk_name_from_row(row)
+
+    def claim_milk_name_welcome(self, chat_id: str, user_id: str) -> bool:
+        """原子占用一次入群欢迎资格，避免飞书事件重投时重复发消息。"""
+        if not chat_id or not user_id:
+            return False
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO milk_name_welcomes (chat_hash, user_hash, welcomed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_hash, user_hash) DO NOTHING
+                """,
+                (
+                    self.identity_hash(chat_id),
+                    self.identity_hash(user_id),
+                    datetime.now(LOCAL_TIMEZONE).isoformat(),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def release_milk_name_welcome(self, chat_id: str, user_id: str) -> None:
+        """欢迎未发送成功时归还本次占用，让后续入群事件仍能重试。"""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM milk_name_welcomes WHERE chat_hash = ? AND user_hash = ?",
+                (self.identity_hash(chat_id), self.identity_hash(user_id)),
+            )
+
+    def milk_family_member(self, user_id: str) -> MilkFamilyMember | None:
+        """查询用户是否被机器人登记为奶家人。"""
+        if not user_id:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT display_name, first_seen_at, last_seen_at
+                FROM milk_family_members
+                WHERE user_hash = ?
+                """,
+                (self.identity_hash(user_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return MilkFamilyMember(
+            display_name=row["display_name"],
+            first_seen_at=row["first_seen_at"],
+            last_seen_at=row["last_seen_at"],
+        )
+
+    def active_group_chat_ids(self) -> list[str]:
+        """返回机器人运行库里已知且仍有效的群聊，用于补登记群成员。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chat_id
+                FROM chat_targets
+                WHERE chat_type = 'group' AND active = 1
+                ORDER BY last_seen_at
+                """
+            ).fetchall()
+        return [str(row["chat_id"]) for row in rows]
+
+    def proactive_enabled(self, chat_id: str) -> bool:
+        """未设置的群默认允许主动互动，保持旧群行为不变。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT proactive_enabled
+                FROM chat_bot_settings
+                WHERE chat_hash = ?
+                """,
+                (self.identity_hash(chat_id),),
+            ).fetchone()
+        return row is None or bool(row["proactive_enabled"])
+
+    def set_proactive_enabled(self, chat_id: str, enabled: bool) -> None:
+        now = datetime.now(LOCAL_TIMEZONE).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_bot_settings (chat_hash, proactive_enabled, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_hash) DO UPDATE SET
+                    proactive_enabled = excluded.proactive_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (self.identity_hash(chat_id), int(enabled), now),
+            )
+
+    def record_chat(self, chat_id: str, chat_type: str) -> None:
+        """记录机器人收到过的会话，让纯文字群也进入后续成员补登记范围。"""
+        if not chat_id:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_targets (
+                    chat_hash, chat_id, chat_type, last_seen_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_hash) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    chat_type = excluded.chat_type,
+                    last_seen_at = excluded.last_seen_at,
+                    active = 1
+                """,
+                (
+                    self.identity_hash(chat_id),
+                    chat_id,
+                    chat_type,
+                    datetime.now(LOCAL_TIMEZONE).isoformat(),
+                ),
+            )
 
     def next_chain_asset(
         self,
@@ -880,8 +1359,11 @@ class BotStore:
                 """
                 SELECT chat_targets.chat_id
                 FROM chat_targets
+                LEFT JOIN chat_bot_settings
+                  ON chat_bot_settings.chat_hash = chat_targets.chat_hash
                 WHERE chat_targets.chat_type IN ('group', 'topic')
                   AND chat_targets.active = 1
+                  AND COALESCE(chat_bot_settings.proactive_enabled, 1) = 1
                   AND EXISTS (
                       SELECT 1
                       FROM observations

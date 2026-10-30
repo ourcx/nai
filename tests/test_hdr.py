@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 
 from nailong_classifier.hdr import (
+    make_flash_gif,
     make_hdr_image,
     random_milk_image_content,
     validate_hdr_settings,
@@ -101,7 +102,7 @@ def test_invalid_brightness_is_rejected(peak_nits: float) -> None:
         make_hdr_image(image_bytes(Image.new("RGB", (32, 32), "gold")), peak_nits=peak_nits)
 
 
-def test_random_hdr_push_only_contains_image_and_keeps_original(
+def test_random_flash_push_only_contains_animated_gif_and_keeps_original(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "milk.png"
@@ -113,11 +114,14 @@ def test_random_hdr_push_only_contains_image_and_keeps_original(
 
     assert set(content) == {"image"}
     assert set(content["image"]) == {"source"}
-    assert imagecodecs.ultrahdr_check(content["image"]["source"])
+    with Image.open(io.BytesIO(content["image"]["source"])) as image:
+        assert image.format == "GIF"
+        assert image.n_frames == 3
+        assert image.info["loop"] == 0
     assert source.read_bytes() == original
 
 
-def test_disabled_hdr_does_not_read_or_convert_missing_image(
+def test_disabled_flash_does_not_read_or_convert_missing_image(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def unexpected_rng():
@@ -134,20 +138,20 @@ def test_probability_miss_preserves_original_path(tmp_path: Path, monkeypatch: p
     assert random_milk_image_content(path, probability=0.2) == {"image": {"source": str(path)}}
 
 
-@pytest.mark.parametrize("failure", ["bad-image", "missing", "encoder"])
-def test_hdr_conversion_failure_falls_back_to_original(
+@pytest.mark.parametrize("failure", ["bad-image", "missing", "gif"])
+def test_flash_conversion_failure_falls_back_to_original(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     path = tmp_path / "milk.png"
     if failure == "bad-image":
         path.write_bytes(b"not an image")
-    elif failure == "encoder":
+    elif failure == "gif":
         path.write_bytes(image_bytes(Image.new("RGB", (32, 32), "gold")))
 
-        def broken_encoder(*args, **kwargs):
-            raise RuntimeError("codec failure")
+        def broken_gif(*args, **kwargs):
+            raise RuntimeError("GIF encoder failure")
 
-        monkeypatch.setattr("nailong_classifier.hdr.imagecodecs.ultrahdr_encode", broken_encoder)
+        monkeypatch.setattr("nailong_classifier.hdr.make_flash_gif", broken_gif)
 
     assert random_milk_image_content(path, probability=1) == {"image": {"source": str(path)}}
 
@@ -158,3 +162,14 @@ def test_sdr_only_encoder_output_is_not_sent_as_hdr(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr("nailong_classifier.hdr.imagecodecs.ultrahdr_encode", lambda *a, **k: sdr)
     with pytest.raises(RuntimeError, match="no valid Ultra HDR"):
         make_hdr_image(source)
+
+
+def test_flash_gif_has_a_brighter_middle_frame() -> None:
+    source = image_bytes(Image.new("RGB", (32, 32), (120, 120, 0)))
+
+    with Image.open(io.BytesIO(make_flash_gif(source))) as gif:
+        first = gif.convert("RGB").getpixel((16, 16))[0]
+        gif.seek(1)
+        flash = gif.convert("RGB").getpixel((16, 16))[0]
+
+    assert flash > first

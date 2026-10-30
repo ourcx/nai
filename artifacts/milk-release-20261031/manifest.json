@@ -1,0 +1,48 @@
+{
+  "format": "milk-priority-v1",
+  "release": "milk-priority-20261031-target60-fallback",
+  "threshold": 0.5,
+  "guard_threshold": 0.3,
+  "selection": {
+    "models": [
+      "foundation",
+      "joint-C0.01"
+    ],
+    "weights": [
+      0.75,
+      0.25
+    ],
+    "preserve_policy": {
+      "online_confidence": 0.5,
+      "mixed_naiwa_minimum": 0.05
+    },
+    "unknown_naiwa_fallback": true
+  },
+  "weights": {
+    "online": {
+      "file": "online.pt",
+      "sha256": "3911bb01a064fba7cba6a036f13b39abd2726d83586e691d257ab19313df1230"
+    },
+    "old_guard": {
+      "file": "old_guard.pt",
+      "sha256": "2df528a1170f3715d0ced930acc7195d7fde5e7dd34a4016bf91332f5f293038"
+    },
+    "backbone": {
+      "file": "backbone.safetensors",
+      "sha256": "04d27f3400d059fc0cfd7d17dd1909a75bf3ea8fb3eeb48b97cb99e57ee20081"
+    },
+    "finetune": {
+      "file": "finetune.pt",
+      "sha256": "9044815a6e8d5d7513e7b6b7dce1d493a7282f211913a6d6ea66746f33fa0ecc"
+    },
+    "joint": {
+      "file": "joint.npz",
+      "sha256": "45ce917b14c357757d51e2088692ad3a4ad4a59c0bfadff03639d9c85b117871"
+    },
+    "new_guard": {
+      "file": "new_guard.npz",
+      "sha256": "4749b14f57439314b582cd80d795b708d164b8201a5b26ca7bb21bac29a1d4e3"
+    }
+  },
+  "source_selection_sha256": "8da7b2186b635cf23af7b4908c30cb628576dc84d7f9e010c602dd04ba26ea04"
+}

@@ -10,4 +10,11 @@ __pycache__/
 artifacts/
 data/train/
 data/test/
+data/cnn-*/
 runtime/
+.env.*
+*cookies*.json
+*.sqlite3*
+.marscode.internal/
+.screenshots/
+outputs/

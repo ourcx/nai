@@ -52,3 +52,34 @@ def test_contact_resolver_empty_open_id_returns_fallback() -> None:
 
     assert asyncio.run(resolver.resolve("", fallback="神秘奶友")) == "神秘奶友"
     assert client.calls == 0
+
+
+def test_denied_contact_can_be_recovered_from_message_name_without_another_request() -> None:
+    client = FakeClient({"code": 41050, "msg": "no user authority"})
+    resolver = ContactResolver(client)
+
+    async def exercise():
+        assert await resolver.resolve("user", fallback="") == ""
+        assert await resolver.resolve("user", fallback="新朋友") == "新朋友"
+        assert client.calls == 1
+        resolver.remember("user", " 李雷 ")
+        assert await resolver.resolve("user") == "李雷"
+        resolver.remember("user", "  ")
+        assert await resolver.resolve("user") == "李雷"
+        assert client.calls == 1
+
+    asyncio.run(exercise())
+
+
+def test_failed_contact_lookup_can_retry_after_negative_cache_expires() -> None:
+    client = FakeClient({"code": 41050, "msg": "no user authority"})
+    resolver = ContactResolver(client)
+
+    async def exercise():
+        assert await resolver.resolve("user", fallback="") == ""
+        client.payload = {"code": 0, "data": {"user": {"name": "李雷"}}}
+        resolver._failed_until["user"] = -1
+        assert await resolver.resolve("user") == "李雷"
+        assert client.calls == 2
+
+    asyncio.run(exercise())

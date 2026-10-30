@@ -6,10 +6,14 @@ REMOTE_DIR="${2:-/opt/nailong-bot}"
 SERVICE_NAME="nailong-bot"
 WEB_SERVICE_NAME="nailong-web"
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [[ ! -f artifacts/model.pt ]]; then
+if [[ ! -f "$PROJECT_DIR/artifacts/model.pt" ]]; then
   echo "artifacts/model.pt is missing; train the model before deployment." >&2
+  exit 1
+fi
+if [[ ! -f "$PROJECT_DIR/artifacts/milk-release-20261031/manifest.json" ]]; then
+  echo "Milk release manifest is missing; build the verified release before deployment." >&2
   exit 1
 fi
 
@@ -18,10 +22,24 @@ rsync -az --delete \
   --exclude='.git/' \
   --exclude='.venv/' \
   --exclude='.env' \
+  --exclude='.env.*' \
+  --exclude='*cookies*.json' \
+  --exclude='*.sqlite3*' \
+  --exclude='backups/' \
   --exclude='data/' \
   --exclude='__pycache__/' \
   --exclude='.pytest_cache/' \
-  ./ "$HOST:$REMOTE_DIR/"
+  --exclude='.ruff_cache/' \
+  --exclude='.marscode.internal/' \
+  --exclude='.screenshots/' \
+  --exclude='.DS_Store' \
+  --exclude='outputs/' \
+  --include='/artifacts/' \
+  --include='/artifacts/model.pt' \
+  --include='/artifacts/doubao-detector-20261026/***' \
+  --include='/artifacts/milk-release-20261031/***' \
+  --exclude='/artifacts/*' \
+  "$PROJECT_DIR/" "$HOST:$REMOTE_DIR/"
 
 ssh "$HOST" bash -s -- "$REMOTE_DIR" "$SERVICE_NAME" "$WEB_SERVICE_NAME" <<'REMOTE'
 set -euo pipefail
@@ -38,6 +56,8 @@ python3 -m venv "$REMOTE_DIR/.venv"
 "$REMOTE_DIR/.venv/bin/python" -m pip install --upgrade pip
 "$REMOTE_DIR/.venv/bin/python" -m pip install \
   lark-channel-sdk \
+  "httpx>=0.27,<1" \
+  "websockets>=15,<16" \
   Pillow \
   "starlette>=0.48,<1" \
   "uvicorn>=0.35,<1" \
@@ -49,7 +69,10 @@ python3 -m venv "$REMOTE_DIR/.venv"
   jinja2 \
   fsspec \
   "numpy>=2.0" \
-  "imagecodecs>=2025.3.30"
+  "imagecodecs>=2025.3.30" \
+  "timm==1.0.22" \
+  "safetensors==0.6.2" \
+  "huggingface-hub==0.36.0"
 "$REMOTE_DIR/.venv/bin/python" -m pip install \
   --no-deps \
   --index-url https://download.pytorch.org/whl/cpu \

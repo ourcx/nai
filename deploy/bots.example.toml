@@ -1,0 +1,27 @@
+# 可按需保留/增加 [[bots]]。凭证引用环境变量，不写进本文件。
+[[bots]]
+id = "feishu-main"
+platform = "feishu"
+app_id_env = "LARK_APP_ID"
+app_secret_env = "LARK_APP_SECRET"
+# 仅现有线上机器人启用，继续使用旧群统计、欢迎记录和纠正引用。
+legacy = true
+# 要同步图鉴时，在所属飞书实例上同时填写以下两个字段。
+# catalog_document_id = "your-document-id"
+# catalog_section_block_id = "your-section-block-id"
+
+[[bots]]
+id = "feishu-second"
+platform = "feishu"
+app_id_env = "LARK_SECOND_APP_ID"
+app_secret_env = "LARK_SECOND_APP_SECRET"
+
+[[bots]]
+id = "qq-main"
+platform = "qq"
+# QQ 官方机器人“我是奶龙”，后台事件接收方式使用 WebSocket。
+app_id = "102498836"
+app_secret_env = "QQ_APP_SECRET"
+# 默认只回复最近收到的消息。群主动消息需群主在 QQ 授权后再启用。
+allow_proactive = false
+sandbox = false
