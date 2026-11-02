@@ -10,8 +10,13 @@ from unittest.mock import patch
 from PIL import Image
 from starlette.testclient import TestClient
 
-from nailong_classifier.storage import BotStore
-from nailong_classifier.web import GalleryRepository, ThumbnailCache, _image_media_type, create_app
+from nailong_classifier.persistence.storage import BotStore
+from nailong_classifier.web.app import (
+    GalleryRepository,
+    ThumbnailCache,
+    _image_media_type,
+    create_app,
+)
 
 
 def make_image_bytes(color: str, *, size: tuple[int, int] = (900, 600)) -> bytes:
@@ -135,7 +140,7 @@ def test_thumbnail_cache_serializes_different_image_decodes(tmp_path: Path) -> N
         return TrackedImage(original_open(*args, **kwargs))
 
     with (
-        patch("nailong_classifier.web.Image.open", side_effect=tracked_open),
+        patch("nailong_classifier.web.app.Image.open", side_effect=tracked_open),
         ThreadPoolExecutor(max_workers=2) as executor,
     ):
         results = list(
@@ -206,6 +211,11 @@ def test_gallery_page_is_lazy_and_input_is_validated(tmp_path: Path) -> None:
     assert "loading=\"lazy\"" not in page.text  # 图片卡由 API 返回后再创建。
     assert "http://" not in page.text
     assert "https://" not in page.text
+    for name, content_type in (("app.js", "javascript"), ("app.css", "text/css")):
+        response = client.get(f"/static/{name}")
+        assert response.status_code == 200
+        assert content_type in response.headers["content-type"]
+        assert response.content
     assert client.get("/api/assets?label=unknown").status_code == 400
     assert client.get("/api/assets?label=other").status_code == 400
     assert client.get("/api/assets?page=bad").status_code == 400

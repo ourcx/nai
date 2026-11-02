@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from .data import SUPPORTED_SUFFIXES
+from ..classification.data import SUPPORTED_SUFFIXES
 from .storage import BotStore
 
 SEED_LABELS = ("nailong", "naiwa")

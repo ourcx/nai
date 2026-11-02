@@ -14,13 +14,13 @@ from PIL import Image
 from websockets.asyncio.client import connect as ws_connect
 from websockets.asyncio.server import serve
 
-import nailong_classifier.bot as bot
+import nailong_classifier.application.bot as bot
 from nailong_classifier.adapters.base import ErrorCode, IdentityScope
 from nailong_classifier.adapters.config import AdapterConfig, create_adapter, load_adapter_configs
 from nailong_classifier.adapters.qq import QQAdapter
-from nailong_classifier.model import Prediction
-from nailong_classifier.services import BackendServices, SerializedPredictor
-from nailong_classifier.storage import BotStore
+from nailong_classifier.application.services import BackendServices, SerializedPredictor
+from nailong_classifier.classification.model import Prediction
+from nailong_classifier.persistence.storage import BotStore
 
 
 def image_bytes(format="PNG", *, color="yellow") -> bytes:

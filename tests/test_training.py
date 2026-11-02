@@ -10,14 +10,14 @@ from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from nailong_classifier.data import (
+from nailong_classifier.classification.data import (
     ROBUST_AUGMENTATION,
     RandomChatDegradation,
     build_train_val_loaders,
     evaluation_transform,
     training_transform,
 )
-from nailong_classifier.model import (
+from nailong_classifier.classification.model import (
     ARCHITECTURE,
     REGULARIZED_ARCHITECTURE,
     build_model,
@@ -25,7 +25,7 @@ from nailong_classifier.model import (
     load_checkpoint,
     save_checkpoint,
 )
-from nailong_classifier.train import (
+from nailong_classifier.training.train import (
     build_optimizer,
     parse_args,
     run_epoch,
@@ -125,7 +125,7 @@ def test_robust_augmentation_preserves_files_and_evaluation_is_deterministic(
     _image_tree(tmp_path)
     source = tmp_path / "train" / "nailong" / "sample.png"
     original = source.read_bytes()
-    monkeypatch.setattr("nailong_classifier.data.random.random", lambda: 0.0)
+    monkeypatch.setattr("nailong_classifier.classification.data.random.random", lambda: 0.0)
     with Image.open(source) as image:
         degraded = RandomChatDegradation()(image.convert("RGB"))
         assert degraded.size == image.size
@@ -168,14 +168,14 @@ def test_training_smoke_migrates_backbone_and_serializes_configuration(
     ])
     # 留出测试集只在候选固定后使用，烟测也验证这一门禁。
     real_evaluate = __import__(
-        "nailong_classifier.train", fromlist=["evaluate_loader"]
+        "nailong_classifier.training.train", fromlist=["evaluate_loader"]
     ).evaluate_loader
 
     def validation_only(model, loader, **kwargs):
         assert Path(loader.dataset.root) == tmp_path / "val"
         return real_evaluate(model, loader, **kwargs)
 
-    monkeypatch.setattr("nailong_classifier.train.evaluate_loader", validation_only)
+    monkeypatch.setattr("nailong_classifier.training.train.evaluate_loader", validation_only)
     checkpoint = train(args)
     loaded, _, _, _, metadata = load_checkpoint(checkpoint, torch.device("cpu"))
     assert loaded.architecture == architecture

@@ -11,8 +11,8 @@ from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
 from lark_channel.channel.types import MediaSource, ReplyRef
 from lark_channel.core import LogLevel
 
-from ..catalog_document import CatalogDocumentClient
-from ..contact import ContactResolver
+from ..integrations.catalog_document import CatalogDocumentClient
+from ..integrations.contact import ContactResolver
 from .base import (
     CardAction,
     Handler,

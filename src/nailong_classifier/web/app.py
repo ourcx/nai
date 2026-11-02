@@ -239,7 +239,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 def _static_dir() -> Path:
-    return Path(__file__).with_name("web_assets")
+    return Path(__file__).with_name("assets")
 
 
 def _json_etag(payload: object) -> str:

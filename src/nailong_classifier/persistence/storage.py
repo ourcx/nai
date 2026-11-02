@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 
 from PIL import Image
 
-from .image_fingerprint import try_content_hash
-from .rarity import Rarity, classify_rarity
+from ..domain.rarity import Rarity, classify_rarity
+from ..imaging.image_fingerprint import try_content_hash
 
 LABELS = {"nailong", "naiwa", "other"}
 LEGACY_NAME_FALLBACKS = {"神秘奶友", "新朋友"}

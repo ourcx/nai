@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 import nailong_classifier.adapters.feishu as feishu
-import nailong_classifier.bot as bot
+import nailong_classifier.application.bot as bot
 from nailong_classifier.adapters.base import IdentityScope, SendError
 from nailong_classifier.adapters.feishu_process import ProcessFeishuAdapter
-from nailong_classifier.services import BackendServices, SerializedPredictor
-from nailong_classifier.storage import BotStore
+from nailong_classifier.application.services import BackendServices, SerializedPredictor
+from nailong_classifier.persistence.storage import BotStore
 
 EVENT_TYPE = "im.chat.member.user.added_v1"
 

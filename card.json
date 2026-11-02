@@ -1,0 +1,469 @@
+{
+  "schema": "2.0",
+  "config": {
+    "compact_width": false,
+    "enable_forward": true,
+    "summary": {
+      "content": "示例预览：识别结果奶龙，置信度 61.0%，奶含量 91%"
+    },
+    "style": {
+      "color": {
+        "wb_handdrawn_vibes_canvas": {
+          "light_mode": "rgba(255,250,238,1)",
+          "dark_mode": "rgba(255,250,238,1)"
+        },
+        "wb_handdrawn_vibes_body": {
+          "light_mode": "rgba(255,250,238,1)",
+          "dark_mode": "rgba(255,250,238,1)"
+        },
+        "wb_handdrawn_vibes_panel": {
+          "light_mode": "rgba(255,255,246,1)",
+          "dark_mode": "rgba(255,255,246,1)"
+        },
+        "wb_handdrawn_vibes_ink": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_muted": {
+          "light_mode": "rgba(95,94,90,1)",
+          "dark_mode": "rgba(95,94,90,1)"
+        },
+        "wb_handdrawn_vibes_secondary": {
+          "light_mode": "rgba(221,214,200,1)",
+          "dark_mode": "rgba(221,214,200,1)"
+        },
+        "wb_handdrawn_vibes_accent": {
+          "light_mode": "rgba(173,222,255,1)",
+          "dark_mode": "rgba(173,222,255,1)"
+        },
+        "wb_handdrawn_vibes_accent_2": {
+          "light_mode": "rgba(254,197,84,1)",
+          "dark_mode": "rgba(254,197,84,1)"
+        },
+        "wb_handdrawn_vibes_button": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_button_text": {
+          "light_mode": "rgba(255,250,238,1)",
+          "dark_mode": "rgba(255,250,238,1)"
+        },
+        "wb_handdrawn_vibes_button_secondary": {
+          "light_mode": "rgba(255,255,246,1)",
+          "dark_mode": "rgba(255,255,246,1)"
+        },
+        "wb_handdrawn_vibes_button_secondary_text": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_icon_surface": {
+          "light_mode": "rgba(255,250,238,1)",
+          "dark_mode": "rgba(255,250,238,1)"
+        },
+        "wb_handdrawn_vibes_icon_border": {
+          "light_mode": "rgba(31,35,41,0.10)",
+          "dark_mode": "rgba(31,35,41,0.10)"
+        },
+        "wb_handdrawn_vibes_on_canvas": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_on_body": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_on_panel": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_on_accent": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        },
+        "wb_handdrawn_vibes_on_accent_2": {
+          "light_mode": "rgba(15,15,14,1)",
+          "dark_mode": "rgba(15,15,14,1)"
+        }
+      }
+    }
+  },
+  "body": {
+    "padding": "0px 0px 0px 0px",
+    "elements": [
+      {
+        "tag": "interactive_container",
+        "behaviors": [],
+        "background_style": "wb_handdrawn_vibes_canvas",
+        "padding": "18px 18px 18px 18px",
+        "corner_radius": "0px",
+        "has_border": false,
+        "direction": "vertical",
+        "vertical_spacing": "10px",
+        "disabled": false,
+        "elements": [
+          {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+              {
+                "tag": "column",
+                "width": "auto",
+                "elements": [
+                  {
+                    "tag": "interactive_container",
+                    "behaviors": [],
+                    "width": "auto",
+                    "height": "auto",
+                    "corner_radius": "999px",
+                    "has_border": true,
+                    "border_color": "wb_handdrawn_vibes_icon_border",
+                    "background_style": "wb_handdrawn_vibes_panel",
+                    "padding": "3px 8px 3px 8px",
+                    "horizontal_align": "center",
+                    "disabled": false,
+                    "elements": [
+                      {
+                        "tag": "markdown",
+                        "content": "<font color='wb_handdrawn_vibes_muted'>示例预览</font>",
+                        "text_align": "center",
+                        "text_size": "notation"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "tag": "markdown",
+            "content": "**<font color='wb_handdrawn_vibes_on_canvas'>识别结果：奶龙</font>**",
+            "text_align": "left",
+            "text_size": "heading",
+            "margin": "4px 0px 0px 0px"
+          },
+          {
+            "tag": "markdown",
+            "content": "<font color='wb_handdrawn_vibes_muted'>置信度 61.0% · 奶含量 91%</font>",
+            "text_align": "left",
+            "text_size": "notation",
+            "margin": "2px 0px 8px 0px"
+          },
+          {
+            "tag": "column_set",
+            "flex_mode": "bisect",
+            "horizontal_spacing": "8px",
+            "columns": [
+              {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": "wb_handdrawn_vibes_accent",
+                "padding": "14px 12px 14px 12px",
+                "horizontal_align": "left",
+                "vertical_spacing": "0px",
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "content": "<font color='wb_handdrawn_vibes_on_accent'>模型置信度</font>",
+                    "text_align": "left",
+                    "text_size": "notation"
+                  },
+                  {
+                    "tag": "markdown",
+                    "content": "**<font color='wb_handdrawn_vibes_on_accent'>61.0%</font>**",
+                    "text_align": "left",
+                    "text_size": "heading-2",
+                    "margin": "4px 0px 0px 0px"
+                  }
+                ]
+              },
+              {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": "wb_handdrawn_vibes_accent_2",
+                "padding": "14px 12px 14px 12px",
+                "horizontal_align": "left",
+                "vertical_spacing": "0px",
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "content": "<font color='wb_handdrawn_vibes_on_accent_2'>奶含量</font>",
+                    "text_align": "left",
+                    "text_size": "notation"
+                  },
+                  {
+                    "tag": "markdown",
+                    "content": "**<font color='wb_handdrawn_vibes_on_accent_2'>91%</font>**",
+                    "text_align": "left",
+                    "text_size": "heading-2",
+                    "margin": "4px 0px 0px 0px"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "tag": "interactive_container",
+            "behaviors": [],
+            "background_style": "wb_handdrawn_vibes_panel",
+            "has_border": true,
+            "border_color": "wb_handdrawn_vibes_icon_border",
+            "corner_radius": "14px",
+            "padding": "12px 14px 12px 14px",
+            "vertical_spacing": "0px",
+            "disabled": false,
+            "elements": [
+              {
+                "tag": "markdown",
+                "content": "**<font color='wb_handdrawn_vibes_on_panel'>这是一张奶龙图</font>**",
+                "text_align": "left",
+                "text_size": "normal"
+              }
+            ]
+          },
+          {
+            "tag": "chart",
+            "height": "48px",
+            "color_theme": "primary",
+            "preview": false,
+            "chart_spec": {
+              "type": "bar",
+              "background": "rgba(255,250,238,1)",
+              "direction": "horizontal",
+              "data": {
+                "values": [
+                  {
+                    "metric": "奶含量",
+                    "segment": "奶含量",
+                    "value": 91.0
+                  },
+                  {
+                    "metric": "奶含量",
+                    "segment": "剩余",
+                    "value": 9.0
+                  }
+                ]
+              },
+              "xField": "value",
+              "yField": "metric",
+              "seriesField": "segment",
+              "stack": true,
+              "color": [
+                "#FEC554",
+                "rgba(143,149,158,0.18)"
+              ],
+              "bar": {
+                "style": {
+                  "cornerRadius": 12
+                }
+              },
+              "label": {
+                "visible": false
+              },
+              "axes": [
+                {
+                  "orient": "bottom",
+                  "visible": false,
+                  "min": 0,
+                  "max": 100
+                },
+                {
+                  "orient": "left",
+                  "visible": false
+                }
+              ],
+              "legends": {
+                "visible": false
+              },
+              "tooltip": {
+                "visible": false
+              },
+              "padding": {
+                "top": 2,
+                "right": 0,
+                "bottom": 2,
+                "left": 0
+              }
+            }
+          },
+          {
+            "tag": "interactive_container",
+            "behaviors": [],
+            "background_style": "wb_handdrawn_vibes_panel",
+            "has_border": true,
+            "border_color": "wb_handdrawn_vibes_icon_border",
+            "corner_radius": "14px",
+            "padding": "12px 14px 12px 14px",
+            "vertical_spacing": "0px",
+            "disabled": false,
+            "elements": [
+              {
+                "tag": "markdown",
+                "content": "**<font color='wb_handdrawn_vibes_on_panel'>稀有度：⭐⭐⭐⭐⭐ 传说</font>**",
+                "text_align": "left",
+                "text_size": "normal"
+              },
+              {
+                "tag": "markdown",
+                "content": "<font color='wb_handdrawn_vibes_muted'>深藏不露 · 群里出现过 1 次</font>",
+                "text_align": "left",
+                "text_size": "notation",
+                "margin": "4px 0px 0px 0px"
+              }
+            ]
+          },
+          {
+            "tag": "markdown",
+            "content": "<font color='wb_handdrawn_vibes_muted'>识别不对？点一下直接纠正</font>",
+            "text_align": "left",
+            "text_size": "notation"
+          },
+          {
+            "tag": "column_set",
+            "flex_mode": "trisect",
+            "horizontal_spacing": "8px",
+            "margin": "6px 0px 0px 0px",
+            "columns": [
+              {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                  {
+                    "tag": "interactive_container",
+                    "behaviors": [
+                      {
+                        "type": "callback",
+                        "value": {
+                          "action": "correct_label",
+                          "observation_id": 1,
+                          "label": "nailong"
+                        }
+                      }
+                    ],
+                    "background_style": "wb_handdrawn_vibes_accent_2",
+                    "has_border": true,
+                    "border_color": "wb_handdrawn_vibes_icon_border",
+                    "corner_radius": "14px",
+                    "padding": "10px 8px 10px 8px",
+                    "horizontal_align": "center",
+                    "disabled": false,
+                    "confirm": {
+                      "title": {
+                        "tag": "plain_text",
+                        "content": "确认是奶龙？"
+                      },
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "确认后会更新图鉴与后续统计。"
+                      }
+                    },
+                    "elements": [
+                      {
+                        "tag": "markdown",
+                        "content": "**<font color='wb_handdrawn_vibes_on_accent_2'>奶龙</font>**",
+                        "text_align": "center",
+                        "text_size": "normal"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                  {
+                    "tag": "interactive_container",
+                    "behaviors": [
+                      {
+                        "type": "callback",
+                        "value": {
+                          "action": "correct_label",
+                          "observation_id": 1,
+                          "label": "naiwa"
+                        }
+                      }
+                    ],
+                    "background_style": "wb_handdrawn_vibes_accent",
+                    "has_border": true,
+                    "border_color": "wb_handdrawn_vibes_icon_border",
+                    "corner_radius": "14px",
+                    "padding": "10px 8px 10px 8px",
+                    "horizontal_align": "center",
+                    "disabled": false,
+                    "confirm": {
+                      "title": {
+                        "tag": "plain_text",
+                        "content": "确认是奶蛙？"
+                      },
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "确认后会更新图鉴与后续统计。"
+                      }
+                    },
+                    "elements": [
+                      {
+                        "tag": "markdown",
+                        "content": "**<font color='wb_handdrawn_vibes_on_accent'>奶蛙</font>**",
+                        "text_align": "center",
+                        "text_size": "normal"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                  {
+                    "tag": "interactive_container",
+                    "behaviors": [
+                      {
+                        "type": "callback",
+                        "value": {
+                          "action": "correct_label",
+                          "observation_id": 1,
+                          "label": "other"
+                        }
+                      }
+                    ],
+                    "background_style": "wb_handdrawn_vibes_button",
+                    "has_border": true,
+                    "border_color": "wb_handdrawn_vibes_icon_border",
+                    "corner_radius": "14px",
+                    "padding": "10px 8px 10px 8px",
+                    "horizontal_align": "center",
+                    "disabled": false,
+                    "confirm": {
+                      "title": {
+                        "tag": "plain_text",
+                        "content": "确认是其他？"
+                      },
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "确认后会更新图鉴与后续统计。"
+                      }
+                    },
+                    "elements": [
+                      {
+                        "tag": "markdown",
+                        "content": "**<font color='wb_handdrawn_vibes_button_text'>其他</font>**",
+                        "text_align": "center",
+                        "text_size": "normal"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

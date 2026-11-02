@@ -9,9 +9,13 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from PIL import Image
 
-from nailong_classifier.doubao import DoubaoPrediction
-from nailong_classifier.milk_runtime import MilkPriorityPredictor, SharedMilkGuard, verified_weight
-from nailong_classifier.model import Prediction
+from nailong_classifier.classification.doubao import DoubaoPrediction
+from nailong_classifier.classification.milk_runtime import (
+    MilkPriorityPredictor,
+    SharedMilkGuard,
+    verified_weight,
+)
+from nailong_classifier.classification.model import Prediction
 
 
 def test_release_rejects_modified_weights_and_paths_outside_bundle(tmp_path):

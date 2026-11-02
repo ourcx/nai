@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from nailong_classifier.douyin import (
+from nailong_classifier.integrations.douyin import (
     DouyinSearchError,
     DouyinVideo,
     choose_douyin_video,
@@ -130,7 +130,7 @@ def test_search_douyin_videos_filters_by_keyword_and_deduplicates(
         }
         return FakeResponse(json.dumps(payload).encode())
 
-    monkeypatch.setattr("nailong_classifier.douyin.urlopen", fake_urlopen)
+    monkeypatch.setattr("nailong_classifier.integrations.douyin.urlopen", fake_urlopen)
 
     videos = search_douyin_videos(cookie_file, keywords=("奶龙", "奶娃"), count=3)
 
@@ -173,7 +173,7 @@ def test_search_douyin_videos_requires_a_structured_milk_tag(
         ],
     }
     monkeypatch.setattr(
-        "nailong_classifier.douyin.urlopen",
+        "nailong_classifier.integrations.douyin.urlopen",
         lambda request, timeout: FakeResponse(json.dumps(payload).encode()),
     )
 
@@ -200,7 +200,9 @@ def test_choose_douyin_video_selects_from_available_topics_equally(
             author_name="奶友乙",
         ),
     ]
-    monkeypatch.setattr("nailong_classifier.douyin.secrets.choice", lambda values: values[0])
+    monkeypatch.setattr(
+        "nailong_classifier.integrations.douyin.secrets.choice", lambda values: values[0]
+    )
 
     assert choose_douyin_video(videos, keywords=("奶龙", "奶娃")).url == (
         "https://www.douyin.com/video/1"
@@ -219,7 +221,7 @@ def test_download_douyin_cover_rejects_oversized_responses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "nailong_classifier.douyin.urlopen",
+        "nailong_classifier.integrations.douyin.urlopen",
         lambda request, timeout: FakeResponse(b"image", {"Content-Length": "6"}),
     )
 

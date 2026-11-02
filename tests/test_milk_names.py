@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import nailong_classifier.bot as bot
+import nailong_classifier.application.bot as bot
 from nailong_classifier.adapters.base import (
     IdentityScope,
     Member,
@@ -18,8 +18,8 @@ from nailong_classifier.adapters.base import (
     SendError,
     SendResult,
 )
-from nailong_classifier.services import BackendServices, SerializedPredictor
-from nailong_classifier.storage import BotStore
+from nailong_classifier.application.services import BackendServices, SerializedPredictor
+from nailong_classifier.persistence.storage import BotStore
 
 
 def test_milk_name_survives_restart_and_nickname_changes_without_storing_raw_identity(tmp_path):
@@ -540,7 +540,9 @@ def test_occupied_and_previous_names_are_skipped_before_random_fallback(tmp_path
     assert renewed.milk_name == "最奶的 王小奶"
     tokens = iter(("taken", "new"))
     store.assign_milk_name("third", original_name="赵小李", milk_name="王小奶·taken")
-    monkeypatch.setattr("nailong_classifier.storage.secrets.token_hex", lambda _: next(tokens))
+    monkeypatch.setattr(
+        "nailong_classifier.persistence.storage.secrets.token_hex", lambda _: next(tokens)
+    )
     renewed = store.assign_milk_name(
         "user", original_name="王小明", milk_name="王小奶",
         name_options=lambda original: ("最奶的 王小奶", "尼古拉斯·奶"),

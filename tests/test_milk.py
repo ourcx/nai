@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 from torchvision.transforms.functional import pil_to_tensor
 
-from nailong_classifier.bot import (
+from nailong_classifier.application.bot import (
     OTHER_MILKY_REACTIONS,
     build_prediction_card,
     format_concentration,
@@ -18,8 +18,8 @@ from nailong_classifier.bot import (
     is_milky_other,
     milk_concentration,
 )
-from nailong_classifier.milk import combined_milk_concentration, yellow_pixel_ratio
-from nailong_classifier.model import NailongPredictor, Prediction
+from nailong_classifier.classification.milk import combined_milk_concentration, yellow_pixel_ratio
+from nailong_classifier.classification.model import NailongPredictor, Prediction
 
 
 @pytest.mark.parametrize(
@@ -138,7 +138,9 @@ def test_yellow_other_triggers_suspicion_in_text_and_card_without_changing_class
     assert prediction.scores == plain.scores
     assert prediction.confidence == plain.confidence == pytest.approx(0.9)
 
-    monkeypatch.setattr("nailong_classifier.bot.secrets.choice", lambda choices: choices[0])
+    monkeypatch.setattr(
+        "nailong_classifier.application.bot.secrets.choice", lambda choices: choices[0]
+    )
     assert format_prediction(prediction).startswith(OTHER_MILKY_REACTIONS[0])
     concentration = format_concentration(prediction)
     assert "本图奶含量 46%" in concentration

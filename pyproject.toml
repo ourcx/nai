@@ -32,14 +32,14 @@ dev = [
 ]
 
 [project.scripts]
-nailong-train = "nailong_classifier.train:main"
-nailong-doubao-train = "nailong_classifier.train_doubao:main"
-nailong-evaluate = "nailong_classifier.evaluate:main"
-nailong-predict = "nailong_classifier.predict:main"
-nailong-hdr = "nailong_classifier.hdr:main"
-nailong-bot = "nailong_classifier.bot:main"
-nailong-seed = "nailong_classifier.seed:main"
-nailong-web = "nailong_classifier.web:main"
+nailong-train = "nailong_classifier.training.train:main"
+nailong-doubao-train = "nailong_classifier.training.train_doubao:main"
+nailong-evaluate = "nailong_classifier.training.evaluate:main"
+nailong-predict = "nailong_classifier.classification.predict:main"
+nailong-hdr = "nailong_classifier.imaging.hdr:main"
+nailong-bot = "nailong_classifier.application.bot:main"
+nailong-seed = "nailong_classifier.persistence.seed:main"
+nailong-web = "nailong_classifier.web.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nailong_classifier"]

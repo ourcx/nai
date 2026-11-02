@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from nailong_classifier.bot import (
+from nailong_classifier.application.bot import (
     CARD_THEME_COLORS,
     build_catalog_post,
     build_correction_confirmation_card,
@@ -39,8 +39,8 @@ from nailong_classifier.bot import (
     parse_douyin_topic_request,
     should_reply_media_error,
 )
-from nailong_classifier.model import Prediction
-from nailong_classifier.storage import LOCAL_TIMEZONE, BotStore, DailyStats
+from nailong_classifier.classification.model import Prediction
+from nailong_classifier.persistence.storage import LOCAL_TIMEZONE, BotStore, DailyStats
 
 
 def make_image_bytes(color: str, *, image_format: str = "PNG") -> bytes:

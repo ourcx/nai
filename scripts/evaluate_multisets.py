@@ -13,8 +13,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from nailong_classifier.data import evaluation_image_loader, evaluation_transform
-from nailong_classifier.model import load_checkpoint, select_device
+from nailong_classifier.classification.data import evaluation_image_loader, evaluation_transform
+from nailong_classifier.classification.model import load_checkpoint, select_device
 from scripts.evaluate_generalization import FixedChatDegradation
 
 

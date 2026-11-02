@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from nailong_classifier.bot import (
+from nailong_classifier.application.bot import (
     OTHER_MILKY_REACTIONS,
     OTHER_REACTIONS,
     build_prediction_card,
@@ -28,9 +28,9 @@ from nailong_classifier.bot import (
     milk_concentration,
     parse_guess_answer,
 )
-from nailong_classifier.model import Prediction
-from nailong_classifier.rarity import classify_rarity
-from nailong_classifier.storage import BotStore
+from nailong_classifier.classification.model import Prediction
+from nailong_classifier.domain.rarity import classify_rarity
+from nailong_classifier.persistence.storage import BotStore
 
 
 def make_image_bytes(color: str, *, image_format: str = "PNG") -> bytes:
@@ -135,7 +135,9 @@ def test_other_replies_suspect_missed_milk_without_losing_uncertainty(
     observation = record(
         store, make_gradient_bytes(), message_id="suspected-other", label="other"
     )
-    monkeypatch.setattr("nailong_classifier.bot.secrets.choice", lambda choices: choices[0])
+    monkeypatch.setattr(
+        "nailong_classifier.application.bot.secrets.choice", lambda choices: choices[0]
+    )
 
     text = format_prediction(prediction)
     card = build_prediction_card(observation, prediction, None)
@@ -175,7 +177,7 @@ def test_corrected_other_does_not_get_suspected_milk_title(
     def unexpected_reaction(choices):
         raise AssertionError("人工确认的图片不应使用随机怀疑文案")
 
-    monkeypatch.setattr("nailong_classifier.bot.secrets.choice", unexpected_reaction)
+    monkeypatch.setattr("nailong_classifier.application.bot.secrets.choice", unexpected_reaction)
 
     reply = format_mention_reply(observation, prediction, None)
     assert reply.startswith("这张图已经确认是其他")
@@ -366,7 +368,7 @@ def test_guess_message_formatters() -> None:
 
 
 def test_format_guess_reveal_and_ranking(tmp_path: Path) -> None:
-    from nailong_classifier.storage import GuessRanking
+    from nailong_classifier.persistence.storage import GuessRanking
 
     store = BotStore(tmp_path)
     record(store, make_image_bytes("yellow"), message_id="g-1", label="nailong")
@@ -393,7 +395,7 @@ def test_format_rarity_line() -> None:
 
 
 def store_guess_result(answer: str, *, first_correct: bool):
-    from nailong_classifier.storage import GuessResult
+    from nailong_classifier.persistence.storage import GuessResult
 
     return GuessResult(
         round_id=1,
@@ -408,7 +410,7 @@ def store_guess_result(answer: str, *, first_correct: bool):
 def test_make_puzzle_image_crops_blurs_and_is_deterministic() -> None:
     import random
 
-    from nailong_classifier.puzzle import (
+    from nailong_classifier.imaging.puzzle import (
         PUZZLE_OUTPUT_SIZE,
         make_puzzle_image,
         try_make_puzzle_image,
@@ -429,7 +431,7 @@ def test_make_puzzle_image_crops_blurs_and_is_deterministic() -> None:
 def test_make_puzzle_image_rejects_bad_params() -> None:
     import pytest
 
-    from nailong_classifier.puzzle import make_puzzle_image
+    from nailong_classifier.imaging.puzzle import make_puzzle_image
 
     source = make_image_bytes("yellow")
     with pytest.raises(ValueError):
@@ -441,7 +443,7 @@ def test_make_puzzle_image_rejects_bad_params() -> None:
 def test_deactivate_chat_excludes_from_daily_report(tmp_path: Path) -> None:
     from datetime import datetime
 
-    from nailong_classifier.storage import LOCAL_TIMEZONE
+    from nailong_classifier.persistence.storage import LOCAL_TIMEZONE
 
     store = BotStore(tmp_path)
     record(store, make_image_bytes("yellow"), message_id="m-1", label="nailong", chat_id="grp")
@@ -511,7 +513,7 @@ def test_discoverer_recorded_on_first_capture_only(tmp_path: Path) -> None:
 
 
 def test_legacy_asset_without_discoverer_shows_no_line(tmp_path: Path) -> None:
-    from nailong_classifier.bot import build_catalog_post
+    from nailong_classifier.application.bot import build_catalog_post
 
     store = BotStore(tmp_path)
     # 不传 discoverer_name，模拟老图：图鉴条目不含「首发」。
@@ -569,8 +571,8 @@ def test_hunter_rankings_counts_catalog_discoveries(tmp_path: Path) -> None:
 
 
 def test_hunter_ranking_command_and_formatter() -> None:
-    from nailong_classifier.bot import format_hunter_ranking, is_hunter_ranking_command
-    from nailong_classifier.storage import HunterRanking
+    from nailong_classifier.application.bot import format_hunter_ranking, is_hunter_ranking_command
+    from nailong_classifier.persistence.storage import HunterRanking
 
     assert is_hunter_ranking_command("奶龙猎人榜") is True
     assert is_hunter_ranking_command("猎人榜") is True

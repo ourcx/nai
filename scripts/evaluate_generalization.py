@@ -12,8 +12,8 @@ import torch
 from PIL import Image, ImageFilter
 from torchvision import transforms
 
-from nailong_classifier.data import build_evaluation_loader, evaluation_transform
-from nailong_classifier.model import load_checkpoint, select_device
+from nailong_classifier.classification.data import build_evaluation_loader, evaluation_transform
+from nailong_classifier.classification.model import load_checkpoint, select_device
 
 
 class FixedChatDegradation:

@@ -4,6 +4,44 @@
 
 2026-10-31 的奶蛙优先版本通过 `MILK_MODEL_PATH` 加载可移植的 `manifest.json`，主分类和豆包过滤共享模型。文档奶蛙识别为 61/66，压缩图为 58/66，群聊奶蛙为 19/21；普通图误收有所增加。这些是已使用过的诊断回归集，不能作为独立的 95% 准确率证明。
 
+## 源码结构
+
+`src/nailong_classifier/` 按职责组织：
+
+```text
+src/nailong_classifier/
+├── application/       # 机器人业务编排、共享模型与后端服务
+│   ├── bot.py
+│   └── services.py
+├── adapters/          # 飞书、QQ 接入，统一消息协议与实例配置
+├── classification/    # 数据处理、模型定义、分类推理与命令行预测
+│   ├── data.py
+│   ├── model.py
+│   ├── doubao.py
+│   ├── milk.py
+│   ├── milk_runtime.py
+│   └── predict.py
+├── training/          # 主分类器、豆包检测器训练与评估
+│   ├── train.py
+│   ├── train_doubao.py
+│   ├── evaluate.py
+│   └── metrics.py
+├── domain/            # 稀有度规则、奶名词库
+├── imaging/           # 图像指纹去重、HDR 转换、猜图处理
+├── integrations/      # 飞书通讯录、图鉴文档、抖音搜索
+├── persistence/       # SQLite 状态与图库存储、初始数据导入
+│   ├── storage.py
+│   └── seed.py
+└── web/               # 图库 Web 应用与前端资源
+    ├── app.py
+    └── assets/
+```
+
+`application` 通过 `adapters` 接收统一事件，调用分类、图像处理、外部集成和存储模块。
+`training` 复用 `classification` 的数据处理与模型定义；`web` 提供图库查询和展示。
+各模块的 Python 导入路径随目录调整，例如 `nailong_classifier.application.bot`；
+`nailong-bot`、`nailong-web` 等命令名称保持不变。
+
 ## 数据目录
 
 ```text
@@ -34,7 +72,7 @@ data/
 
 ```bash
 uv sync --extra dev
-uv run pytest
+uv run python -m pytest
 uv run ruff check .
 ```
 
@@ -139,9 +177,9 @@ uv run nailong-predict data/test/nailong/image.png
 
 ## 机器人接入层
 
-接入结构为 `飞书 / QQ → adapters → 统一消息与事件 → 共用业务服务`。`bot.py`
+接入结构为 `飞书 / QQ → adapters → 统一消息与事件 → 共用业务服务`。`application/bot.py`
 负责识图、接龙、纠正、猜图、日报和新人起奶名；SDK、平台 ID 转换、引用消息读取、
-图片收发和通讯录查询放在 `src/nailong_classifier/adapters/`。所有接入实例共用
+图片收发放在 `adapters/`，通讯录与图鉴文档访问放在 `integrations/`。所有接入实例共用
 `BackendServices` 中的一份模型和 `BotStore`，当前通过进程内调用共用后端，尚未拆成
 独立 HTTP 服务。多个飞书 SDK 运行在各自的子进程中，避免其全局长连接事件循环互相干扰；
 模型推理与业务状态留在主进程。
@@ -175,7 +213,7 @@ QQ 奶家人玩法使用 `@机器人 接奶`（也支持 `奶家人`）：按发
 词库混合荒唐职位和猎奇场景，还能抽到“奶龙鸡腿失踪案嫌疑人”
 “奶蛙替补席永久居民”，或“住在奶龙第三个胃里的”这样的定语。
 每类词库候选都明确带“奶龙”或“奶蛙”。
-词库位于 `src/nailong_classifier/milk_name_words.py`，按 2026-10-30 的抖音
+词库位于 `src/nailong_classifier/domain/milk_name_words.py`，按 2026-10-30 的抖音
 [奶龙](https://www.douyin.com/search/奶龙)、
 [奶龙 小七](https://www.douyin.com/search/奶龙%20小七)、
 [奶蛙](https://www.douyin.com/search/奶蛙)、

@@ -4,9 +4,9 @@ import argparse
 import json
 from pathlib import Path
 
-from .data import build_evaluation_loader, validate_image_tree
+from ..classification.data import build_evaluation_loader, validate_image_tree
+from ..classification.model import load_checkpoint, select_device
 from .metrics import evaluate_loader
-from .model import load_checkpoint, select_device
 
 
 def parse_args() -> argparse.Namespace:

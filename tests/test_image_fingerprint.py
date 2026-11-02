@@ -4,7 +4,7 @@ import io
 
 from PIL import Image, ImageDraw
 
-from nailong_classifier.image_fingerprint import (
+from nailong_classifier.imaging.image_fingerprint import (
     DUPLICATE_DISTANCE,
     content_hash,
     find_duplicate,

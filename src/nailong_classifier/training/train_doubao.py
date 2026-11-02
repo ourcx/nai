@@ -10,14 +10,19 @@ from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from .data import (
+from ..classification.data import (
     DOUBAO_DETECTOR_CLASSES,
     build_doubao_detector_evaluation_loader,
     build_doubao_detector_train_val_loaders,
     validate_image_tree,
 )
+from ..classification.model import (
+    build_model,
+    configure_for_finetuning,
+    save_checkpoint,
+    select_device,
+)
 from .metrics import evaluate_loader
-from .model import build_model, configure_for_finetuning, save_checkpoint, select_device
 from .train import run_epoch, seed_everything
 
 
@@ -158,7 +163,7 @@ def train(args: argparse.Namespace) -> Path:
                 print(f"early_stop epoch={epoch}")
                 break
 
-    from .model import load_checkpoint
+    from ..classification.model import load_checkpoint
 
     best_model, _, image_size, threshold, metadata = load_checkpoint(checkpoint_path, device)
     result = {

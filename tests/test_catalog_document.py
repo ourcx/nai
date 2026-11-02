@@ -4,7 +4,10 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from nailong_classifier.catalog_document import CatalogDocumentClient, CatalogDocumentError
+from nailong_classifier.integrations.catalog_document import (
+    CatalogDocumentClient,
+    CatalogDocumentError,
+)
 
 
 class FakeClient:

@@ -16,10 +16,27 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .adapters.base import BotAdapter, CardAction, ErrorCode, ImageTarget, MembersAdded
-from .adapters.config import create_adapter, load_adapter_configs
-from .doubao import DoubaoDetector
-from .douyin import (
+from ..adapters.base import BotAdapter, CardAction, ErrorCode, ImageTarget, MembersAdded
+from ..adapters.config import create_adapter, load_adapter_configs
+from ..classification.doubao import DoubaoDetector
+from ..classification.milk import combined_milk_concentration
+from ..classification.model import NailongPredictor, Prediction
+from ..domain.milk_name_words import (
+    MILK_NAME_CHARACTERS,
+    MILK_NAME_FOREIGN,
+    MILK_NAME_PREFIXES,
+    MILK_NAME_TITLES,
+)
+from ..domain.rarity import Rarity
+from ..imaging.hdr import (
+    DEFAULT_HDR_PEAK_NITS,
+    DEFAULT_HDR_PROBABILITY,
+    random_milk_image_content,
+    validate_hdr_settings,
+)
+from ..imaging.image_fingerprint import find_duplicate, try_content_hash, try_file_content_hash
+from ..imaging.puzzle import try_make_puzzle_image
+from ..integrations.douyin import (
     SEARCH_KEYWORDS,
     DouyinSearchError,
     DouyinVideo,
@@ -27,25 +44,7 @@ from .douyin import (
     download_douyin_cover,
     search_douyin_videos,
 )
-from .hdr import (
-    DEFAULT_HDR_PEAK_NITS,
-    DEFAULT_HDR_PROBABILITY,
-    random_milk_image_content,
-    validate_hdr_settings,
-)
-from .image_fingerprint import find_duplicate, try_content_hash, try_file_content_hash
-from .milk import combined_milk_concentration
-from .milk_name_words import (
-    MILK_NAME_CHARACTERS,
-    MILK_NAME_FOREIGN,
-    MILK_NAME_PREFIXES,
-    MILK_NAME_TITLES,
-)
-from .model import NailongPredictor, Prediction
-from .puzzle import try_make_puzzle_image
-from .rarity import Rarity
-from .services import BackendServices, SerializedPredictor
-from .storage import (
+from ..persistence.storage import (
     LEGACY_NAME_FALLBACKS,
     LOCAL_TIMEZONE,
     AssetRecord,
@@ -59,9 +58,10 @@ from .storage import (
     MilkFamilyMember,
     ObservationRecord,
 )
+from .services import BackendServices, SerializedPredictor
 
 if TYPE_CHECKING:
-    from .catalog_document import CatalogDocumentClient
+    from ..integrations.catalog_document import CatalogDocumentClient
 
 LOGGER = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -1612,7 +1612,7 @@ async def run_bot(args: argparse.Namespace) -> None:
         for config in configs:
             adapters.append(create_adapter(config, isolate_feishu=isolate_feishu))
         if getattr(args, "milk_model", None):
-            from .milk_runtime import MilkPriorityPredictor
+            from ..classification.milk_runtime import MilkPriorityPredictor
 
             milk_predictor = MilkPriorityPredictor(
                 args.milk_model, device=args.device, threshold=args.threshold,

@@ -4,7 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from nailong_classifier.contact import ContactResolver
+from nailong_classifier.integrations.contact import ContactResolver
 
 
 class FakeResponse:

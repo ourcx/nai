@@ -13,7 +13,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from .data import (
+from ..classification.data import (
     AUGMENTATION_PROFILES,
     DEFAULT_CLASS_BALANCE_POWER,
     ROBUST_AUGMENTATION,
@@ -21,8 +21,7 @@ from .data import (
     build_train_val_loaders,
     validate_image_tree,
 )
-from .metrics import evaluate_loader
-from .model import (
+from ..classification.model import (
     ARCHITECTURE,
     SUPPORTED_ARCHITECTURES,
     build_model,
@@ -32,6 +31,7 @@ from .model import (
     save_checkpoint,
     select_device,
 )
+from .metrics import evaluate_loader
 
 EXPECTED_CLASSES = {"nailong", "naiwa", "other"}
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import nailong_classifier.bot as bot
+import nailong_classifier.application.bot as bot
 from nailong_classifier.adapters.base import (
     IdentityScope,
     ImageTarget,

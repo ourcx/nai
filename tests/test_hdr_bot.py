@@ -11,11 +11,11 @@ from lark_channel.channel.errors import FeishuChannelErrorCode
 from PIL import Image
 
 import nailong_classifier.adapters.feishu as feishu
-import nailong_classifier.bot as bot
+import nailong_classifier.application.bot as bot
 from nailong_classifier.adapters.config import create_adapter
-from nailong_classifier.douyin import DouyinVideo
-from nailong_classifier.model import Prediction
-from nailong_classifier.storage import BotStore
+from nailong_classifier.classification.model import Prediction
+from nailong_classifier.integrations.douyin import DouyinVideo
+from nailong_classifier.persistence.storage import BotStore
 
 
 def image_bytes(color: str) -> bytes:

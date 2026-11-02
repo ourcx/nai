@@ -7,14 +7,14 @@ import pytest
 import torch
 from PIL import Image
 
-from nailong_classifier.bot import (
+from nailong_classifier.application.bot import (
     _decode_message_content,
     _find_file_key,
     _find_image_key,
     _raw_parent_id,
     format_prediction,
 )
-from nailong_classifier.data import (
+from nailong_classifier.classification.data import (
     ANIMATED_SAMPLE_WEIGHT,
     DEFAULT_CLASS_BALANCE_POWER,
     DOUBAO_DETECTOR_CLASSES,
@@ -23,8 +23,8 @@ from nailong_classifier.data import (
     build_train_val_loaders,
     validate_image_tree,
 )
-from nailong_classifier.doubao import DoubaoDetector
-from nailong_classifier.model import (
+from nailong_classifier.classification.doubao import DoubaoDetector
+from nailong_classifier.classification.model import (
     NailongPredictor,
     Prediction,
     build_model,
@@ -131,7 +131,7 @@ def test_majority_candidate_is_accepted_at_relaxed_threshold(
             return probabilities.log().unsqueeze(0).expand(images.shape[0], -1)
 
     monkeypatch.setattr(
-        "nailong_classifier.model.load_checkpoint",
+        "nailong_classifier.classification.model.load_checkpoint",
         lambda path, device: (CandidateModel(), ["nailong", "naiwa", "other"], 32, 0.5, {}),
     )
     predictor = NailongPredictor(Path("unused.pt"), device="cpu")

@@ -252,15 +252,15 @@ train,naiwa,collected_20261021_457.gif,线上数据库收集并人工复核 asse
 train,naiwa,collected_20261021_463.gif,线上数据库收集并人工复核 asset 463
 train,naiwa,collected_20261021_464.jpg,线上数据库收集并人工复核 asset 464
 train,naiwa,collected_20261021_470.jpg,线上数据库收集并人工复核 asset 470
-train,other,collected_20261021_159.jpg,线上数据库收集并人工复核 asset 159
+train,doubao,collected_20261021_159.jpg,线上数据库收集并人工复核 asset 159；2026-10-26 按新增独立豆包类别重新标注（原 other）
 train,other,collected_20261021_194.jpg,线上数据库收集并人工复核 asset 194
 train,other,collected_20261021_228.jpg,线上数据库收集并人工复核 asset 228
 train,other,collected_20261021_319.gif,线上数据库收集并人工复核 asset 319
 train,other,collected_20261021_356.gif,线上数据库收集并人工复核 asset 356
-train,other,collected_20261021_411.jpg,线上数据库收集并人工复核 asset 411
+train,doubao,collected_20261021_411.jpg,线上数据库收集并人工复核 asset 411；2026-10-26 按新增独立豆包类别重新标注（原 other）
 train,other,collected_20261021_418.jpg,线上数据库收集并人工复核 asset 418
 train,other,collected_20261021_420.jpg,线上数据库收集并人工复核 asset 420
-train,other,collected_20261021_422.jpg,线上数据库收集并人工复核 asset 422
+train,doubao,collected_20261021_422.jpg,线上数据库收集并人工复核 asset 422；2026-10-26 按新增独立豆包类别重新标注（原 other）
 train,other,collected_20261021_428.jpg,线上数据库收集并人工复核 asset 428
 train,other,collected_20261021_441.jpg,线上数据库收集并人工复核 asset 441
 train,other,collected_20261021_462.jpg,线上数据库收集并人工复核 asset 462
@@ -291,3 +291,43 @@ test,other,collected_20261021_403.jpg,线上数据库收集并人工复核 asset
 test,other,collected_20261021_440.jpg,线上数据库收集并人工复核 asset 440
 test,other,collected_20261021_460.jpg,线上数据库收集并人工复核 asset 460
 test,other,collected_20261021_467.jpg,线上数据库收集并人工复核 asset 467
+test,doubao,doubao_20261026_001.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/6a9af9b54cfb6ULV.gif
+train,doubao,doubao_20261026_002.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/6a9462b17d9624dK.gif
+train,doubao,doubao_20261026_003.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/6a9462ade085cRVp.gif
+train,doubao,doubao_20261026_004.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/6a4024e02eddap7I.png
+train,doubao,doubao_20261026_005.jpg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1c66c92f7K.jpg
+train,doubao,doubao_20261026_006.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1c3d087TGo.png
+train,doubao,doubao_20261026_007.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1c206a8IBR.jpeg
+test,doubao,doubao_20261026_008.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1c0512avUg.png
+train,doubao,doubao_20261026_009.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1a889c3Ayd.png
+train,doubao,doubao_20261026_010.jpg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef3536c902uUy.jpg
+train,doubao,doubao_20261026_011.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef353448b0JYU.png
+train,doubao,doubao_20261026_012.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef353096bf9eW.png
+train,doubao,doubao_20261026_013.jpg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef35299becC87.jpg
+train,doubao,doubao_20261026_014.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef3527671cqBF.png
+test,doubao,doubao_20261026_015.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef352110164nL.gif
+test,doubao,doubao_20261026_016.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef3518bb08C0R.png
+train,doubao,doubao_20261026_017.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef3515ca905bQ.png
+train,doubao,doubao_20261026_018.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef34f565c4jaC.gif
+test,doubao,doubao_20261026_019.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bef34e92ca4Lkl.jpeg
+test,doubao,doubao_20261026_020.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/68e487ecc8b2dnJ9.gif
+train,doubao,doubao_20261026_021.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/68e487ec8e40ebzw.gif
+train,doubao,doubao_20261026_022.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/68e487ec72f00Vsw.gif
+train,doubao,doubao_20261026_023.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/68e487ec206c7Ywj.gif
+train,doubao,doubao_20261026_024.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1a507a3YtP.jpeg
+test,doubao,doubao_20261026_025.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d19e5e0eUcv.jpeg
+train,doubao,doubao_20261026_026.jpg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d19969fcnxz.jpg
+train,doubao,doubao_20261026_027.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d19393531fr.jpeg
+train,doubao,doubao_20261026_028.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d190b57eTj3.png
+train,doubao,doubao_20261026_029.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d18cf040rEh.png
+test,doubao,doubao_20261026_030.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d16627a47a7.png
+train,doubao,doubao_20261026_031.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d160309b6Td.png
+train,doubao,doubao_20261026_032.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d15d767aQdE.jpeg
+train,doubao,doubao_20261026_033.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d148f9e2z3v.png
+test,doubao,doubao_20261026_034.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1475035ejz.jpeg
+train,doubao,doubao_20261026_035.jpeg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1403e2bqeh.jpeg
+test,doubao,doubao_20261026_036.jpg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d12c90eddRo.jpg
+train,doubao,doubao_20261026_037.png,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d12a35eceAT.png
+train,doubao,doubao_20261026_038.jpg,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d1059729cE6.jpg
+train,doubao,doubao_20261026_039.gif,https://imgs.qiubiaoqing.com/qiubiaoqing/imgs/69bf0d0e8280eM6C.gif
+train,doubao,doubao_20261026_040.png,https://lf-flow-web-cdn.doubao.com/obj/flow-doubao/doubao/web/doubao_avatar.png
