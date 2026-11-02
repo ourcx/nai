@@ -7,6 +7,7 @@ import itertools
 import json
 import logging
 import re
+import wave
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -34,6 +35,7 @@ from .base import (
 
 LOGGER = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 20_971_520
+MAX_AUDIO_BYTES = 8 * 1024 * 1024
 MESSAGE_CACHE_SIZE = 1024
 GROUP_AND_C2C_INTENTS = 33_554_432
 MESSAGE_EVENTS = {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"}
@@ -468,8 +470,9 @@ class QQAdapter:
         if not message.reply_to_message_id:
             return ImageTarget()
         parent = self._messages.get(message.reply_to_message_id)
-        if parent and parent.resources:
-            resource = parent.resources[0]
+        image_resources = [r for r in parent.resources if r.type == "image"] if parent else []
+        if image_resources:
+            resource = image_resources[0]
             if (
                 self.scope.owns("message", resource.file_key)
                 and resource.file_key not in self._sent_sources
@@ -542,6 +545,21 @@ class QQAdapter:
         Image.fromarray(merged).save(output, format="PNG")
         return output.getvalue()
 
+    @staticmethod
+    def _voice(source: bytes) -> bytes:
+        # QQ 富媒体不接收飞书的 Ogg Opus，发送客户端保留的 PCM WAV。
+        if not isinstance(source, bytes) or len(source) > MAX_AUDIO_BYTES:
+            raise ValueError("QQ voice requires bounded WAV bytes")
+        with wave.open(io.BytesIO(source), "rb") as audio:
+            if (
+                audio.getnchannels() != 1 or audio.getsampwidth() != 2
+                or audio.getframerate() != 32000
+                or not 0 < audio.getnframes() <= 32000 * 91
+                or len(audio.readframes(audio.getnframes())) != audio.getnframes() * 2
+            ):
+                raise ValueError("QQ voice requires complete mono PCM16 WAV")
+        return source
+
     def _reply_context(self, chat_id: str, options: dict[str, Any]) -> dict[str, Any]:
         message_id = options.get("reply_to") or self._last_messages.get(chat_id)
         if message_id:
@@ -578,6 +596,7 @@ class QQAdapter:
                 content.get("text") or content.get("fallback_text") or content.get("caption") or ""
             )
             source = None
+            file_type, resource_type = 1, "image"
             if "gallery" in content:
                 uploading = True
                 source = await asyncio.to_thread(self._gallery, content["gallery"])
@@ -587,12 +606,16 @@ class QQAdapter:
             elif "image" in content:
                 uploading = True
                 source = await asyncio.to_thread(self._png, content["image"]["source"])
+            elif "audio" in content:
+                uploading = True
+                source = await asyncio.to_thread(self._voice, content["audio"]["source"])
+                file_type, resource_type = 3, "audio"
             if source is not None:
                 uploading = True
                 file = await self._call(
                     "POST", f"{route}/files",
                     json={
-                        "file_type": 1,
+                        "file_type": file_type,
                         "file_data": base64.b64encode(source).decode(),
                         "srv_send_msg": False,
                     },
@@ -602,15 +625,17 @@ class QQAdapter:
             if text:
                 payload["content"] = text
             if not text and source is None:
-                raise NotImplementedError("QQ needs text or an image")
+                raise NotImplementedError("QQ needs text, an image, or voice")
             result = await self._call("POST", f"{route}/messages", json=payload)
             message_id = self._message_key(f"{kind}:{raw_id}", str(result["id"]))
             resources = ()
             if source is not None:
-                self._cache(self._sent_sources, message_id, source, limit=32)
-                while sum(map(len, self._sent_sources.values())) > 33_554_432:
-                    self._sent_sources.popitem(last=False)
-                resources = (Resource("image", message_id),)
+                # 图片引用需要原图缓存；语音只记录类型，不能再作为识图素材下载。
+                if resource_type == "image":
+                    self._cache(self._sent_sources, message_id, source, limit=32)
+                    while sum(map(len, self._sent_sources.values())) > 33_554_432:
+                        self._sent_sources.popitem(last=False)
+                resources = (Resource(resource_type, message_id),)
             self._cache(self._messages, message_id, Message(
                 message_id=message_id, chat_id=chat_id, chat_type=kind,
                 sender_id=self.scope.key("user", "bot"), sender_is_bot=True,

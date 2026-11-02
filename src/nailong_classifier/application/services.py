@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..integrations.speech import NailongSpeechClient, SpeechRequestLimiter
 from ..persistence.storage import BotStore
 
 
@@ -45,6 +46,8 @@ class BackendServices:
     store: BotStore
     doubao_detector: SerializedPredictor | None = None
     catalog_sync_events: list[asyncio.Event] = field(default_factory=list)
+    speech_client: NailongSpeechClient | None = None
+    speech_limiter: SpeechRequestLimiter = field(default_factory=SpeechRequestLimiter)
 
     def notify_catalog_changed(self) -> None:
         """任何平台收录或纠正图片后，唤醒所有配置了图鉴同步的接入实例。"""

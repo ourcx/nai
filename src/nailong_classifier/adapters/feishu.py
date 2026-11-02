@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import time
@@ -334,6 +335,42 @@ class FeishuAdapter:
         self, chat_id: str, content: dict[str, Any], options: dict[str, Any] | None = None
     ) -> SendResult:
         payload = {key: value for key, value in content.items() if key != "fallback_text"}
+        audio = payload.get("audio")
+        if isinstance(audio, dict) and "duration_ms" in audio:
+            duration, source = audio["duration_ms"], audio.get("source")
+            if (
+                type(duration) is not int
+                or not 0 < duration <= 90500
+                or not isinstance(source, bytes)
+            ):
+                return SendResult(False, error=SendError("invalid_audio"))
+            # SDK 的普通 audio 上传没有透传 duration，飞书会把可播放语音显示成 00:00。
+            # 在飞书边界显式上传毫秒时长，再复用 SDK 的消息发送和引用消息处理。
+            from lark_channel.api.im.v1.model.create_file_request import CreateFileRequest
+            from lark_channel.api.im.v1.model.create_file_request_body import CreateFileRequestBody
+
+            try:
+                with io.BytesIO(source) as stream:
+                    stream.name = "nailong.opus"
+                    body = (
+                        CreateFileRequestBody.builder()
+                        .file_type("opus")
+                        .file_name(stream.name)
+                        .duration(duration)
+                        .file(stream)
+                        .build()
+                    )
+                    response = await self.channel.client.im.v1.file.acreate(
+                        CreateFileRequest.builder().request_body(body).build()
+                    )
+                key = response.data.file_key if response.code == 0 and response.data else None
+                if not key:
+                    LOGGER.warning("Audio upload rejected code=%s", response.code)
+                    return SendResult(False, error=SendError("upload_failed"))
+            except Exception:
+                LOGGER.exception("Failed to upload audio with duration")
+                return SendResult(False, error=SendError("upload_failed"))
+            payload["audio"] = {"source": MediaSource(kind="key", key=key)}
         if "gallery" in payload:
             rows = [[{"tag": "text", "text": payload.get("caption", "")}]]
             for item in payload["gallery"]:

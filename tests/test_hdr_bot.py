@@ -48,6 +48,8 @@ def run_mock_bot(
     quoted_image: bool = False,
     first_error: FeishuChannelErrorCode | None = None,
     doubao_detected: bool = False,
+    chat_type: str = "group",
+    audio_uploads: list | None = None,
 ):
     store = BotStore(tmp_path)
     store.register_seed(image_bytes("yellow"), "nailong")
@@ -58,6 +60,16 @@ def run_mock_bot(
 
         def __init__(self, **kwargs):
             self.handlers = {}
+
+            async def upload(request):
+                body = request.request_body
+                if audio_uploads is not None:
+                    audio_uploads.append((body.file.read(), body.duration))
+                return SimpleNamespace(code=0, data=SimpleNamespace(file_key="test-audio"))
+
+            self.client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(
+                file=SimpleNamespace(acreate=upload)
+            )))
 
         def on(self, event, handler):
             self.handlers[event] = handler
@@ -96,7 +108,7 @@ def run_mock_bot(
                 mentioned_bot=mentioned_bot,
                 message_id="source-id",
                 chat_id="chat-a",
-                chat_type="group",
+                chat_type=chat_type,
                 sender_id="user-a",
                 sender_name="奶友",
                 mentions=mentions or [],

@@ -44,6 +44,7 @@ from ..integrations.douyin import (
     download_douyin_cover,
     search_douyin_videos,
 )
+from ..integrations.speech import MAX_SPEECH_CHARS, NailongSpeechClient, SpeechError
 from ..persistence.storage import (
     LEGACY_NAME_FALLBACKS,
     LOCAL_TIMEZONE,
@@ -323,12 +324,17 @@ def is_hdr_milk_command(text: str) -> bool:
     return text.strip().lower() in {"hdr奶图", "hdr奶龙", "来张hdr奶图"}
 
 
+def parse_speech_command(text: str) -> str | None:
+    match = re.fullmatch(r"奶龙说(?:[\s：:]+(.*))?", text.strip(), flags=re.DOTALL)
+    return (match.group(1) or "").strip() if match else None
+
+
 def is_help_command(text: str) -> bool:
-    return text.strip().lower() in {"help", "帮助", "使用帮助", "奶龙帮助"}
+    return text.strip().lower() in {"help", "/help", "帮助", "/帮助", "使用帮助", "奶龙帮助"}
 
 
-def is_help_request(text: str, *, mentioned_bot: bool) -> bool:
-    return mentioned_bot and is_help_command(text)
+def is_help_request(text: str, *, mentioned_bot: bool, chat_type: str = "group") -> bool:
+    return (mentioned_bot or chat_type == "p2p") and is_help_command(text)
 
 
 def mentioned_user_ids(
@@ -1313,15 +1319,21 @@ def parse_correction_card_action(
 
 
 def format_help_message(
-    report_time: time, *, platform: str = "feishu", allow_proactive: bool = False
+    report_time: time, *, platform: str = "feishu", allow_proactive: bool = False,
+    speech_enabled: bool = False,
 ) -> str:
     if platform == "qq":
         report_note = (
             f"已开启主动播报，每天 {report_time.strftime('%H:%M')} 发送，需群主允许主动发言。"
             if allow_proactive else "当前未开启定时主动播报，可手动查询。"
         )
+        speech_note = (
+            "11. 奶龙说 你好：用奶龙的声音读出台词，最多 200 字。\n"
+            if speech_enabled else ""
+        )
         return (
             "我是奶龙，QQ群里先 @我再发送下面的内容，私聊直接发：\n"
+            "help / 帮助：随时查看这份使用说明，也支持 /help。\n"
             "1. 图片：识别奶龙/奶蛙，查看奶含量和稀有度；QQ表情请保存成图片发送。\n"
             "2. 直接发图片并 @我：识图后自动接同类奶图；"
             "回复图片并 @我：同样识图并接龙，附奶含量和稀有度。\n"
@@ -1334,11 +1346,14 @@ def format_help_message(
             "8. 接奶（或奶家人）：认领你为奶家人，领一张随机奶图，不用 @群友或输入昵称。\n"
             "9. 求赐名：随机起一个不撞名的奶名并记住，再求一次就换名。\n"
             "10. #奶龙 / #奶蛙 / #其他话题：找相关抖音视频，需搜索可用且链接通过QQ审核。\n"
-            "群主允许接收全量消息后，普通发图也能自动接龙；"
+            "HDR奶图：领一张闪亮奶图。\n"
+            "安静一点 / 开始说话：@我关闭或恢复随机奶图、视频推送。\n"
+            f"{speech_note}群主允许接收全量消息后，普通发图也能自动接龙；"
             "普通成员入群暂不能自动欢迎。奶运和识图使用文字回复。"
         )
     return (
         "我是奶龙，可以这样玩：\n"
+        "群聊 @我发送 help 或 帮助，私聊直接发；也支持 /help。\n"
         "1. 直接发送图片或表情：自动接龙，不用 @。\n"
         "2. 回复图片并 @我：查看识别结果、奶龙浓度和稀有度。\n"
         "3. 回复原图或接龙图，发送“纠正为奶龙/奶蛙/其他”：修正分类。\n"
@@ -1350,8 +1365,10 @@ def format_help_message(
         "7. 发送“奶龙猎人榜”：看谁首发收进图鉴的奶图最多。\n"
         "8. 发送“今日奶运”：抽当天固定奶签，看看奶气值、宜忌和称号。\n"
         "9. @我发送“求赐名”：随机起一个不撞名的奶名并记住，再求一次就换名。\n"
-        "10. 发送“HDR奶图”：立即来一张高亮奶图；自动接龙也会随机转成 HDR。"
-    )
+        "10. 发送“HDR奶图”：立即来一张闪亮奶图；自动接龙也会随机转成闪亮 GIF。\n"
+        "@我发送“安静一点”或“开始说话”：关闭或恢复随机奶图、视频推送。"
+    ) + ("\n11. @我发送“奶龙说 你好”：用奶龙的声音读出台词，最多 200 字。"
+         if speech_enabled else "")
 
 
 def format_catalog_caption(stats: CatalogStats, shown: int) -> str:
@@ -1631,7 +1648,10 @@ async def run_bot(args: argparse.Namespace) -> None:
                 if args.doubao_model
                 else None
             )
-        services = BackendServices(predictor, BotStore(args.state_dir), doubao_detector)
+        services = BackendServices(
+            predictor, BotStore(args.state_dir), doubao_detector,
+            speech_client=NailongSpeechClient.from_environment(),
+        )
         for config, adapter in zip(configs, adapters, strict=True):
             runtime_args = argparse.Namespace(**vars(args))
             if getattr(args, "bots_config", None):
@@ -1963,6 +1983,46 @@ async def run_adapter(
         normalized_text = text.strip().replace(" ", "")
         mentioned_users = mentioned_user_ids(message, body_text=text)
 
+        # 帮助优先于群友点名和引用图片，避免问用法时误触发查奶名或识图。
+        if is_help_request(
+            text, mentioned_bot=message.mentioned_bot, chat_type=message.chat_type
+        ):
+            await reply_usage(message)
+            return True
+
+        speech_text = parse_speech_command(text)
+        if (
+            speech_text is not None
+            and channel.scope.platform in {"feishu", "qq"}
+            and (message.mentioned_bot or message.chat_type == "p2p")
+        ):
+            if services.speech_client is None:
+                await reply(message, "语音功能暂未启用。")
+            elif not speech_text or len(speech_text) > MAX_SPEECH_CHARS:
+                await reply(message, f"发送“奶龙说 你好”，台词最多 {MAX_SPEECH_CHARS} 字。")
+            else:
+                try:
+                    with services.speech_limiter.admit(
+                        chat_id=message.chat_id, user_id=message.sender_id
+                    ):
+                        audio = await services.speech_client.synthesize(speech_text)
+                    result = await channel.send(
+                        message.chat_id,
+                        {"audio": {
+                            "source": audio.wav if channel.scope.platform == "qq" else audio.opus,
+                            "duration_ms": audio.duration_ms,
+                        }},
+                        {"reply_to": message.message_id},
+                    )
+                    if not result.success:
+                        await reply(message, "语音发送失败，请稍后重试。")
+                except SpeechError as error:
+                    await reply(message, str(error))
+                except Exception:
+                    LOGGER.exception("Speech reply failed")
+                    await reply(message, "语音生成失败，请稍后重试。")
+            return True
+
         if (
             message.mentioned_bot
             and mentioned_users
@@ -2140,14 +2200,6 @@ async def run_adapter(
             await reply(message, f"来点#{video.keyword}：{video.url}")
             return True
 
-        if is_help_request(text, mentioned_bot=message.mentioned_bot):
-            await reply(message, format_help_message(
-                args.daily_report_time,
-                platform=channel.scope.platform,
-                allow_proactive=getattr(channel, "allow_proactive", False),
-            ))
-            return True
-
         if is_hdr_milk_command(text):
             asset = await asyncio.to_thread(store.random_milk_asset)
             if asset:
@@ -2258,6 +2310,17 @@ async def run_adapter(
             return True
 
         return False
+
+    async def reply_usage(message, *, unknown_command: bool = False) -> None:
+        text = format_help_message(
+            args.daily_report_time,
+            platform=channel.scope.platform,
+            allow_proactive=getattr(channel, "allow_proactive", False),
+            speech_enabled=services.speech_client is not None,
+        )
+        if unknown_command:
+            text = "没认出这个指令，看看下面的用法：\n\n" + text
+        await reply(message, text)
 
     async def start_guess(message) -> None:
         async with guess_lock:
@@ -2808,7 +2871,11 @@ async def run_adapter(
                 await asyncio.to_thread(store.remember_milk_family_names, named_mentions)
             if await handle_command(message):
                 return
-            if not has_direct_image(message) and not message.mentioned_bot:
+            if (
+                not has_direct_image(message)
+                and not message.mentioned_bot
+                and message.chat_type != "p2p"
+            ):
                 # 普通聊天最多触发一种主动内容，避免一条消息连发视频和奶图。
                 if await maybe_douyin_video_push(message):
                     return
@@ -2825,19 +2892,10 @@ async def run_adapter(
                     )
                 return
             if not target.file_key:
-                if message.mentioned_bot:
-                    if (
-                        channel.scope.platform == "qq"
-                        and message.chat_type == "group"
-                        and not message.reply_to_message_id
-                    ):
-                        await reply(
-                            message,
-                            "想接奶：@我发“接奶”，直接领一张奶图。\n"
-                            "想识图：直接发送图片并 @我，或回复图片后 @我。",
-                        )
-                    else:
-                        await reply(message, "请发送图片，或回复一条图片消息后 @我。")
+                if message.mentioned_bot or message.chat_type == "p2p":
+                    # 只有明确找机器人时才提示；图片和可读取的引用已在前面解析。
+                    text = message.body_text or message.content_text
+                    await reply_usage(message, unknown_command=bool(text.strip()))
                 return
 
             reply_error = should_reply_media_error(

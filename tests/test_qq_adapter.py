@@ -376,7 +376,8 @@ def test_qq_uses_shared_image_workflows_and_simple_milk_command(tmp_path, monkey
             old_mention = event("@王小明", id="old-mention")
             await adapter.handle_event("GROUP_AT_MESSAGE_CREATE", old_mention)
             messages = [payload for path, payload in calls if path.endswith("/messages")]
-            assert "想接奶" in messages[-1]["content"]
+            assert "没认出这个指令" in messages[-1]["content"]
+            assert "接奶（或奶家人）" in messages[-1]["content"]
             assert "完整昵称" not in messages[-1]["content"]
 
             private_milk = event("接奶", id="private-milk")
@@ -429,12 +430,13 @@ def test_qq_uses_shared_image_workflows_and_simple_milk_command(tmp_path, monkey
             assert "奶龙接上了" not in messages[-1]["content"]
             assert calls[-1][0] == "/v2/users/user-a/messages"
 
-            # 只 @机器人时提示新口令，不再要求输入群友昵称。
+            # 只 @机器人时展示用法，不再要求输入群友昵称。
             bare = event(id="qq-stripped-mention")
             bare["content"] = ""
             await adapter.handle_event("GROUP_AT_MESSAGE_CREATE", bare)
             messages = [payload for path, payload in calls if path.endswith("/messages")]
-            assert "想接奶" in messages[-1]["content"]
+            assert "help / 帮助" in messages[-1]["content"]
+            assert "接奶（或奶家人）" in messages[-1]["content"]
             assert "手动输入" not in messages[-1]["content"]
 
             # 图片与引用仍按原逻辑识图、接龙和纠正。
