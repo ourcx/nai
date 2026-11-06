@@ -1577,11 +1577,12 @@ def format_help_message(
         if qq else "奶龙玩法\n群聊先 @我，私聊直接发。"
     )
     image_note = (
-        "发图或回复图片并 @我：识图、接奶，显示奶含量和稀有度。"
-        if qq else "群里发图、表情会自动接奶；@我识图会显示奶含量和稀有度。"
+        "发图或回复图片时 @机器人。识别后会显示结果；QQ 表情需要先保存成图片。"
+        if qq else
+        "群里直接发图或表情。识别为奶龙或奶蛙后，机器人会接一张同类奶图。"
     )
     family_note = (
-        "接奶 / 奶家人：领一张随机奶图。"
+        "发送「接奶」或「奶家人」，随机领一张奶图。"
         if qq else "@我和群友：查看奶名；给 @群友 求赐名：替对方随机换名。"
     )
     report_note = (
@@ -1592,53 +1593,91 @@ def format_help_message(
         if qq else f"每天 {report_time.strftime('%H:%M')} 自动播报。"
     )
     generator_note = "QQ 返回静态 PNG。" if qq else "飞书支持动态 GIF。"
-    video_note = "需通过 QQ 审核。" if qq else "搜索可用时返回链接。"
-    speech_note = (
+    video_note = "视频还需要通过 QQ 审核。" if qq else ""
+    speech_section = (
         "奶龙说 你好 / 奶蛙说 你好：用对应声音读出台词，最多 200 字。\n"
         "奶蛙大笑：直接播放奶蛙笑声。"
         if speech_enabled else "当前未启用语音功能。"
     )
     sections = {
         "奶名": (
-            "取奶名 奶狗：自选奶名，每 7 天成功一次。\n"
-            "求赐名：随机换奶名，不限次数。\n"
+            "取奶名 奶狗\n"
+            "把「奶狗」换成你想要的名字。自选奶名每 7 天可以成功一次。\n\n"
+            "求赐名\n"
+            "随机换一个奶名，不限次数。\n\n"
+            f"{'接奶 / 奶家人' if qq else '查看群友奶名'}\n"
             f"{family_note}"
         ),
         "奶签": (
-            "今日奶运：抽今日签，当天固定、零点更新。\n"
-            f"奶签收藏册：查看 {len(FORTUNE_FACES)} 张签面和徽章。\n"
-            "奶签历史 2：翻页；奶签详情 2026-11-04：回看指定日期。"
+            "今日奶运\n"
+            "抽取今天的奶签。同一天结果不变，第二天零点更新。\n\n"
+            "奶签收藏册\n"
+            f"查看已经抽到的签面、套装和连签徽章。签面共 {len(FORTUNE_FACES)} 张。\n\n"
+            "奶签历史 2\n"
+            "查看历史奶签；末尾数字是页码。\n\n"
+            "奶签详情 2026-11-04\n"
+            "查看指定日期收藏的奶签，日期按「年-月-日」填写。"
         ),
         "识图": (
-            f"{image_note}\n"
-            "随机奶图：随机领一张奶龙或奶蛙。\n"
-            "标怪图 / 取消怪图：回复图片后调整怪图池。\n"
-            "纠正为奶龙 / 奶蛙 / 其他：回复图片后修正分类。\n"
-            "奶龙图鉴：查看最近收录；HDR奶图：发送静态高亮奶图。\n"
-            f"#奶龙 / #奶蛙 / #话题：查找抖音视频，{video_note}"
+            f"{'识图与接奶' if qq else '自动接奶'}\n"
+            f"{image_note}\n\n"
+            "@我识图\n"
+            "发图时 @机器人，或者回复一张图再 @机器人。机器人会返回分类、奶含量和稀有度。\n\n"
+            "随机奶图 / 来张奶图\n"
+            "随机领取一张奶龙或奶蛙图片。\n\n"
+            "标怪图 / 取消怪图\n"
+            "先回复一张已识别的图片，再发送对应指令，把它加入或移出怪图池。\n\n"
+            "纠正为奶龙 / 纠正为奶蛙 / 纠正为其他\n"
+            "先回复原图，再发送正确分类。\n\n"
+            "奶龙图鉴\n"
+            "查看最近收录的奶图。\n\n"
+            "HDR奶图\n"
+            "获取一张静态高亮奶图。亮度效果取决于客户端和屏幕。\n\n"
+            "#奶龙 / #奶蛙 / #话题\n"
+            f"@机器人后发送话题。搜到抖音视频后返回链接。{video_note}"
         ),
         "游戏": (
-            f"猜图：开始盲盒，{'@我后发' if qq else '直接发'}奶龙 / 奶蛙 / 其他抢答。\n"
-            "公布答案：揭晓；猜图榜：积分排行；奶龙猎人榜：首发收图排行。"
+            "猜图\n"
+            "开始一局盲盒猜图。"
+            f"{'@机器人后发送' if qq else '直接发送'}「奶龙」「奶蛙」或「其他」抢答。\n\n"
+            "公布答案\n"
+            "结束当前回合并显示正确答案。\n\n"
+            "猜图榜\n"
+            "查看本群猜图积分排行。\n\n"
+            "奶龙猎人榜\n"
+            "查看奶图首发收录排行。"
         ),
         "创作": (
-            "奶峰生成器 鸡腿拿来！：制作奶龙文字图。\n"
-            "奶蛙字 笑得肚子疼：制作奶蛙文字图。\n"
-            f"最多 60 字、四行；发送「奶峰生成器」查看参数。{generator_note}"
+            "奶峰生成器 鸡腿拿来！\n"
+            "制作奶龙文字图。把「鸡腿拿来！」换成你要写的内容。\n\n"
+            "奶蛙字 笑得肚子疼\n"
+            "制作奶蛙文字图。把「笑得肚子疼」换成你要写的内容。\n\n"
+            "奶峰生成器\n"
+            f"查看配色、头像、动作等参数。文字最多 60 字、四行。{generator_note}"
         ),
-        "语音": speech_note,
+        "语音": (
+            "奶龙说 你好\n"
+            "把「你好」换成台词，用奶龙声音朗读。\n\n"
+            "奶蛙说 你好\n"
+            "把「你好」换成台词，用奶蛙声音朗读。\n\n"
+            "奶蛙大笑\n"
+            "直接播放奶蛙笑声。台词最多 200 字。"
+            if speech_enabled else speech_section
+        ),
         "设置": (
-            f"今日含奶量：查看本群统计。{report_note}\n"
-            "安静一点 / 开始说话：关闭或恢复主动推送。\n"
-            "初始化：登记群成员并扫描历史表情包。"
+            "今日含奶量\n"
+            f"查看本群今天的识图和收录统计。{report_note}\n\n"
+            "安静一点\n"
+            "关闭本群的随机奶图和抖音视频主动推送。\n\n"
+            "开始说话\n"
+            "恢复本群的主动推送。\n\n"
+            "初始化\n"
+            "登记当前群成员，并扫描近期历史消息里的表情包。"
         ),
     }
     if section in sections:
-        footer = (
-            "发送「help」返回分类目录。"
-            if qq else "点击下方按钮切换分类。"
-        )
-        return f"{intro}\n\n{section}\n{sections[section]}\n\n{footer}"
+        footer = "\n\n发送「help」返回分类目录。" if qq else ""
+        return f"{intro}\n\n{section}\n\n{sections[section]}{footer}"
     categories = " / ".join(HELP_SECTION_ALIASES)
     navigation = (
         "发送「help 奶名」「help 识图」这类命令查看详情。"
@@ -1690,7 +1729,8 @@ def _help_navigation(selected: str | None) -> list[dict[str, Any]]:
 
 def build_help_card(text: str, *, section: str | None = None) -> dict[str, Any]:
     """帮助卡通过分类按钮切换内容，减少命令输入。"""
-    elements = []
+    navigation = _help_navigation(section)
+    elements = list(navigation) if section else []
     for index, paragraph in enumerate(text.split("\n\n")):
         lines = paragraph.splitlines()
         if index and lines:
@@ -1698,7 +1738,8 @@ def build_help_card(text: str, *, section: str | None = None) -> dict[str, Any]:
         content = "\n".join(lines)
         content = re.sub(r"^([^：\n]{1,32})：", r"**\1**：", content, flags=re.MULTILINE)
         elements.append({"tag": "markdown", "content": content})
-    elements.extend(_help_navigation(section))
+    if not section:
+        elements.extend(navigation)
     return {
         "schema": "2.0",
         "config": {"enable_forward": True, "summary": {"content": "奶龙玩法"}},
@@ -3706,7 +3747,10 @@ async def run_adapter(
             section=section,
         )
         if feishu_emoji_ids and section == "识图":
-            text += "\n奶龙表情 点赞 · 点播企业表情；发「奶龙表情」查看列表。"
+            text += (
+                "\n\n奶龙表情 点赞\n"
+                "发送「奶龙表情」查看可用列表；把「点赞」换成表情名即可点播。"
+            )
         options = {"reply_to": context.message_id}
         if context.platform == "feishu" and context.chat_type in {"group", "topic"}:
             options["reply_in_thread"] = True
@@ -4503,7 +4547,10 @@ async def run_adapter(
                 section=section,
             )
             if feishu_emoji_ids and section == "识图":
-                text += "\n奶龙表情 点赞 · 点播企业表情；发「奶龙表情」查看列表。"
+                text += (
+                    "\n\n奶龙表情 点赞\n"
+                    "发送「奶龙表情」查看可用列表；把「点赞」换成表情名即可点播。"
+                )
             result = await delivery.update_card(
                 event.message_id,
                 build_help_card(text, section=section),
