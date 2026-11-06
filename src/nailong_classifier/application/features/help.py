@@ -23,10 +23,17 @@ class HelpFeature:
         text = context.text.strip()
         remaining = text
         for mention in context.mentions:
-            if mention.is_bot and mention.name:
+            if (
+                (mention.is_bot or (
+                    context.mentioned_bot and len(context.mentions) == 1
+                ))
+                and mention.name
+            ):
                 remaining = remaining.replace(f"@{mention.name}", "").replace(
                     mention.name, "",
                 )
+        if context.mentioned_bot:
+            remaining = remaining.replace("@我是奶龙", "").replace("我是奶龙", "")
         mention_only = (
             context.mentioned_bot
             and not re.sub(r"[\s@，,：:]+", "", remaining)

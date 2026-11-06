@@ -378,13 +378,18 @@ def mentioned_user_ids(
     users: list[tuple[str, str | None]] = []
     seen: set[str] = set()
     visible_text = body_text if getattr(message, "mentioned_bot", False) else None
-    for mention in getattr(message, "mentions", ()):
+    mentions = tuple(getattr(message, "mentions", ()))
+    for mention in mentions:
         open_id = getattr(mention, "open_id", None)
         name = getattr(mention, "name", None)
         if (
             not isinstance(open_id, str)
             or not open_id
             or getattr(mention, "is_bot", False)
+            or (
+                getattr(message, "mentioned_bot", False)
+                and len(mentions) == 1
+            )
             or (
                 visible_text is not None
                 and isinstance(name, str)
@@ -1649,9 +1654,9 @@ def format_help_message(
 def _help_navigation(selected: str | None) -> list[dict[str, Any]]:
     labels = ("全部", *HELP_SECTION_ALIASES)
     rows: list[dict[str, Any]] = []
-    for start in range(0, len(labels), 4):
+    for start in range(0, len(labels), 3):
         columns = []
-        for label in labels[start:start + 4]:
+        for label in labels[start:start + 3]:
             section = None if label == "全部" else label
             active = selected == section
             columns.append({
@@ -1683,7 +1688,7 @@ def _help_navigation(selected: str | None) -> list[dict[str, Any]]:
             })
         rows.append({
             "tag": "column_set",
-            "flex_mode": "stretch",
+            "flex_mode": "trisect",
             "horizontal_spacing": "8px",
             "columns": columns,
         })
