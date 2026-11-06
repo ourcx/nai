@@ -2422,7 +2422,7 @@ async def run_adapter(
             and result.error
             and result.error.code == ErrorCode.UPLOAD_FAILED
         ):
-LOGGER.warning(
+            LOGGER.warning(
                 "Derived image upload failed, falling back to original asset_id=%d",
                 asset.id,
             )
