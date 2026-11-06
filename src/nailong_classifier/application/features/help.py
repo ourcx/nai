@@ -36,6 +36,8 @@ class HelpFeature:
             remaining = remaining.replace("@我是奶龙", "").replace("我是奶龙", "")
         mention_only = (
             context.mentioned_bot
+            and not context.reply_to_message_id
+            and not context.resources
             and not re.sub(r"[\s@，,：:]+", "", remaining)
         )
         return (
