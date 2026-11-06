@@ -1629,17 +1629,69 @@ def format_help_message(
         ),
     }
     if section in sections:
-        return f"{intro}\n\n{section}\n{sections[section]}\n\n发送「help」返回分类目录。"
+        footer = (
+            "发送「help」返回分类目录。"
+            if qq else "点击下方按钮切换分类。"
+        )
+        return f"{intro}\n\n{section}\n{sections[section]}\n\n{footer}"
     categories = " / ".join(HELP_SECTION_ALIASES)
+    navigation = (
+        "发送「help 奶名」「help 识图」这类命令查看详情。"
+        if qq else "点击下方分类按钮查看详情。"
+    )
     return (
         f"{intro}\n\n"
         f"选择分类\n{categories}\n\n"
-        "发送「help 奶名」「help 识图」这类命令查看详情。"
+        f"{navigation}"
     )
 
 
-def build_help_card(text: str) -> dict[str, Any]:
-    """帮助使用飞书原生分组卡片；每组保留常用命令，详细参数走独立命令。"""
+def _help_navigation(selected: str | None) -> list[dict[str, Any]]:
+    labels = ("全部", *HELP_SECTION_ALIASES)
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(labels), 4):
+        columns = []
+        for label in labels[start:start + 4]:
+            section = None if label == "全部" else label
+            active = selected == section
+            columns.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "interactive_container",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {"action": "help_section", "section": section or ""},
+                    }],
+                    "background_style": _theme_token(
+                        "accent_2" if active else "button",
+                    ),
+                    "has_border": True,
+                    "border_color": _theme_token("icon_border"),
+                    "corner_radius": "8px",
+                    "padding": "8px 6px 8px 6px",
+                    "horizontal_align": "center",
+                    "elements": [_theme_text(
+                        label,
+                        color="on_accent_2" if active else "button_text",
+                        size="normal",
+                        bold=active,
+                        align="center",
+                    )],
+                }],
+            })
+        rows.append({
+            "tag": "column_set",
+            "flex_mode": "stretch",
+            "horizontal_spacing": "8px",
+            "columns": columns,
+        })
+    return rows
+
+
+def build_help_card(text: str, *, section: str | None = None) -> dict[str, Any]:
+    """帮助卡通过分类按钮切换内容，减少命令输入。"""
     elements = []
     for index, paragraph in enumerate(text.split("\n\n")):
         lines = paragraph.splitlines()
@@ -1648,11 +1700,15 @@ def build_help_card(text: str) -> dict[str, Any]:
         content = "\n".join(lines)
         content = re.sub(r"^([^：\n]{1,32})：", r"**\1**：", content, flags=re.MULTILINE)
         elements.append({"tag": "markdown", "content": content})
+    elements.extend(_help_navigation(section))
     return {
         "schema": "2.0",
         "config": {"enable_forward": True, "summary": {"content": "奶龙玩法"}},
         "header": {
-            "title": {"tag": "plain_text", "content": "奶龙玩法"},
+            "title": {
+                "tag": "plain_text",
+                "content": f"奶龙玩法 · {section}" if section else "奶龙玩法",
+            },
             "template": "yellow",
         },
         "body": {"vertical_spacing": "12px", "elements": elements},
@@ -3657,7 +3713,10 @@ async def run_adapter(
         if context.platform == "feishu" and context.chat_type in {"group", "topic"}:
             options["reply_in_thread"] = True
         content = (
-            {"card": build_help_card(text), "fallback_text": text}
+            {
+                "card": build_help_card(text, section=section),
+                "fallback_text": text,
+            }
             if context.platform == "feishu"
             else {"text": text}
         )
@@ -4435,6 +4494,25 @@ async def run_adapter(
                     await asyncio.to_thread(store.release_milk_name_welcome, chat_id, user_id)
 
     async def handle_card_action(event: CardAction) -> None:
+        if event.value.get("action") == "help_section":
+            requested = event.value.get("section")
+            section = requested if requested in HELP_SECTION_ALIASES else None
+            text = format_help_message(
+                args.daily_report_time,
+                platform=channel.scope.platform,
+                allow_proactive=getattr(channel, "allow_proactive", False),
+                speech_enabled=services.speech_client is not None,
+                section=section,
+            )
+            if feishu_emoji_ids and section == "识图":
+                text += "\n奶龙表情 点赞 · 点播企业表情；发「奶龙表情」查看列表。"
+            result = await delivery.update_card(
+                event.message_id,
+                build_help_card(text, section=section),
+            )
+            if not result.success:
+                LOGGER.error("Failed to update help card: %s", result.error)
+            return
         parsed = parse_correction_card_action(event.value)
         if parsed is None:
             LOGGER.info("Ignored unknown card action tag=%s", event.tag)

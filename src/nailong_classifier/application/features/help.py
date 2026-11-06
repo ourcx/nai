@@ -20,14 +20,28 @@ class HelpFeature:
         self.build_plan = build_plan
 
     def matches(self, context: MessageContext) -> bool:
+        text = context.text.strip()
+        remaining = text
+        for mention in context.mentions:
+            if mention.is_bot and mention.name:
+                remaining = remaining.replace(f"@{mention.name}", "").replace(
+                    mention.name, "",
+                )
+        mention_only = (
+            context.mentioned_bot
+            and not re.sub(r"[\s@，,：:]+", "", remaining)
+        )
         return (
             context.content_type in {"text", "post"}
             and (context.mentioned_bot or context.chat_type == "p2p")
-            and re.fullmatch(
-                r"(?:/?help|/?帮助|使用帮助|奶龙帮助)(?:[\s：:].*)?",
-                context.text.strip(),
-                flags=re.IGNORECASE,
-            ) is not None
+            and (
+                mention_only
+                or re.fullmatch(
+                    r"(?:/?help|/?帮助|使用帮助|奶龙帮助)(?:[\s：:].*)?",
+                    text,
+                    flags=re.IGNORECASE,
+                ) is not None
+            )
         )
 
     async def handle(self, context: MessageContext) -> ResponsePlan:
