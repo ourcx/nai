@@ -1664,26 +1664,19 @@ def _help_navigation(selected: str | None) -> list[dict[str, Any]]:
                 "width": "weighted",
                 "weight": 1,
                 "elements": [{
-                    "tag": "interactive_container",
+                    "tag": "button",
+                    "type": "primary" if active else "default",
+                    "size": "medium",
+                    "width": "fill",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": label,
+                        "text_align": "center",
+                    },
                     "behaviors": [{
                         "type": "callback",
                         "value": {"action": "help_section", "section": section or ""},
                     }],
-                    "background_style": _theme_token(
-                        "accent_2" if active else "button",
-                    ),
-                    "has_border": True,
-                    "border_color": _theme_token("icon_border"),
-                    "corner_radius": "8px",
-                    "padding": "8px 6px 8px 6px",
-                    "horizontal_align": "center",
-                    "elements": [_theme_text(
-                        label,
-                        color="on_accent_2" if active else "button_text",
-                        size="normal",
-                        bold=active,
-                        align="center",
-                    )],
                 }],
             })
         rows.append({
