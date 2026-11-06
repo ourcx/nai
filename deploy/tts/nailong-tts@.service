@@ -1,8 +1,8 @@
 [Unit]
-Description=Nailong GPT-SoVITS speech synthesis
+Description=Nailong GPT-SoVITS speech synthesis (%i)
 After=network.target
-StartLimitIntervalSec=300
-StartLimitBurst=3
+StartLimitIntervalSec=900
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,34 +10,33 @@ User=nailong-tts
 Group=nailong-tts
 WorkingDirectory=/srv/nailong-tts/current
 EnvironmentFile=/etc/nailong-tts.env
+EnvironmentFile=/etc/nailong-tts-%i.env
 Environment=TTS_RELEASE_DIR=/srv/nailong-tts/current
-Environment=TTS_STATE_DIR=/var/lib/nailong-tts
 Environment=TTS_HOST=127.0.0.1
-Environment=TTS_PORT=9880
-Environment=TTS_NUM_THREADS=4
-Environment=OMP_NUM_THREADS=4
-Environment=MKL_NUM_THREADS=4
-Environment=OPENBLAS_NUM_THREADS=4
+Environment=TTS_NUM_THREADS=8
+Environment=OMP_NUM_THREADS=8
+Environment=MKL_NUM_THREADS=8
+Environment=OPENBLAS_NUM_THREADS=8
 Environment=TOKENIZERS_PARALLELISM=false
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
-Environment=MPLCONFIGDIR=/var/cache/nailong-tts/matplotlib
-Environment=NUMBA_CACHE_DIR=/var/cache/nailong-tts/numba
+Environment=MPLCONFIGDIR=/var/cache/nailong-tts-%i/matplotlib
+Environment=NUMBA_CACHE_DIR=/var/cache/nailong-tts-%i/numba
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/srv/nailong-tts/.venv/bin/python /srv/nailong-tts/current/service.py
 Restart=on-failure
-RestartSec=5
-TimeoutStopSec=30
-StateDirectory=nailong-tts
-CacheDirectory=nailong-tts
+RestartSec=30
+TimeoutStopSec=75
+StateDirectory=nailong-tts-%i
+CacheDirectory=nailong-tts-%i
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-MemoryHigh=6G
-MemoryMax=8G
-CPUQuota=400%
+MemoryHigh=12G
+MemoryMax=16G
+CPUQuota=800%
 TasksMax=128
 
 [Install]

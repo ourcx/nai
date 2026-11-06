@@ -103,42 +103,52 @@ def encode_feishu_opus(content: bytes) -> SpeechAudio:
 class NailongSpeechClient:
     base_url: str
     token: str = field(repr=False)
+    naiwa_base_url: str | None = None
 
     @classmethod
     def from_environment(cls) -> NailongSpeechClient | None:
-        base_url, token = os.getenv("NAILONG_TTS_URL", ""), os.getenv("NAILONG_TTS_TOKEN", "")
-        if not base_url and not token:
+        legacy_url = os.getenv("NAILONG_TTS_URL", "")
+        nailong_url = os.getenv("NAILONG_TTS_NAILONG_URL", "") or legacy_url
+        naiwa_url = os.getenv("NAILONG_TTS_NAIWA_URL", "") or legacy_url
+        token = os.getenv("NAILONG_TTS_TOKEN", "")
+        if not nailong_url and not naiwa_url and not token:
             return None
-        parsed = urlsplit(base_url)
-        if (
-            not base_url
-            or not token
-            or parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("Set valid NAILONG_TTS_URL and NAILONG_TTS_TOKEN together")
+        for url in (nailong_url, naiwa_url):
+            parsed = urlsplit(url)
+            if (
+                not url
+                or not token
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "Set valid nailong/naiwa TTS URLs and NAILONG_TTS_TOKEN together"
+                )
         # 在开通功能时就检查编码依赖，避免用户发出第一条指令后才发现缺包。
         import av
 
         if "libopus" not in av.codecs_available:
             raise ValueError("Install the speech extra with a libopus-enabled PyAV wheel")
-        return cls(base_url.rstrip("/"), token)
+        return cls(nailong_url.rstrip("/"), token, naiwa_url.rstrip("/"))
 
     async def synthesize(self, text: str, *, voice: str = "nailong") -> SpeechAudio:
         if not text.strip() or len(text) > MAX_SPEECH_CHARS:
             raise SpeechError(f"请提供 1～{MAX_SPEECH_CHARS} 字的中文台词。")
         if voice not in {"nailong", "naiwa"}:
             raise ValueError("Unsupported speech voice")
+        base_url = self.naiwa_base_url if voice == "naiwa" else self.base_url
+        if not base_url:
+            raise SpeechError("对应音色暂未启用。")
         try:
             async with (
                 httpx.AsyncClient(timeout=httpx.Timeout(120, connect=5), trust_env=False) as client,
                 client.stream(
                     "POST",
-                    self.base_url + "/tts",
+                    base_url + "/tts",
                     headers={"Authorization": "Bearer " + self.token},
                     json={"text": text, "voice": voice},
                 ) as response,

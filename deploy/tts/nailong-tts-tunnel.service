@@ -1,12 +1,12 @@
 [Unit]
 Description=Restricted Nailong TTS reverse tunnel to tx
-After=network-online.target nailong-tts.service
-Wants=network-online.target nailong-tts.service
+After=network-online.target nailong-tts@nailong.service nailong-tts@naiwa.service
+Wants=network-online.target nailong-tts@nailong.service nailong-tts@naiwa.service
 
 [Service]
 User=nailong-tts
 Group=nailong-tts
-ExecStart=/usr/bin/ssh -NT -i /var/lib/nailong-tts/ssh/id_ed25519 -o BatchMode=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/var/lib/nailong-tts/ssh/known_hosts -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:19880:127.0.0.1:9880 nailong-tts-tunnel@1.14.151.75
+ExecStart=/usr/bin/ssh -NT -i /var/lib/nailong-tts/ssh/id_ed25519 -o BatchMode=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/var/lib/nailong-tts/ssh/known_hosts -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:19880:127.0.0.1:9880 -R 127.0.0.1:19881:127.0.0.1:9881 nailong-tts-tunnel@1.14.151.75
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

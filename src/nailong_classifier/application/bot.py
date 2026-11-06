@@ -81,7 +81,34 @@ from ..persistence.storage import (
     ObservationRecord,
 )
 from .chain_selector import ChainSelector
+from .context import MentionRef, MessageContext, ResourceRef
+from .dispatch import (
+    AsyncTaskDegraded,
+    DeliveryGateway,
+    ResponseBundle,
+    ResponseCoordinator,
+    SpeechDispatcher,
+)
+from .inference_dispatch import InferenceDispatcher, InferenceTaskDegraded
+from .features import (
+    AdminFeature,
+    HelpFeature,
+    InitializationFeature,
+    SocialImportFeature,
+    SpeechFeature,
+    SpeechRequest,
+    Workload,
+)
+from .response import AsyncTask, MessageAction, ResponsePlan
+from .router import FeatureRegistry, FeatureRouter
 from .services import BackendServices, SerializedPredictor
+from .work_scheduler import (
+    LaneConfig,
+    OverloadPolicy,
+    TaskContext,
+    WorkOutcome,
+    WorkScheduler,
+)
 
 if TYPE_CHECKING:
     from ..integrations.catalog_document import CatalogDocumentClient
@@ -108,6 +135,9 @@ OTHER_MILKY_REACTIONS = (
     "不敢细看了，怎么有股奶龙味？！",
     "你别过来啊！该不会是奶娃吧？！",
     "先别笑，我怕这真是没认出来的奶龙！",
+    "这是奶龙吗？！",
+    "奶蛋救我",
+    "你们奶家人"
 )
 OTHER_REACTIONS = (
     "等等，奶龙呢？奶蛙呢？！",
@@ -241,34 +271,6 @@ def is_milky_other(prediction: Prediction) -> bool:
 def other_reaction(prediction: Prediction) -> str:
     reactions = OTHER_MILKY_REACTIONS if is_milky_other(prediction) else OTHER_REACTIONS
     return secrets.choice(reactions)
-
-
-def filter_douyin_videos_by_cover(
-    videos: list[DouyinVideo],
-    predictor: NailongPredictor,
-) -> list[DouyinVideo]:
-    """只保留封面被本地模型高置信判为奶龙或奶蛙的搜索结果。"""
-    verified: list[DouyinVideo] = []
-    for video in videos:
-        if not video.cover_url:
-            LOGGER.info("Skipping Douyin video without cover URL url=%s", video.url)
-            continue
-        try:
-            prediction = predictor.predict_bytes(download_douyin_cover(video.cover_url))
-        except (DouyinSearchError, OSError, ValueError):
-            LOGGER.info("Skipping Douyin video with unavailable cover url=%s", video.url)
-            continue
-        if prediction.accepted and prediction.label in {"nailong", "naiwa"}:
-            verified.append(video)
-        else:
-            LOGGER.info(
-                "Skipping non-milk Douyin cover url=%s label=%s confidence=%.3f accepted=%s",
-                video.url,
-                prediction.label,
-                prediction.confidence,
-                prediction.accepted,
-            )
-    return verified
 
 
 def format_concentration(prediction: Prediction, *, corrected: bool = False) -> str:
@@ -1847,6 +1849,9 @@ async def run_bot(args: argparse.Namespace) -> None:
     adapters: list[BotAdapter] = []
     tasks: list[asyncio.Task] = []
     index_task: asyncio.Task | None = None
+    speech_dispatcher: SpeechDispatcher | None = None
+    inference_dispatcher: InferenceDispatcher | None = None
+    work_scheduler: WorkScheduler | None = None
     try:
         # 先校验所有接入凭证，再加载一份共用模型，避免每个机器人重复占内存。
         # SDK 导入时捕获模块级事件循环；即使只有一个飞书实例，在运行中的
@@ -1876,14 +1881,58 @@ async def run_bot(args: argparse.Namespace) -> None:
                 else None
             )
         store = BotStore(args.state_dir)
+        inference_dispatcher = InferenceDispatcher(predictor, doubao_detector)
+        inference_dispatcher.start()
+        work_scheduler = WorkScheduler({
+            "background": LaneConfig(
+                concurrency=2,
+                queue_capacity=8,
+                timeout=120,
+                overload_policy=OverloadPolicy.DEGRADE_TEXT,
+                circuit_failure_threshold=3,
+                circuit_reset_timeout=60,
+            ),
+            "social": LaneConfig(
+                concurrency=1,
+                queue_capacity=2,
+                timeout=180,
+                overload_policy=OverloadPolicy.DEGRADE_TEXT,
+                circuit_failure_threshold=3,
+                circuit_reset_timeout=60,
+            ),
+            "initialization": LaneConfig(
+                concurrency=1,
+                queue_capacity=1,
+                timeout=300,
+                overload_policy=OverloadPolicy.DEGRADE_TEXT,
+                circuit_failure_threshold=3,
+                circuit_reset_timeout=60,
+            ),
+            "proactive": LaneConfig(
+                concurrency=1,
+                queue_capacity=1,
+                timeout=60,
+                overload_policy=OverloadPolicy.DROP,
+                circuit_failure_threshold=3,
+                circuit_reset_timeout=60,
+            ),
+        })
+        await work_scheduler.start()
         chain_selector = ChainSelector(
             store, weights=getattr(args, "chain_weights", (20, 40, 30)),
             top_k=getattr(args, "chain_top_k", 5),
             min_similarity=getattr(args, "chain_min_similarity", 0.55),
         )
+        speech_client = NailongSpeechClient.from_environment()
+        speech_dispatcher = SpeechDispatcher(speech_client) if speech_client else None
+        if speech_dispatcher:
+            speech_dispatcher.start()
         services = BackendServices(
             predictor, store, doubao_detector,
-            speech_client=NailongSpeechClient.from_environment(),
+            inference_dispatcher=inference_dispatcher,
+            work_scheduler=work_scheduler,
+            speech_client=speech_client,
+            speech_dispatcher=speech_dispatcher,
             chain_selector=chain_selector,
         )
         # 独立索引任务不参加接入实例的 gather；图库没准备好也能正常启动和随机接龙。
@@ -1911,6 +1960,12 @@ async def run_bot(args: argparse.Namespace) -> None:
         # 一个实例异常退出时也必须收尾其余实例；重抛失败任务会跳过 close。
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if work_scheduler:
+            await work_scheduler.close()
+        if speech_dispatcher:
+            await speech_dispatcher.close()
+        if inference_dispatcher:
+            await inference_dispatcher.close()
         for adapter in adapters:
             try:
                 await adapter.close()
@@ -1940,7 +1995,13 @@ async def run_adapter(
 ) -> None:
     predictor = services.predictor
     doubao_detector = services.doubao_detector
+    inference_dispatcher = services.inference_dispatcher
+    if inference_dispatcher is None:
+        raise RuntimeError("Inference dispatcher is not configured")
     store = services.store
+    delivery = DeliveryGateway(channel)
+    speech_dispatcher = services.speech_dispatcher
+    responses = ResponseCoordinator(delivery, speech_dispatcher)
     chain_lock = asyncio.Lock()
     guess_lock = asyncio.Lock()
     contact_resolver = channel
@@ -1984,7 +2045,7 @@ async def run_adapter(
         options = {"reply_to": message.message_id}
         if in_thread:
             options["reply_in_thread"] = True
-        result = await channel.send(
+        result = await delivery.send(
             message.chat_id,
             {"text": text},
             options,
@@ -1999,7 +2060,7 @@ async def run_adapter(
         options = {"reply_to": message.message_id}
         if in_thread:
             options["reply_in_thread"] = True
-        result = await channel.send(
+        result = await delivery.send(
             message.chat_id,
             {"card": card, "fallback_text": fallback_text},
             options,
@@ -2036,7 +2097,7 @@ async def run_adapter(
 
     async def reply_image(message, source: bytes | Path, caption: str):
         image_source = source if isinstance(source, bytes) else str(source)
-        result = await channel.send(
+        result = await delivery.send(
             message.chat_id,
             {"image": {"source": image_source}, "caption": caption},
             {"reply_to": message.message_id},
@@ -2050,12 +2111,18 @@ async def run_adapter(
         voice: str = "nailong",
     ) -> None:
         """赐名语音是文字结果的互动补充，失败时不影响赐名和新人欢迎。"""
-        if channel.scope.platform != "feishu" or services.speech_client is None:
+        if channel.scope.platform != "feishu" or speech_dispatcher is None:
             return
         try:
-            audio = await services.speech_client.synthesize(text, voice=voice)
+            audio = await speech_dispatcher.generate(
+                message_id=reply_to or f"proactive:{secrets.token_hex(8)}",
+                chat_id=chat_id,
+                user_id="",
+                voice=voice,
+                text=text,
+            )
             options = {"reply_to": reply_to} if reply_to else None
-            result = await channel.send(
+            result = await delivery.send(
                 chat_id,
                 {"audio": {
                     "source": audio.opus,
@@ -2068,11 +2135,44 @@ async def run_adapter(
                     "Milk name speech send failed instance=%s",
                     channel.scope.instance_id,
                 )
+        except AsyncTaskDegraded:
+            LOGGER.info(
+                "Milk name speech degraded instance=%s",
+                channel.scope.instance_id,
+            )
         except Exception:
             LOGGER.exception(
                 "Milk name speech generation failed instance=%s",
                 channel.scope.instance_id,
             )
+
+    async def reply_with_speech(
+        message,
+        text: str,
+        speech_text: str,
+        *,
+        voice: str = "nailong",
+    ):
+        if channel.scope.platform != "feishu" or speech_dispatcher is None:
+            return await reply(message, text)
+        text_result, audio_result = await responses.send_text_with_optional_speech(
+            ResponseBundle(
+                message_id=message.message_id,
+                chat_id=message.chat_id,
+                user_id=message.sender_id,
+                text_content={"text": text},
+                speech_text=speech_text,
+                voice=voice,
+                audio_source="opus",
+                options={"reply_to": message.message_id},
+            )
+        )
+        if audio_result is not None and not audio_result.success:
+            LOGGER.warning(
+                "Paired speech send failed instance=%s",
+                channel.scope.instance_id,
+            )
+        return text_result
 
     async def request_milk_name_image(message, milk_name: str) -> None:
         image_bot_open_id = (
@@ -2109,7 +2209,7 @@ async def run_adapter(
                 )
                 return
             image_bot_open_id = channel.scope.raw("user", target.id)
-        result = await channel.send(
+        result = await delivery.send(
             message.chat_id,
             {"post": build_milk_name_image_request(image_bot_open_id, milk_name)},
             {"reply_to": message.message_id},
@@ -2190,10 +2290,15 @@ async def run_adapter(
     ):
         """接龙、主动推送、随机奶图和手动 HDR 奶图共用发送入口。"""
         if doubao_detector:
-            doubao_prediction = await asyncio.to_thread(
-                doubao_detector.predict_path,
-                asset.path,
-            )
+            try:
+                doubao_prediction = await inference_dispatcher.detect_doubao_path(
+                    asset.path,
+                    message_id=message.message_id,
+                    chat_id=message.chat_id,
+                    user_id=message.sender_id,
+                )
+            except InferenceTaskDegraded:
+                return None
             if doubao_prediction.detected:
                 LOGGER.warning(
                     "Blocked bot asset with Doubao asset_id=%d confidence=%.3f",
@@ -2217,7 +2322,7 @@ async def run_adapter(
         if caption and not is_derived:
             content["caption"] = caption
         options = {"reply_to": message.message_id} if reply_to else None
-        result = await channel.send(message.chat_id, content, options)
+        result = await delivery.send(message.chat_id, content, options)
         # 衍生图上传失败时只回退一次原图；群已撤销或发送结果不确定时不重复发。
         if (
             not result.success
@@ -2229,7 +2334,7 @@ async def run_adapter(
                 "Derived image upload failed, falling back to original asset_id=%d effect=%s",
                 asset.id, effect,
             )
-            result = await channel.send(
+            result = await delivery.send(
                 message.chat_id, {"image": {"source": str(asset.path)}}, options
             )
             is_derived = False
@@ -2261,6 +2366,25 @@ async def run_adapter(
             )
         return result
 
+    async def filter_douyin_covers(videos: list[DouyinVideo]) -> list[DouyinVideo]:
+        verified = []
+        for index, video in enumerate(videos):
+            if not video.cover_url:
+                continue
+            try:
+                cover = await asyncio.to_thread(download_douyin_cover, video.cover_url)
+                prediction = await inference_dispatcher.predict_bytes(
+                    cover,
+                    message_id=f"douyin-cover:{index}:{secrets.token_hex(4)}",
+                    chat_id="",
+                    user_id="",
+                )
+            except (DouyinSearchError, InferenceTaskDegraded, OSError, ValueError):
+                continue
+            if prediction.accepted and prediction.label in {"nailong", "naiwa"}:
+                verified.append(video)
+        return verified
+
     async def cached_douyin_videos(keywords: tuple[str, ...]) -> list[DouyinVideo]:
         if not args.douyin_cookie_file:
             return []
@@ -2275,11 +2399,7 @@ async def run_adapter(
                         keywords=keywords,
                     )
                     searched_count = len(videos)
-                    videos = await asyncio.to_thread(
-                        filter_douyin_videos_by_cover,
-                        videos,
-                        predictor,
-                    )
+                    videos = await filter_douyin_covers(videos)
                     douyin_video_cache[keywords] = (now, videos)
                     LOGGER.info(
                         "Douyin search cache refreshed topics=%s searched_count=%d "
@@ -2293,10 +2413,11 @@ async def run_adapter(
                     return []
             return videos
 
-    async def import_social_link(message, url: str) -> None:
+    async def import_social_link(message, url: str, *, announce: bool = True) -> None:
         """用户明确分享链接才解析；逐图识别、收录，文档仍走原有去重与重试流程。"""
         async with social_import_lock:
-            await reply(message, "正在读取图片或抽取视频画面并识别奶蛙、奶龙，稍等一下。")
+            if announce:
+                await reply(message, "正在读取图片或抽取视频画面并识别奶蛙、奶龙，稍等一下。")
             images = iter_social_images(
                 url, douyin_cookie_file=args.douyin_cookie_file,
                 xiaohongshu_cookie_file=getattr(args, "xiaohongshu_cookie_file", None),
@@ -2319,13 +2440,21 @@ async def run_adapter(
                         known_hashes[image.source_key] = fingerprint
                     try:
                         if doubao_detector:
-                            guard = await asyncio.to_thread(
-                                doubao_detector.predict_bytes, image.content,
+                            guard = await inference_dispatcher.detect_doubao_bytes(
+                                image.content,
+                                message_id=f"{message.message_id}:{image.source_key}:guard",
+                                chat_id=message.chat_id,
+                                user_id=message.sender_id,
                             )
                             if guard.detected:
                                 counts.update(["filtered"])
                                 continue
-                        prediction = await asyncio.to_thread(predictor.predict_bytes, image.content)
+                        prediction = await inference_dispatcher.predict_bytes(
+                            image.content,
+                            message_id=f"{message.message_id}:{image.source_key}",
+                            chat_id=message.chat_id,
+                            user_id=message.sender_id,
+                        )
                         if not prediction.accepted or prediction.label not in {"nailong", "naiwa"}:
                             counts.update(["filtered"])
                             continue
@@ -2390,7 +2519,7 @@ async def run_adapter(
             if asset.discoverer_name:
                 caption += f" · 首发：{asset.discoverer_name}"
             gallery.append({"source": asset.path, "caption": caption})
-        result = await channel.send(
+        result = await delivery.send(
             message.chat_id,
             {"gallery": gallery, "caption": format_catalog_caption(stats, len(assets))},
             {"reply_to": message.message_id},
@@ -2406,23 +2535,6 @@ async def run_adapter(
         mentioned_users = mentioned_user_ids(message, body_text=text)
         custom_milk_name = parse_custom_milk_name_command(text)
 
-        if (
-            normalized_text in {"初始化", "初始化群聊"}
-            and channel.scope.platform == "feishu"
-            and message.chat_type == "group"
-            and message.mentioned_bot
-        ):
-            await reply(message, "正在登记群成员并分析历史表情包，稍等一下。")
-            await initialize_group(message.chat_id)
-            return True
-
-        # 帮助优先于群友点名和引用图片，避免问用法时误触发查奶名或识图。
-        if is_help_request(
-            text, mentioned_bot=message.mentioned_bot, chat_type=message.chat_type
-        ):
-            await reply_usage(message)
-            return True
-
         if feishu_emoji_ids and (message.mentioned_bot or message.chat_type == "p2p"):
             emoji_command = re.fullmatch(r"(?:奶龙|奶蛙)表情[ \t:：]*(.*)", text.strip())
             if emoji_command:
@@ -2433,7 +2545,7 @@ async def run_adapter(
                     return True
                 # 飞书富文本需要企业表情的原始 ID 字符串，避免长整数精度丢失。
                 emotion = {"tag": "emotion", "emoji_type": emoji_id}
-                result = await channel.send(
+                result = await delivery.send(
                     message.chat_id,
                     {"post": {"zh_cn": {"content": [[emotion]]}}},
                     {"reply_to": message.message_id},
@@ -2441,11 +2553,6 @@ async def run_adapter(
                 if not result.success:
                     LOGGER.warning("Feishu enterprise emoji reply failed: %s", result.error)
                 return True
-
-        social_link = find_social_link(text)
-        if social_link and (message.mentioned_bot or message.chat_type == "p2p"):
-            await import_social_link(message, social_link)
-            return True
 
         # 明确要随机图时优先响应命令，不因引用图片或 @群友转去识图、点名。
         # 复用图库两类等概率抽图和已有发送护栏，只返回普通图片。
@@ -2497,48 +2604,6 @@ async def run_adapter(
                     await reply(message, "奶字制作失败，稍后再试试。")
             return True
 
-        naiwa_speech_text = parse_naiwa_speech_command(text)
-        speech_text = parse_speech_command(text)
-        speech_voice = "naiwa" if naiwa_speech_text is not None else "nailong"
-        if naiwa_speech_text is not None:
-            speech_text = naiwa_speech_text
-        if (
-            speech_text is not None
-            and channel.scope.platform in {"feishu", "qq"}
-            and (message.mentioned_bot or message.chat_type == "p2p")
-        ):
-            if services.speech_client is None:
-                await reply(message, "语音功能暂未启用。")
-            elif not speech_text or len(speech_text) > MAX_SPEECH_CHARS:
-                command = "奶蛙说 你好" if speech_voice == "naiwa" else "奶龙说 你好"
-                await reply(message, f"发送“{command}”，台词最多 {MAX_SPEECH_CHARS} 字。")
-            else:
-                try:
-                    with services.speech_limiter.admit(
-                        chat_id=message.chat_id, user_id=message.sender_id
-                    ):
-                        audio = (
-                            await services.speech_client.synthesize(speech_text, voice="naiwa")
-                            if speech_voice == "naiwa"
-                            else await services.speech_client.synthesize(speech_text)
-                        )
-                    result = await channel.send(
-                        message.chat_id,
-                        {"audio": {
-                            "source": audio.wav if channel.scope.platform == "qq" else audio.opus,
-                            "duration_ms": audio.duration_ms,
-                        }},
-                        {"reply_to": message.message_id},
-                    )
-                    if not result.success:
-                        await reply(message, "语音发送失败，请稍后重试。")
-                except SpeechError as error:
-                    await reply(message, str(error))
-                except Exception:
-                    LOGGER.exception("Speech reply failed")
-                    await reply(message, "语音生成失败，请稍后重试。")
-            return True
-
         if (
             message.mentioned_bot
             and mentioned_users
@@ -2568,14 +2633,11 @@ async def run_adapter(
                 milk_name=make_milk_name(display_name),
                 name_options=milk_name_options,
             )
-            await reply(
+            await reply_with_speech(
                 message,
                 format_milk_name_for_other(
                     display_name, existing.milk_name, existing=already_named
                 ),
-            )
-            await send_milk_name_speech(
-                message.chat_id,
                 format_milk_name_speech(existing.milk_name),
             )
             await request_milk_name_image(message, existing.milk_name)
@@ -2650,26 +2712,14 @@ async def run_adapter(
                     "「求赐名」可无限次随机换名。",
                 )
             else:
-                await reply(
-                    message, format_milk_name_grant(
+                await reply_with_speech(
+                    message,
+                    format_milk_name_grant(
                         assigned.original_name, assigned.milk_name,
                         original_name_known=assigned.original_name_known,
-                    )
-                )
-                await send_milk_name_speech(
-                    message.chat_id,
+                    ),
                     format_milk_name_speech(assigned.milk_name),
                 )
-            return True
-
-        if message.mentioned_bot and normalized_text in {"安静一点", "少说话", "闭嘴"}:
-            await asyncio.to_thread(store.set_proactive_enabled, message.chat_id, False)
-            await reply(message, "好，我安静一点。以后只在被 @、识图或收到命令时说话。")
-            return True
-
-        if message.mentioned_bot and normalized_text in {"开始说话", "活跃一点", "别安静"}:
-            await asyncio.to_thread(store.set_proactive_enabled, message.chat_id, True)
-            await reply(message, "收到，恢复正常参与。")
             return True
 
         collection_command = parse_fortune_collection_command(text)
@@ -3105,7 +3155,7 @@ async def run_adapter(
                     target.chat_id,
                     day=target.report_day,
                 )
-                result = await channel.send(
+                result = await delivery.send(
                     target.chat_id,
                     {
                         "card": build_daily_stats_card(
@@ -3130,7 +3180,7 @@ async def run_adapter(
                         store.identity_hash(target.chat_id),
                         result.error,
                     )
-                    result = await channel.send(
+                    result = await delivery.send(
                         target.chat_id,
                         {"text": f"每日含奶量播报\n{format_daily_stats(stats)}"},
                     )
@@ -3405,7 +3455,7 @@ async def run_adapter(
         )
         if reservation_id is None:
             return False
-        result = await channel.send(message.chat_id, {"text": f"来点奶：{video_url}"})
+        result = await delivery.send(message.chat_id, {"text": f"来点奶：{video_url}"})
         if result.success:
             LOGGER.info(
                 "Douyin video link sent chat_hash=%s reservation_id=%d",
@@ -3429,6 +3479,12 @@ async def run_adapter(
 
         仅在群聊生效；被踢出的群和冷却期内跳过；发送遇到 TARGET_REVOKED 标记该群失效。
         """
+        scheduler = services.work_scheduler
+        if (
+            (scheduler and scheduler.busy("social"))
+            or (speech_dispatcher and speech_dispatcher.busy)
+        ):
+            return
         if message.chat_type not in {"group", "topic"}:
             return
         if not await asyncio.to_thread(store.proactive_enabled, message.chat_id):
@@ -3465,6 +3521,275 @@ async def run_adapter(
         elif result:
             LOGGER.error("Random push failed error=%s", result.error)
 
+    def build_help_plan(context: MessageContext) -> ResponsePlan:
+        text = format_help_message(
+            args.daily_report_time,
+            platform=context.platform,
+            allow_proactive=getattr(channel, "allow_proactive", False),
+            speech_enabled=services.speech_client is not None,
+        )
+        if feishu_emoji_ids:
+            text += "\n奶龙表情 点赞 · 点播企业表情；发「奶龙表情」查看列表。"
+        options = {"reply_to": context.message_id}
+        if context.platform == "feishu" and context.chat_type in {"group", "topic"}:
+            options["reply_in_thread"] = True
+        content = (
+            {"card": build_help_card(text), "fallback_text": text}
+            if context.platform == "feishu"
+            else {"text": text}
+        )
+        return ResponsePlan(
+            messages=(MessageAction(content=content, options=options),),
+            handled=True,
+        )
+
+    def build_social_plan(context: MessageContext, url: str) -> ResponsePlan:
+        message = context.metadata["legacy_message"]
+
+        async def run_import() -> ResponsePlan | None:
+            await import_social_link(message, url, announce=False)
+            return None
+
+        return ResponsePlan(
+            messages=(
+                MessageAction(
+                    content={
+                        "text": "正在读取图片或抽取视频画面并识别奶蛙、奶龙，稍等一下。"
+                    },
+                    options={"reply_to": context.message_id},
+                ),
+            ),
+            tasks=(
+                AsyncTask(
+                    name="social_import",
+                    lane="social",
+                    run=run_import,
+                    fallback_messages=(
+                        MessageAction(
+                            content={
+                                "text": "当前链接解析任务较多，文字功能正常，请稍后再试。"
+                            },
+                            options={"reply_to": context.message_id},
+                        ),
+                    ),
+                ),
+            ),
+            handled=True,
+        )
+
+    async def build_speech_plan(
+        context: MessageContext,
+        request: SpeechRequest,
+    ) -> ResponsePlan:
+        if speech_dispatcher is None:
+            return ResponsePlan(
+                messages=(MessageAction(
+                    content={"text": "语音功能暂未启用。"},
+                    options={"reply_to": context.message_id},
+                ),),
+                handled=True,
+            )
+        if not request.text or len(request.text) > MAX_SPEECH_CHARS:
+            command = "奶蛙说 你好" if request.voice == "naiwa" else "奶龙说 你好"
+            return ResponsePlan(
+                messages=(MessageAction(
+                    content={
+                        "text": f"发送“{command}”，台词最多 {MAX_SPEECH_CHARS} 字。"
+                    },
+                    options={"reply_to": context.message_id},
+                ),),
+                handled=True,
+            )
+
+        async def run_speech() -> ResponsePlan | None:
+            try:
+                with services.speech_limiter.admit(
+                    chat_id=context.chat_id,
+                    user_id=context.sender_id,
+                ):
+                    text_result, audio_result = (
+                        await responses.send_text_with_optional_speech(
+                            ResponseBundle(
+                                message_id=context.message_id,
+                                chat_id=context.chat_id,
+                                user_id=context.sender_id,
+                                text_content={"text": request.text},
+                                speech_text=request.text,
+                                voice=request.voice,
+                                audio_source=(
+                                    "wav" if context.platform == "qq" else "opus"
+                                ),
+                                options={"reply_to": context.message_id},
+                            )
+                        )
+                    )
+                if text_result.success and (
+                    audio_result is None or audio_result.success
+                ):
+                    return None
+                error_text = "语音发送失败，请稍后重试。"
+            except SpeechError as error:
+                error_text = str(error)
+            except Exception:
+                LOGGER.exception("Speech feature failed")
+                error_text = "语音生成失败，请稍后重试。"
+            return ResponsePlan(
+                messages=(MessageAction(
+                    content={"text": error_text},
+                    options={"reply_to": context.message_id},
+                ),),
+                handled=True,
+            )
+
+        return ResponsePlan(
+            tasks=(AsyncTask(
+                name=f"speech:{request.voice}",
+                lane="background",
+                run=run_speech,
+                fallback_messages=(MessageAction(
+                    content={"text": request.text},
+                    options={"reply_to": context.message_id},
+                ),),
+            ),),
+            handled=True,
+        )
+
+    async def build_admin_plan(
+        context: MessageContext,
+        action: str,
+    ) -> ResponsePlan:
+        quiet = action == "quiet"
+        await asyncio.to_thread(
+            store.set_proactive_enabled,
+            context.chat_id,
+            not quiet,
+        )
+        text = (
+            "好，我安静一点。以后只在被 @、识图或收到命令时说话。"
+            if quiet else "收到，恢复正常参与。"
+        )
+        return ResponsePlan(
+            messages=(MessageAction(
+                content={"text": text},
+                options={"reply_to": context.message_id},
+            ),),
+            handled=True,
+        )
+
+    class LegacyCommandFeature:
+        """迁移期最低优先级兜底；功能移出后对应分支必须从 handle_command 删除。"""
+
+        name = "legacy_command"
+        priority = -10_000
+        workload = Workload.INLINE
+
+        def matches(self, context: MessageContext) -> bool:
+            return context.content_type in {"text", "post"}
+
+        async def handle(self, context: MessageContext) -> ResponsePlan:
+            message = context.metadata["legacy_message"]
+            return ResponsePlan(
+                handled=await handle_command(message),
+            )
+
+    class LegacyEventFeature:
+        workload = Workload.INLINE
+
+        def __init__(self, name: str, event_type: str, priority: int, callback) -> None:
+            self.name = name
+            self.event_type = event_type
+            self.priority = priority
+            self.callback = callback
+
+        def matches(self, context: MessageContext) -> bool:
+            return context.event_type == self.event_type
+
+        async def handle(self, context: MessageContext) -> ResponsePlan:
+            await self.callback(context.metadata["legacy_event"])
+            return ResponsePlan(handled=True)
+
+    def build_message_context(message) -> MessageContext:
+        return MessageContext(
+            platform=channel.scope.platform,
+            message_id=message.message_id,
+            chat_id=message.chat_id,
+            sender_id=message.sender_id,
+            sender_name=message.sender_name,
+            text=message.body_text or message.content_text,
+            chat_type=message.chat_type,
+            content_type=message.raw_content_type,
+            mentioned_bot=message.mentioned_bot,
+            reply_to_message_id=message.reply_to_message_id,
+            resources=tuple(
+                ResourceRef(resource.type, resource.file_key)
+                for resource in message.resources
+            ),
+            mentions=tuple(
+                MentionRef(mention.user_id, mention.name, mention.is_bot)
+                for mention in message.mentions
+            ),
+            metadata={"legacy_message": message},
+        )
+
+    async def execute_response_plan(
+        context: MessageContext,
+        plan: ResponsePlan,
+    ) -> None:
+        async def send_action(action: MessageAction) -> None:
+            if action.action == "update":
+                if action.message_id:
+                    await delivery.update_card(action.message_id, dict(action.content))
+                return
+            await delivery.send(
+                action.chat_id or context.chat_id,
+                dict(action.content),
+                dict(action.options) or None,
+            )
+
+        for action in plan.messages:
+            await send_action(action)
+        if not plan.tasks:
+            return
+        scheduler = services.work_scheduler
+        if scheduler is None:
+            for task in plan.tasks:
+                for action in task.fallback_messages:
+                    await send_action(action)
+            return
+        for task in plan.tasks:
+            result = await scheduler.submit(
+                task.lane,
+                lambda _task_context, runner=task.run: runner(),
+                TaskContext(
+                    job=task.name,
+                    message=context.message_id,
+                    chat=context.chat_id,
+                    user=context.sender_id,
+                ),
+            )
+            if result.outcome is WorkOutcome.SUCCESS:
+                if isinstance(result.value, ResponsePlan):
+                    await execute_response_plan(context, result.value)
+                continue
+            if result.outcome in {
+                WorkOutcome.DEGRADE_TEXT,
+                WorkOutcome.DROP,
+                WorkOutcome.FAILED,
+                WorkOutcome.RETRY,
+                WorkOutcome.TIMEOUT,
+            }:
+                if result.error:
+                    LOGGER.warning(
+                        "Feature task degraded name=%s outcome=%s error=%s",
+                        task.name,
+                        result.outcome,
+                        type(result.error).__name__,
+                    )
+                for action in task.fallback_messages:
+                    await send_action(action)
+
+    feature_router: FeatureRouter | None = None
+
     async def on_message(message) -> None:
         remember_milk_image_generator(message)
         if message.sender_is_bot:
@@ -3499,18 +3824,39 @@ async def run_adapter(
             ]
             if named_mentions:
                 await asyncio.to_thread(store.remember_milk_family_names, named_mentions)
-            if await handle_command(message):
+            context = build_message_context(message)
+            if feature_router is None:
+                raise RuntimeError("Feature router is not initialized")
+            plan = await feature_router.route(context)
+            await execute_response_plan(context, plan)
+            if plan.handled:
                 return
             if (
                 not has_direct_image(message)
                 and not message.mentioned_bot
                 and message.chat_type != "p2p"
             ):
-                # 普通聊天最多触发一种主动内容，避免一条消息连发视频和奶图。
-                if await maybe_douyin_video_push(message):
+                scheduler = services.work_scheduler
+                if scheduler is None:
                     return
-                # 群里有人正常聊天（没发图、没 @），按概率冷不丁丢一张抽象奶图。
-                await maybe_random_push(message)
+
+                async def run_proactive(_context: TaskContext) -> bool:
+                    # 普通聊天最多触发一种主动内容，避免一条消息连发视频和奶图。
+                    if await maybe_douyin_video_push(message):
+                        return True
+                    await maybe_random_push(message)
+                    return True
+
+                await scheduler.submit(
+                    "proactive",
+                    run_proactive,
+                    TaskContext(
+                        job="proactive_content",
+                        message=message.message_id,
+                        chat=message.chat_id,
+                        user=message.sender_id,
+                    ),
+                )
                 return
 
             target = await resolve_image_target(channel, message)
@@ -3559,11 +3905,27 @@ async def run_adapter(
                     await reply(message, "图片超过 20 MB，暂时无法识别。")
                 return
             recognition_bytes = await asyncio.to_thread(gif_recognition_frame, image_bytes)
-            if doubao_detector:
-                doubao_prediction = await asyncio.to_thread(
-                    doubao_detector.predict_bytes,
-                    recognition_bytes,
+            try:
+                doubao_prediction = (
+                    await inference_dispatcher.detect_doubao_bytes(
+                        recognition_bytes,
+                        message_id=target.message_id or message.message_id,
+                        chat_id=message.chat_id,
+                        user_id=message.sender_id,
+                    )
+                    if doubao_detector else None
                 )
+                prediction = await inference_dispatcher.predict_bytes(
+                    recognition_bytes,
+                    message_id=target.message_id or message.message_id,
+                    chat_id=message.chat_id,
+                    user_id=message.sender_id,
+                )
+            except InferenceTaskDegraded:
+                if reply_error:
+                    await reply(message, "当前识图任务较多，文字功能正常，请稍后再试。")
+                return
+            if doubao_prediction:
                 if doubao_prediction.detected:
                     LOGGER.warning(
                         "Rejected Doubao image chat_hash=%s message_id=%s confidence=%.3f",
@@ -3573,9 +3935,6 @@ async def run_adapter(
                     )
                     # 自动收图仍静默过滤；明确 @识图或私聊必须给结果，不能无声退出。
                     if reply_error:
-                        prediction = await asyncio.to_thread(
-                            predictor.predict_bytes, recognition_bytes,
-                        )
                         await reply(
                             message,
                             f"{format_prediction(prediction)}\n"
@@ -3583,7 +3942,6 @@ async def run_adapter(
                             "豆包过滤器认为这张图疑似含豆包，本次不收录图鉴。",
                         )
                     return
-            prediction = await asyncio.to_thread(predictor.predict_bytes, recognition_bytes)
             # 首发署名：发图者昵称为空时按 open_id 反查，拿不到就留空（图鉴不显示该行）。
             discoverer_name = message.sender_name
             if not discoverer_name:
@@ -3684,13 +4042,19 @@ async def run_adapter(
                         gif_recognition_frame, image_bytes,
                     )
                     if doubao_detector:
-                        guard = await asyncio.to_thread(
-                            doubao_detector.predict_bytes, recognition_bytes,
+                        guard = await inference_dispatcher.detect_doubao_bytes(
+                            recognition_bytes,
+                            message_id=f"{sticker.message_id}:guard",
+                            chat_id=chat_id,
+                            user_id=sticker.sender_id,
                         )
                         if guard.detected:
                             continue
-                    prediction = await asyncio.to_thread(
-                        predictor.predict_bytes, recognition_bytes,
+                    prediction = await inference_dispatcher.predict_bytes(
+                        recognition_bytes,
+                        message_id=sticker.message_id,
+                        chat_id=chat_id,
+                        user_id=sticker.sender_id,
                     )
                     if not prediction.accepted or prediction.label not in {"nailong", "naiwa"}:
                         continue
@@ -3722,7 +4086,16 @@ async def run_adapter(
             )
         await send_milk_name_speech(chat_id, "我进来了！")
 
-    async def on_user_added(event: MembersAdded) -> None:
+    feature_router = FeatureRouter(FeatureRegistry((
+        HelpFeature(build_help_plan),
+        InitializationFeature(initialize_group),
+        SocialImportFeature(find_social_link, build_social_plan),
+        AdminFeature(build_admin_plan),
+        SpeechFeature(build_speech_plan),
+        LegacyCommandFeature(),
+    )))
+
+    async def handle_user_added(event: MembersAdded) -> None:
         """为入群新人登记奶家人并起一次奶名。"""
         chat_id = event.chat_id
         entries: list[tuple[str, str]] = []
@@ -3781,26 +4154,34 @@ async def run_adapter(
                     channel.scope.instance_id,
                 )
                 return
-            result = await channel.send(chat_id, {"text": format_milk_name_welcome(entries)})
-            sent = result.success
+            welcome_voice = secrets.choice(("nailong", "naiwa"))
+            text_result, audio_result = await responses.send_text_with_optional_speech(
+                ResponseBundle(
+                    message_id=f"welcome:{secrets.token_hex(8)}",
+                    chat_id=chat_id,
+                    user_id=claimed_ids[0] if claimed_ids else "",
+                    text_content={"text": format_milk_name_welcome(entries)},
+                    speech_text=format_milk_name_welcome_speech(
+                        entries, voice=welcome_voice,
+                    ),
+                    voice=welcome_voice,
+                    audio_source="opus",
+                )
+            )
+            sent = text_result.success
             if not sent:
                 LOGGER.error(
                     "Milk name welcome failed instance=%s members=%d error_code=%s",
                     channel.scope.instance_id,
                     len(entries),
-                    getattr(result.error, "code", None),
+                    getattr(text_result.error, "code", None),
                 )
                 return
             LOGGER.info(
-                "Milk name welcome sent instance=%s members=%d",
+                "Milk name welcome sent instance=%s members=%d voice_sent=%s",
                 channel.scope.instance_id,
                 len(entries),
-            )
-            welcome_voice = secrets.choice(("nailong", "naiwa"))
-            await send_milk_name_speech(
-                chat_id,
-                format_milk_name_welcome_speech(entries, voice=welcome_voice),
-                voice=welcome_voice,
+                bool(audio_result and audio_result.success),
             )
         except Exception:
             LOGGER.error(
@@ -3814,7 +4195,7 @@ async def run_adapter(
                 for user_id in claimed_ids:
                     await asyncio.to_thread(store.release_milk_name_welcome, chat_id, user_id)
 
-    async def on_card_action(event: CardAction) -> None:
+    async def handle_card_action(event: CardAction) -> None:
         parsed = parse_correction_card_action(event.value)
         if parsed is None:
             LOGGER.info("Ignored unknown card action tag=%s", event.tag)
@@ -3847,7 +4228,7 @@ async def run_adapter(
             rarity,
             image_key=image_key,
         )
-        result = await channel.update_card(event.message_id, updated)
+        result = await delivery.update_card(event.message_id, updated)
         if result.success:
             LOGGER.info(
                 "Updated correction card message_id=%s asset_id=%s label=%s",
@@ -3860,6 +4241,46 @@ async def run_adapter(
 
     async def on_reject(event) -> None:
         LOGGER.info("Message rejected reason=%s", event.reason)
+
+    event_router = FeatureRouter(FeatureRegistry((
+        LegacyEventFeature(
+            "card_correction",
+            "card_action",
+            10_000,
+            handle_card_action,
+        ),
+        LegacyEventFeature(
+            "member_welcome",
+            "members_added",
+            9_000,
+            handle_user_added,
+        ),
+    )))
+
+    async def on_card_action(event: CardAction) -> None:
+        context = MessageContext(
+            platform=channel.scope.platform,
+            message_id=event.message_id,
+            chat_id="",
+            sender_id="",
+            event_type="card_action",
+            metadata={"legacy_event": event},
+        )
+        plan = await event_router.route(context)
+        await execute_response_plan(context, plan)
+
+    async def on_user_added(event: MembersAdded) -> None:
+        context = MessageContext(
+            platform=channel.scope.platform,
+            message_id=f"members-added:{secrets.token_hex(8)}",
+            chat_id=event.chat_id,
+            sender_id="",
+            chat_type="group",
+            event_type="members_added",
+            metadata={"legacy_event": event},
+        )
+        plan = await event_router.route(context)
+        await execute_response_plan(context, plan)
 
     channel.on("message", on_message)
     channel.on("card_action", on_card_action)

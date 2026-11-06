@@ -400,44 +400,6 @@ def test_mentioned_topic_search_replies_with_requested_topic(tmp_path, monkeypat
     ]
 
 
-def test_douyin_cover_filter_requires_accepted_milk_prediction(monkeypatch) -> None:
-    videos = [
-        DouyinVideo(
-            url="https://www.douyin.com/video/keep",
-            title="奶蛙视频",
-            keyword="奶蛙",
-            author_name="奶友甲",
-            cover_url="https://p3.douyinpic.com/keep.webp",
-        ),
-        DouyinVideo(
-            url="https://www.douyin.com/video/drop",
-            title="无关视频",
-            keyword="奶蛙",
-            author_name="奶友乙",
-            cover_url="https://p3.douyinpic.com/drop.webp",
-        ),
-        DouyinVideo(
-            url="https://www.douyin.com/video/no-cover",
-            title="无封面视频",
-            keyword="奶蛙",
-            author_name="奶友丙",
-        ),
-    ]
-    monkeypatch.setattr(bot, "download_douyin_cover", lambda url: url.encode())
-
-    def predict_bytes(data: bytes) -> Prediction:
-        return Prediction(
-            label="naiwa" if data.endswith(b"keep.webp") else "other",
-            confidence=0.9,
-            accepted=True,
-            scores={"nailong": 0.05, "naiwa": 0.9, "other": 0.05},
-        )
-
-    predictor = SimpleNamespace(predict_bytes=predict_bytes)
-
-    assert bot.filter_douyin_videos_by_cover(videos, predictor) == [videos[0]]
-
-
 def test_hdr_upload_rejection_falls_back_once_to_original(tmp_path, monkeypatch) -> None:
     calls, _ = run_mock_bot(
         tmp_path, monkeypatch, text="HDR奶图", first_error=FeishuChannelErrorCode.UPLOAD_FAILED

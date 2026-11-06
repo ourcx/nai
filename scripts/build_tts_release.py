@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_FILES = ("service.py", "tts_engine.py", "requirements.txt", "nailong-tts.service")
+RUNTIME_FILES = ("service.py", "tts_engine.py", "requirements.txt", "nailong-tts@.service")
 
 
 def copy_file(source: str, target: str) -> str:

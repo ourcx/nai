@@ -1,22 +1,22 @@
 # 现有飞书和 QQ 机器人调用开发机语音服务
 
-飞书和 QQ 机器人、识图模型、图库 Web 继续在 tx 运行。devbox 只加载 GPT-SoVITS，收到 tx 的请求后返回 WAV；tx 在句首加播放缓冲，飞书使用 Opus 回复，QQ 使用 WAV 语音回复。
+飞书和 QQ 机器人、识图模型、图库 Web 继续在 tx 运行。devbox 常驻奶龙、奶蛙两个固定 GPT-SoVITS 进程，分别返回 WAV；tx 在句首加播放缓冲，飞书使用 Opus 回复，QQ 使用 WAV 语音回复。
 
 ```text
-飞书 / QQ 用户 → tx 原机器人 → 127.0.0.1:19880
-                             ↓ 反向 SSH 隧道
-                     devbox 127.0.0.1:9880 → GPT-SoVITS
+飞书 / QQ 用户 → tx 原机器人 → 127.0.0.1:19880 → 奶龙 9880
+                             └→ 127.0.0.1:19881 → 奶蛙 9881
+                                      反向 SSH 隧道
 ```
 
-开发机主动连接 tx，断线后由 systemd 重连。SSH 专用账号只允许监听 tx 的 `127.0.0.1:19880`，不能执行命令或建立其他转发。HTTP 接口另用随机 Bearer 令牌校验请求。
+开发机主动连接 tx，断线后由 systemd 重连。SSH 专用账号只允许监听 tx 的 `127.0.0.1:19880` 和 `19881`，不能执行命令或建立其他转发。HTTP 接口另用随机 Bearer 令牌校验请求。
 
 ## 使用
 
 群聊中发送 `@机器人 奶龙说 今天的鸡腿都是我的！`；与机器人私聊时发送 `奶龙说 今天的鸡腿都是我的！`。
 
-飞书和 QQ 都支持 `奶龙说`，飞书另外支持 `奶蛙说` 和 `奶蛙大笑`。
+飞书和 QQ 都支持 `奶龙说`、`奶蛙说` 和 `奶蛙大笑`。
 奶蛙音色使用已授权的八级哥笑饿魔参考音和 GPT-SoVITS v2ProPlus 官方基础权重，
-运行时与奶龙权重按请求热切换，不同时常驻两套完整模型。
+奶龙、奶蛙权重分别固定在独立进程中，不再按请求热切换。
 只支持中文台词，可包含数字和标点，最多 200 字。输入英文会收到中文限制提示。
 QQ 沿用现有被动回复规则，语音关联触发消息，保留 5 分钟回复窗口和消息序号；
 没有额外开启主动发言。
@@ -27,10 +27,11 @@ QQ 沿用现有被动回复规则，语音关联触发消息，保留 5 分钟�
 | --- | --- |
 | tx 机器人入口 | 每人间隔 30 秒，同一群或私聊间隔 5 秒，最多 4 个请求等待后端结果 |
 | devbox 后端 | 只执行 1 次推理，最多 3 个等待位，按提交顺序处理 |
-| devbox 后端 | 排队最多等待 30 秒，超时移除；每 60 秒最多接纳 12 个请求 |
-| devbox systemd | CPU 配额 4 核，内存软限 6 GiB、硬限 8 GiB |
+| tx 语音调度 | 每个音色最多等待 3 个任务，单消费者；15 秒未完成则只保留文字 |
+| devbox 后端 | 每个音色仅执行当前任务，不再额外排队；每 60 秒最多接纳 12 个请求 |
+| devbox systemd | 每个模型 CPU 配额 8 核，内存软限 8 GiB、硬限 10 GiB |
 
-排队请求取消后会释放等待位；已经开始的推理由后台 worker 持有，完成后才执行下一项。这样调用方超时或取消时，也不会留下一个继续运行、同时又启动下一次的模型任务。服务重启会清空内存中的队列和限流计数。
+tx 为奶龙、奶蛙分别维护一个单消费者队列。连续失败三次后熔断，恢复等待按 60、120、240、300 秒递增；半开状态只放行一个探测任务。队满、熔断或 15 秒配对超时时，业务文字仍立即发送，过期语音不会稍后补发。
 
 用户冷却按平台提供的身份计算；QQ 的群成员身份按群隔离，跨群不会强行合并为同一个人。所有平台的请求仍受同一后端全局频率和排队上限约束。
 
@@ -64,8 +65,9 @@ QQ 复用同次合成保留的 PCM WAV，包含相同的 350 毫秒缓冲，直�
 | devbox | `/srv/nailong-tts/releases/`、`current` | 发布包和当前版本链接 |
 | devbox | `/srv/nailong-tts/.venv` | 独立 Python 环境 |
 | devbox | `/etc/nailong-tts.env` | 服务端令牌，root 和服务组可读 |
-| devbox | `/var/lib/nailong-tts`、`/var/cache/nailong-tts` | 状态、专用 SSH 私钥和缓存 |
-| devbox | `nailong-tts.service` | 本机 9880 端口，4 个 CPU 线程，内存上限 8 GiB |
+| devbox | `/var/lib/nailong-tts-*`、`/var/cache/nailong-tts-*` | 两个模型的独立状态和缓存 |
+| devbox | `nailong-tts@nailong.service` | 固定奶龙模型，本机 9880，内存上限 10 GiB |
+| devbox | `nailong-tts@naiwa.service` | 固定奶蛙模型，本机 9881，内存上限 10 GiB |
 | devbox | `nailong-tts-tunnel.service` | 连接 tx 的反向隧道 |
 | tx | `/etc/nailong-tts-client.env` | 后端地址与客户端令牌，仅 root 可读 |
 | tx | `/etc/systemd/system/nailong-bot.service.d/90-voice-client.conf` | 为原机器人选择语音分支入口和配置 |
@@ -76,15 +78,16 @@ QQ 复用同次合成保留的 PCM WAV，包含相同的 350 毫秒缓冲，直�
 ## 检查和回滚
 
 ```bash
-ssh devbox 'systemctl status nailong-tts nailong-tts-tunnel --no-pager'
+ssh devbox 'systemctl status nailong-tts@nailong nailong-tts@naiwa nailong-tts-tunnel --no-pager'
 ssh tx 'systemctl status nailong-bot nailong-web --no-pager'
 ssh tx 'curl --fail http://127.0.0.1:19880/healthz'
-ssh devbox 'sudo -n journalctl -u nailong-tts -n 50 --no-pager'
+ssh tx 'curl --fail http://127.0.0.1:19881/healthz'
+ssh devbox 'sudo -n journalctl -u "nailong-tts@*" -n 50 --no-pager'
 ```
 
 `/healthz` 只在模型加载并真实预热合成成功后才可访问，提供 `busy`、`queued`、`queue_capacity` 和全局频率上限。`POST /tts` 需要 Bearer 令牌，JSON 为 `{"text":"你好"}`，可附整数 `seed`。响应为单声道、32 kHz、16 位 PCM WAV，响应头包含排队与生成耗时；未授权返回 401，参数错误返回 400，队满、排队超时或全局限流返回 429，并附 `Retry-After`。接口不提供模型上传或任意文件访问。
 
-后端队列参数可通过 `TTS_MAX_WAITING`、`TTS_QUEUE_TIMEOUT`、`TTS_RATE_LIMIT` 配置，默认分别为 3、30、12。客户端读取超时为 120 秒，覆盖排队和合成；连接超时为 5 秒。
+后端实例使用 `TTS_VOICE` 固定音色；`TTS_MAX_WAITING=0`，排队由 tx 调度层负责。客户端读取超时为 120 秒，覆盖合成；连接超时为 5 秒。
 
 回退到原机器人入口：
 
@@ -92,4 +95,4 @@ ssh devbox 'sudo -n journalctl -u nailong-tts -n 50 --no-pager'
 ssh tx 'rm /etc/systemd/system/nailong-bot.service.d/90-voice-client.conf; systemctl daemon-reload; systemctl restart nailong-bot'
 ```
 
-此操作保留客户端代码副本和配置，图库服务无需重启。如果只想暂停语音后端，可停止开发机的 `nailong-tts` 和 `nailong-tts-tunnel`；启用语音入口的机器人会在调用失败时返回提示。回退后端版本时，将 `/srv/nailong-tts/current` 切到已验证的旧发布目录，再重启 `nailong-tts`。
+此操作保留客户端代码副本和配置，图库服务无需重启。如果只想暂停语音后端，可停止开发机的两个 `nailong-tts@*` 实例和 `nailong-tts-tunnel`；机器人会自动只保留文字回复。回退后端版本时，将 `/srv/nailong-tts/current` 切到已验证的旧发布目录，再重启两个实例。

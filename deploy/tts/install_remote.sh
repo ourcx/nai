@@ -55,6 +55,20 @@ PY
 fi
 chown root:nailong-tts /etc/nailong-tts.env
 chmod 0640 /etc/nailong-tts.env
+cat > /etc/nailong-tts-nailong.env <<'ENV'
+TTS_VOICE=nailong
+TTS_PORT=9880
+TTS_STATE_DIR=/var/lib/nailong-tts-nailong
+TTS_MAX_WAITING=0
+ENV
+cat > /etc/nailong-tts-naiwa.env <<'ENV'
+TTS_VOICE=naiwa
+TTS_PORT=9881
+TTS_STATE_DIR=/var/lib/nailong-tts-naiwa
+TTS_MAX_WAITING=0
+ENV
+chown root:nailong-tts /etc/nailong-tts-nailong.env /etc/nailong-tts-naiwa.env
+chmod 0640 /etc/nailong-tts-nailong.env /etc/nailong-tts-naiwa.env
 
 PREVIOUS="$(readlink "$SERVICE_ROOT/current" || true)"
 if [[ -e "$SERVICE_ROOT/current" && ! -L "$SERVICE_ROOT/current" ]]; then
@@ -63,10 +77,11 @@ if [[ -e "$SERVICE_ROOT/current" && ! -L "$SERVICE_ROOT/current" ]]; then
 fi
 ln -sfn "$RELEASE_TARGET" "$SERVICE_ROOT/current.next"
 mv -Tf "$SERVICE_ROOT/current.next" "$SERVICE_ROOT/current"
-install -m 0644 "$RELEASE_TARGET/nailong-tts.service" /etc/systemd/system/nailong-tts.service
+install -m 0644 "$RELEASE_TARGET/nailong-tts@.service" /etc/systemd/system/nailong-tts@.service
 systemctl daemon-reload
-systemctl enable nailong-tts.service
-systemctl restart nailong-tts.service
+systemctl disable --now nailong-tts.service 2>/dev/null || true
+systemctl enable nailong-tts@nailong.service nailong-tts@naiwa.service
+systemctl restart nailong-tts@nailong.service nailong-tts@naiwa.service
 
 if ! python3 - <<'PY'
 import json
@@ -74,8 +89,14 @@ import time
 from urllib.request import urlopen
 for _ in range(60):
     try:
-        with urlopen('http://127.0.0.1:9880/healthz', timeout=2) as response:
-            if json.load(response)['status'] == 'ok':
+        with (
+            urlopen('http://127.0.0.1:9880/healthz', timeout=2) as nailong,
+            urlopen('http://127.0.0.1:9881/healthz', timeout=2) as naiwa,
+        ):
+            if (
+                json.load(nailong).get('voice') == 'nailong'
+                and json.load(naiwa).get('voice') == 'naiwa'
+            ):
                 print('TTS health check passed')
                 raise SystemExit(0)
     except (OSError, ValueError, KeyError):
@@ -84,13 +105,14 @@ for _ in range(60):
 raise SystemExit(1)
 PY
 then
-  systemctl stop nailong-tts.service
+  systemctl stop nailong-tts@nailong.service nailong-tts@naiwa.service
   if [[ -n "$PREVIOUS" ]]; then
     ln -sfn "$PREVIOUS" "$SERVICE_ROOT/current.next"
     mv -Tf "$SERVICE_ROOT/current.next" "$SERVICE_ROOT/current"
-    systemctl start nailong-tts.service
+    systemctl start nailong-tts@nailong.service nailong-tts@naiwa.service
   fi
   echo 'TTS startup failed; inspect journalctl -u nailong-tts' >&2
   exit 1
 fi
-systemctl show nailong-tts.service -p ActiveState -p SubState -p MemoryCurrent -p MemoryPeak
+systemctl show nailong-tts@nailong.service nailong-tts@naiwa.service \
+  -p ActiveState -p SubState -p MemoryCurrent -p MemoryPeak

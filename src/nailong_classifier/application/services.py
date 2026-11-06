@@ -9,6 +9,9 @@ from typing import Any
 from ..integrations.speech import NailongSpeechClient, SpeechRequestLimiter
 from ..persistence.storage import BotStore
 from .chain_selector import ChainSelector
+from .dispatch import SpeechDispatcher
+from .inference_dispatch import InferenceDispatcher
+from .work_scheduler import WorkScheduler
 
 
 class SerializedPredictor:
@@ -46,8 +49,11 @@ class BackendServices:
     predictor: SerializedPredictor
     store: BotStore
     doubao_detector: SerializedPredictor | None = None
+    inference_dispatcher: InferenceDispatcher | None = None
+    work_scheduler: WorkScheduler | None = None
     catalog_sync_events: list[asyncio.Event] = field(default_factory=list)
     speech_client: NailongSpeechClient | None = None
+    speech_dispatcher: SpeechDispatcher | None = None
     speech_limiter: SpeechRequestLimiter = field(default_factory=SpeechRequestLimiter)
     chain_selector: ChainSelector | None = None
 

@@ -32,6 +32,7 @@ def create_app(
     *,
     token: str,
     release: str,
+    fixed_voice: str | None = None,
     max_waiting: int = 3,
     queue_timeout: float = 30,
     rate_limit: int = 12,
@@ -97,7 +98,8 @@ def create_app(
         return JSONResponse(
             {
                 "status": "ok",
-                "model": "nailong-naiwa-gpt-sovits-v2proplus",
+                "model": f"{fixed_voice or 'multi'}-gpt-sovits-v2proplus",
+                "voice": fixed_voice,
                 "release": release,
                 "busy": active,
                 "queued": len(waiting),
@@ -141,6 +143,8 @@ def create_app(
             return JSONResponse({"error": "invalid_seed"}, status_code=400)
         if voice not in {"nailong", "naiwa"}:
             return JSONResponse({"error": "invalid_voice"}, status_code=400)
+        if fixed_voice and voice != fixed_voice:
+            return JSONResponse({"error": "voice_unavailable"}, status_code=400)
         # 只有一个模型实例。一个执行位加有限等待位，队满时立即拒绝，不堆积任务。
         if len(waiting) + int(active) >= max_waiting + 1:
             return JSONResponse(
@@ -205,14 +209,16 @@ def main() -> None:
     from tts_engine import GptSoVitsEngine
 
     root = Path(os.environ["TTS_RELEASE_DIR"]).resolve()
+    voice = os.getenv("TTS_VOICE", "nailong")
     token = os.environ["TTS_API_TOKEN"]
     if len(token) < 32:
         raise ValueError("TTS_API_TOKEN must contain at least 32 characters")
-    engine = GptSoVitsEngine(root, Path(os.environ["TTS_STATE_DIR"]))
+    engine = GptSoVitsEngine(root, Path(os.environ["TTS_STATE_DIR"]), voice)
     app = create_app(
         engine.synthesize,
         token=token,
         release=engine.release_id,
+        fixed_voice=voice,
         max_waiting=int(os.getenv("TTS_MAX_WAITING", "3")),
         queue_timeout=float(os.getenv("TTS_QUEUE_TIMEOUT", "30")),
         rate_limit=int(os.getenv("TTS_RATE_LIMIT", "12")),

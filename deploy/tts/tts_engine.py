@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import gc
 import hashlib
 import io
 import json
@@ -14,7 +13,7 @@ from time import perf_counter
 
 
 class GptSoVitsEngine:
-    def __init__(self, root: Path, state_dir: Path) -> None:
+    def __init__(self, root: Path, state_dir: Path, voice: str = "nailong") -> None:
         import numpy as np
         import soundfile as sf
         import torch
@@ -48,7 +47,10 @@ class GptSoVitsEngine:
                 "reference_text": metadata["reference_text"],
             }
         }
-        initial = self.voices["nailong"]
+        if voice not in self.voices:
+            raise ValueError(f"Unknown voice: {voice}")
+        self.voice = voice
+        initial = self.voices[voice]
         config = TTS_Config(
             {
                 "custom": {
@@ -69,21 +71,17 @@ class GptSoVitsEngine:
         state_dir.mkdir(parents=True, exist_ok=True)
         config.configs_path = str(state_dir / "tts_infer.yaml")
         self.pipeline = TTS(config)
-        self.current_voice = "nailong"
         # 中文前端和声纹模型按需加载；先真实合成一次，再允许健康检查返回成功。
-        self.synthesize("我是奶龙。", 20261103, "nailong")
+        self.synthesize(
+            "我是奶蛙。" if voice == "naiwa" else "我是奶龙。",
+            20261103,
+            voice,
+        )
 
     def _activate_voice(self, voice: str) -> dict:
-        try:
-            selected = self.voices[voice]
-        except KeyError as error:
-            raise ValueError(f"Unknown voice: {voice}") from error
-        if voice != self.current_voice:
-            self.pipeline.init_t2s_weights(str(self.root / selected["gpt_weights"]))
-            self.pipeline.init_vits_weights(str(self.root / selected["sovits_weights"]))
-            self.current_voice = voice
-            gc.collect()
-        return selected
+        if voice != self.voice:
+            raise ValueError(f"This worker only serves voice: {self.voice}")
+        return self.voices[voice]
 
     def synthesize(self, text: str, seed: int, voice: str = "nailong") -> tuple[bytes, float, float]:
         started = perf_counter()

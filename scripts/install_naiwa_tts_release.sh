@@ -14,6 +14,7 @@ test -f "$ASSET_DIR/base-model/v2Pro/s2Gv2ProPlus.pth"
 test -f "$ASSET_DIR/naiwa-reference.wav"
 test -f "$CODE_DIR/service.py"
 test -f "$CODE_DIR/tts_engine.py"
+test -f "$CODE_DIR/nailong-tts@.service"
 
 TMP="$(mktemp -d "$ROOT/releases/.installing.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -21,6 +22,7 @@ cp -al "$ROOT/current/." "$TMP/"
 rm -f "$TMP/service.py" "$TMP/tts_engine.py" "$TMP/SHA256SUMS"
 install -m 0640 "$CODE_DIR/service.py" "$TMP/service.py"
 install -m 0640 "$CODE_DIR/tts_engine.py" "$TMP/tts_engine.py"
+install -m 0644 "$CODE_DIR/nailong-tts@.service" "$TMP/nailong-tts@.service"
 install -m 0640 "$ASSET_DIR/base-model/s1v3.ckpt" "$TMP/weights/s1v3.ckpt"
 install -m 0640 \
   "$ASSET_DIR/base-model/v2Pro/s2Gv2ProPlus.pth" \
@@ -84,10 +86,29 @@ trap - EXIT
 PREVIOUS="$(readlink "$ROOT/current")"
 ln -sfn "$FINAL" "$ROOT/current.next"
 mv -Tf "$ROOT/current.next" "$ROOT/current"
-systemctl restart nailong-tts
+install -m 0644 "$FINAL/nailong-tts@.service" /etc/systemd/system/nailong-tts@.service
+cat > /etc/nailong-tts-nailong.env <<'ENV'
+TTS_VOICE=nailong
+TTS_PORT=9880
+TTS_STATE_DIR=/var/lib/nailong-tts-nailong
+TTS_MAX_WAITING=0
+ENV
+cat > /etc/nailong-tts-naiwa.env <<'ENV'
+TTS_VOICE=naiwa
+TTS_PORT=9881
+TTS_STATE_DIR=/var/lib/nailong-tts-naiwa
+TTS_MAX_WAITING=0
+ENV
+chown root:nailong-tts /etc/nailong-tts-nailong.env /etc/nailong-tts-naiwa.env
+chmod 0640 /etc/nailong-tts-nailong.env /etc/nailong-tts-naiwa.env
+systemctl daemon-reload
+systemctl disable --now nailong-tts.service 2>/dev/null || true
+systemctl enable nailong-tts@nailong.service nailong-tts@naiwa.service
+systemctl restart nailong-tts@nailong.service nailong-tts@naiwa.service
 
 for _ in $(seq 1 90); do
-  if curl -fsS http://127.0.0.1:9880/healthz; then
+  if curl -fsS http://127.0.0.1:9880/healthz \
+    && curl -fsS http://127.0.0.1:9881/healthz; then
     exit 0
   fi
   sleep 2
@@ -95,5 +116,5 @@ done
 
 ln -sfn "$PREVIOUS" "$ROOT/current.next"
 mv -Tf "$ROOT/current.next" "$ROOT/current"
-systemctl restart nailong-tts
+systemctl restart nailong-tts@nailong.service nailong-tts@naiwa.service
 exit 1
