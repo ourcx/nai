@@ -57,6 +57,7 @@ python3 -m venv "$REMOTE_DIR/.venv"
 "$REMOTE_DIR/.venv/bin/python" -m pip install \
   lark-channel-sdk \
   "httpx>=0.27,<1" \
+  "yt-dlp>=2025.1" \
   "websockets>=15,<16" \
   Pillow \
   "starlette>=0.48,<1" \

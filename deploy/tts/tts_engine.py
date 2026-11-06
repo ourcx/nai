@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import hashlib
 import io
 import json
@@ -38,14 +39,24 @@ class GptSoVitsEngine:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from TTS_infer_pack.TTS import TTS, TTS_Config
 
+        self.root = root
+        self.voices = metadata.get("voices") or {
+            "nailong": {
+                "gpt_weights": "weights/NaiLong-e16.ckpt",
+                "sovits_weights": "weights/NaiLong_e14_s504.pth",
+                "reference": "reference.wav",
+                "reference_text": metadata["reference_text"],
+            }
+        }
+        initial = self.voices["nailong"]
         config = TTS_Config(
             {
                 "custom": {
                     "device": "cpu",
                     "is_half": False,
                     "version": "v2ProPlus",
-                    "t2s_weights_path": str(root / "weights/NaiLong-e16.ckpt"),
-                    "vits_weights_path": str(root / "weights/NaiLong_e14_s504.pth"),
+                    "t2s_weights_path": str(root / initial["gpt_weights"]),
+                    "vits_weights_path": str(root / initial["sovits_weights"]),
                     "bert_base_path": str(
                         upstream / "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
                     ),
@@ -58,13 +69,25 @@ class GptSoVitsEngine:
         state_dir.mkdir(parents=True, exist_ok=True)
         config.configs_path = str(state_dir / "tts_infer.yaml")
         self.pipeline = TTS(config)
-        self.reference = str(root / "reference.wav")
-        self.reference_text = metadata["reference_text"]
+        self.current_voice = "nailong"
         # 中文前端和声纹模型按需加载；先真实合成一次，再允许健康检查返回成功。
-        self.synthesize("我是奶龙。", 20261103)
+        self.synthesize("我是奶龙。", 20261103, "nailong")
 
-    def synthesize(self, text: str, seed: int) -> tuple[bytes, float, float]:
+    def _activate_voice(self, voice: str) -> dict:
+        try:
+            selected = self.voices[voice]
+        except KeyError as error:
+            raise ValueError(f"Unknown voice: {voice}") from error
+        if voice != self.current_voice:
+            self.pipeline.init_t2s_weights(str(self.root / selected["gpt_weights"]))
+            self.pipeline.init_vits_weights(str(self.root / selected["sovits_weights"]))
+            self.current_voice = voice
+            gc.collect()
+        return selected
+
+    def synthesize(self, text: str, seed: int, voice: str = "nailong") -> tuple[bytes, float, float]:
         started = perf_counter()
+        selected = self._activate_voice(voice)
         # 上游会打印目标台词；服务运行时不把用户输入写入日志。
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             pieces = list(
@@ -72,9 +95,9 @@ class GptSoVitsEngine:
                     {
                         "text": text,
                         "text_lang": "all_zh",
-                        "ref_audio_path": self.reference,
+                        "ref_audio_path": str(self.root / selected["reference"]),
                         "prompt_lang": "all_zh",
-                        "prompt_text": self.reference_text,
+                        "prompt_text": selected["reference_text"],
                         "top_k": 5,
                         "top_p": 1.0,
                         "temperature": 1.0,

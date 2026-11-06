@@ -79,7 +79,7 @@ def _worker(connection, scope: IdentityScope, credentials: dict[str, str]) -> No
                     result = await getattr(documents[key], operation)(*parameters, **kwargs)
                 else:
                     if method not in {
-                        "connect", "resolve", "get_chat_members", "send",
+                        "connect", "resolve", "get_chat_members", "get_recent_stickers", "send",
                         "resolve_image_target", "download_target", "update_card", "close",
                     }:
                         raise ValueError("Unsupported adapter operation")
@@ -241,6 +241,9 @@ class ProcessFeishuAdapter:
 
     async def get_chat_members(self, chat_id: str):
         return await self._rpc("get_chat_members", chat_id)
+
+    async def get_recent_stickers(self, chat_id: str):
+        return await self._rpc("get_recent_stickers", chat_id)
 
     async def resolve_image_target(self, message: Message):
         return await self._rpc("resolve_image_target", message)

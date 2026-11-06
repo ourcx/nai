@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import io
 import itertools
 import json
@@ -26,6 +27,7 @@ from .base import (
     IdentityScope,
     ImageTarget,
     Member,
+    HistoricalSticker,
     Mention,
     Message,
     Resource,
@@ -39,6 +41,38 @@ MAX_AUDIO_BYTES = 8 * 1024 * 1024
 MESSAGE_CACHE_SIZE = 1024
 GROUP_AND_C2C_INTENTS = 33_554_432
 MESSAGE_EVENTS = {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"}
+EMOJI_PATTERN = re.compile(
+    r"[0-9#*]\ufe0f?\u20e3|"
+    r"[\U0001f000-\U0001faff\u2600-\u27bf\u200d\ufe0e\ufe0f\U000e0020-\U000e007f]"
+)
+
+
+def qq_plain_text(text: str) -> str:
+    """QQ 文案不带 emoji；稀有度星形改成文字，避免评级随清理一起消失。"""
+    text = re.sub(r"[★☆]+", lambda match: f"{match[0].count('★')} 星", str(text))
+    return "\n".join(EMOJI_PATTERN.sub("", line).strip() for line in text.splitlines()).strip()
+
+
+def qq_markdown(text: str) -> str:
+    """只对机器人输出加排版；昵称、台词和其它正文都按字面转义。"""
+    def escape(value: str) -> str:
+        return re.sub(r"([\\`*_{}\[\]()#~|>])", r"\\\1", html.escape(value, quote=False))
+
+    lines = text.splitlines()
+    result = [f"# {escape(lines[0])}"]
+    sections = {"奶名与奶家人", "每日抽签与收藏", "识图与接奶", "群聊小游戏", "奶系创作", "群聊设置"}
+    for line in lines[1:]:
+        if not line:
+            continue
+        if line in sections:
+            result.append(f"## {escape(line)}")
+            continue
+        match = re.match(r"^([\u3400-\u9fffA-Za-z0-9 ]{1,12}[：:])(?!//)(.*)$", line)
+        if match:
+            result.append(f"**{escape(match[1])}** {escape(match[2])}")
+        else:
+            result.append(escape(line))
+    return "\n\n".join(result)
 
 
 class QQAPIError(RuntimeError):
@@ -65,6 +99,9 @@ class QQAdapter:
         app_secret: str,
         allow_proactive: bool = False,
         sandbox: bool = False,
+        markdown_enabled: bool = True,
+        keyboard_template_id: str = "",
+        custom_keyboard_enabled: bool = False,
     ) -> None:
         if not app_id.isdigit() or not app_secret:
             raise ValueError("QQ requires a numeric AppID and an AppSecret")
@@ -72,6 +109,9 @@ class QQAdapter:
         self.app_id = app_id
         self._app_secret = app_secret
         self.allow_proactive = allow_proactive
+        self.markdown_enabled = markdown_enabled
+        self.keyboard_template_id = keyboard_template_id
+        self.custom_keyboard_enabled = custom_keyboard_enabled
         domain = "sandbox.api.sgroup.qq.com" if sandbox else "api.bot.qq.com"
         self._api = httpx.AsyncClient(base_url=f"https://{domain}/", timeout=20)
         self._auth = httpx.AsyncClient(base_url="https://api.bot.qq.com/", timeout=20)
@@ -463,6 +503,9 @@ class QQAdapter:
         # 官方群机器人不提供普通群成员列表，也不投递普通成员入群通知。
         return []
 
+    async def get_recent_stickers(self, chat_id: str) -> list[HistoricalSticker]:
+        return []
+
     async def resolve_image_target(self, message: Message) -> ImageTarget:
         if message.resources:
             resource = message.resources[0]
@@ -581,6 +624,65 @@ class QQAdapter:
             return {}
         raise NotImplementedError("QQ needs a recent trigger or enabled group proactive messages")
 
+    def _keyboard(self, text: str) -> dict[str, Any] | None:
+        if self.keyboard_template_id:
+            return {"id": self.keyboard_template_id}
+        if not self.custom_keyboard_enabled:
+            return None
+        if text.startswith(("今日奶运", "奶签回看", "奶签收藏册", "奶签历史")):
+            commands = (("今日奶运", "奶签收藏册"), ("奶签历史", "帮助"))
+            page = re.search(r"第 (\d+)/(\d+) 页", text)
+            if page:
+                current, pages = map(int, page.groups())
+                navigation = []
+                if current > 1:
+                    navigation.append(f"奶签历史 {int(Decimal(current) - Decimal(1))}")
+                if current < pages:
+                    navigation.append(f"奶签历史 {int(Decimal(current) + Decimal(1))}")
+                if navigation:
+                    commands = (*commands, tuple(navigation))
+            recent_day = re.search(r"(?m)^(\d{4}-\d{2}-\d{2})  ", text)
+            if recent_day:
+                commands = (*commands, (f"奶签详情 {recent_day[1]}",))
+        elif "抢答" in text and "猜图" in text:
+            commands = (("奶龙", "奶蛙", "其他"), ("公布答案", "猜图榜"))
+        else:
+            commands = (("今日奶运", "奶签收藏册"), ("猜图", "奶龙图鉴"), ("帮助",))
+        return {"content": {"rows": [
+            {"buttons": [
+                {
+                    "id": f"command-{row_index}-{column_index}",
+                    "render_data": {"label": command, "visited_label": command, "style": 1},
+                    # 指令按钮让客户端发送现有命令，无需另外接按钮回调服务。
+                    "action": {
+                        "type": 2, "permission": {"type": 2}, "data": command,
+                        "enter": True, "reply": False,
+                        "unsupport_tips": f"请发送「{command}」",
+                    },
+                }
+                for column_index, command in enumerate(row)
+            ]}
+            for row_index, row in enumerate(commands)
+        ]}}
+
+    async def _send_payload(self, route: str, payload: dict[str, Any], text: str):
+        """仅在平台明确拒绝样式时降级；超时或未知结果不重发，避免双回复。"""
+        try:
+            return await self._call("POST", f"{route}/messages", json=payload)
+        except QQAPIError as error:
+            if payload["msg_type"] != 2 or error.status not in {400, 403, 422}:
+                raise
+        if "keyboard" in payload:
+            payload.pop("keyboard")
+            try:
+                return await self._call("POST", f"{route}/messages", json=payload)
+            except QQAPIError as error:
+                if error.status not in {400, 403, 422}:
+                    raise
+        payload.pop("markdown", None)
+        payload.update(msg_type=0, content=text)
+        return await self._call("POST", f"{route}/messages", json=payload)
+
     async def send(
         self, chat_id: str, content: dict[str, Any], options: dict[str, Any] | None = None
     ) -> SendResult:
@@ -622,11 +724,21 @@ class QQAdapter:
                 )
                 payload.update(msg_type=7, media={"file_info": file["file_info"]})
                 uploading = False
+            text = qq_plain_text(text)
             if text:
                 payload["content"] = text
             if not text and source is None:
                 raise NotImplementedError("QQ needs text, an image, or voice")
-            result = await self._call("POST", f"{route}/messages", json=payload)
+            # 图片和语音维持富媒体协议；多行文字与卡片在 QQ 使用自定义 Markdown。
+            if source is None and text and self.markdown_enabled and (
+                "card" in content or "\n" in text
+            ):
+                payload.pop("content", None)
+                payload.update(msg_type=2, markdown={"content": qq_markdown(text)})
+                keyboard = self._keyboard(text)
+                if keyboard:
+                    payload["keyboard"] = keyboard
+            result = await self._send_payload(route, payload, text)
             message_id = self._message_key(f"{kind}:{raw_id}", str(result["id"]))
             resources = ()
             if source is not None:

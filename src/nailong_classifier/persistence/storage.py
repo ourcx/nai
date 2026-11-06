@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import secrets
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from PIL import Image
 
+from ..domain.milk_fortune import (
+    FORTUNE_SETS,
+    FortuneCollection,
+    FortuneEntry,
+    MilkFortune,
+    make_milk_fortune,
+)
 from ..domain.rarity import Rarity, classify_rarity
 from ..imaging.image_fingerprint import try_content_hash
 
@@ -43,6 +51,14 @@ class AssetRecord:
     origin: str
     # 首次入典时记下的发图者昵称；老库存量图或拿不到名字时为 None，图鉴不显示「首发」行。
     discoverer_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ChainCandidate:
+    asset: AssetRecord
+    fingerprint: str | None
+    weird: bool = False
+    feature: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -158,13 +174,32 @@ class MilkFamilyMember:
 
 @dataclass(frozen=True)
 class MilkName:
-    """首次原昵称与最新奶名；日常改昵称和服务重启不改名，明确求赐名才更新。"""
+    """首次原昵称与最新奶名；日常改昵称和重启不改名，求赐名或取奶名才更新。"""
 
     original_name: str
     milk_name: str
     assigned_at: str
     # 兜底称呼不算真实原昵称；之后得到真实昵称可补全对应关系，不改已赐奶名。
     original_name_known: bool = True
+
+
+class MilkNameTakenError(ValueError):
+    """自选奶名已被当前或历史记录占用，调用方提示换名，不自动补后缀。"""
+
+    def __init__(self, milk_name: str) -> None:
+        super().__init__(f"「{milk_name}」这个奶名已经被用过啦，换一个吧。")
+
+
+class MilkNameCooldownError(ValueError):
+    """自选奶名的七天额度尚未恢复；随机求赐名不使用这份额度。"""
+
+    def __init__(self, available_at: datetime) -> None:
+        self.available_at = available_at
+        super().__init__(
+            "一周只能取一次奶名，"
+            f"下次可在 {available_at.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）取名。\n"
+            "想随机换个奶名，可以发送「求赐名」，不限次数。"
+        )
 
 
 class BotStore:
@@ -178,6 +213,77 @@ class BotStore:
     @staticmethod
     def identity_hash(value: str) -> str:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def draw_milk_fortune(self, *, chat_id: str, sender_id: str, day: str) -> MilkFortune:
+        if not sender_id:
+            raise ValueError("A fortune requires a known sender")
+        day = date.fromisoformat(day).isoformat()
+        identity = (self.identity_hash(chat_id), self.identity_hash(sender_id), day)
+        fortune = make_milk_fortune(chat_id=chat_id, sender_id=sender_id, day=day)
+        with self._connect() as connection:
+            # 主键冲突时保留首次快照，并发请求返回同一条已经落库的签。
+            connection.execute(
+                "INSERT OR IGNORE INTO milk_fortunes "
+                "(chat_hash, sender_hash, fortune_day, payload_version, payload) "
+                "VALUES (?, ?, ?, 3, ?)",
+                (*identity, json.dumps(asdict(fortune), ensure_ascii=False)),
+            )
+            row = connection.execute(
+                "SELECT payload FROM milk_fortunes "
+                "WHERE chat_hash = ? AND sender_hash = ? AND fortune_day = ?",
+                identity,
+            ).fetchone()
+        return MilkFortune(**json.loads(row["payload"]))
+
+    def milk_fortune_on(self, *, chat_id: str, sender_id: str, day: str) -> MilkFortune | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM milk_fortunes "
+                "WHERE chat_hash = ? AND sender_hash = ? AND fortune_day = ?",
+                (self.identity_hash(chat_id), self.identity_hash(sender_id), day),
+            ).fetchone()
+        return MilkFortune(**json.loads(row["payload"])) if row else None
+
+    def milk_fortune_collection(
+        self, *, chat_id: str, sender_id: str, today: str, page: int = 1,
+    ) -> FortuneCollection:
+        if not 1 <= page <= 10000:
+            raise ValueError("Fortune page must be between 1 and 10000")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT fortune_day, payload FROM milk_fortunes "
+                "WHERE chat_hash = ? AND sender_hash = ? ORDER BY fortune_day DESC",
+                (self.identity_hash(chat_id), self.identity_hash(sender_id)),
+            ).fetchall()
+        entries = tuple(
+            FortuneEntry(row["fortune_day"], MilkFortune(**json.loads(row["payload"])))
+            for row in rows
+        )
+        faces = frozenset(entry.fortune.face for entry in entries if entry.fortune.face)
+        days = sorted(date.fromisoformat(entry.day) for entry in entries)
+        run = longest = 0
+        previous = None
+        for current in days:
+            run = (
+                int(Decimal(run) + Decimal(1))
+                if previous and current == previous + timedelta(days=1) else 1
+            )
+            longest = max(longest, run)
+            previous = current
+        # 今天还没抽时保留昨天结束的连签；断了一整天后才归零。
+        streak = run if days and (date.fromisoformat(today) - days[-1]).days in {0, 1} else 0
+        pages = max(1, int((Decimal(len(entries)) / Decimal(6)).to_integral_value(
+            rounding="ROUND_CEILING"
+        )))
+        start = int((Decimal(page) - Decimal(1)) * Decimal(6))
+        stop = int(Decimal(start) + Decimal(6))
+        return FortuneCollection(
+            total=len(entries), faces=faces, streak=streak, longest_streak=longest,
+            entries=entries[start:stop], page=page, pages=pages,
+            completed_sets=tuple(
+                name for name, required in FORTUNE_SETS.items() if set(required) <= faces
+            ),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10)
@@ -260,6 +366,17 @@ class BotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_chain_replies_rotation
                 ON chain_replies(chat_hash, label, asset_id, sent_at);
+
+                -- 特征与人工怪图标签独立保存，不改变分类器的奶龙/奶蛙标签。
+                CREATE TABLE IF NOT EXISTS chain_features (
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    model_id TEXT NOT NULL,
+                    feature BLOB NOT NULL,
+                    PRIMARY KEY (asset_id, model_id)
+                );
+                CREATE TABLE IF NOT EXISTS weird_assets (
+                    asset_id INTEGER PRIMARY KEY REFERENCES assets(id)
+                );
 
                 -- 自动推送抖音链接：发送前先占位，保证并发消息和服务重启后仍按群限制滚动窗口次数。
                 CREATE TABLE IF NOT EXISTS video_link_pushes (
@@ -344,6 +461,18 @@ class BotStore:
                     original_name_known INTEGER NOT NULL DEFAULT 1
                 );
 
+                -- 已赐过的名字永久占位；换名后旧名仍不能重新分给自己或其他人。
+                -- 只存名字，不额外保存用户标识或历史原昵称。
+                CREATE TABLE IF NOT EXISTS milk_name_reservations (
+                    milk_name TEXT PRIMARY KEY
+                );
+
+                -- 仅记录主动“取奶名”成功的时间；随机求赐名不消耗或重置七天额度。
+                CREATE TABLE IF NOT EXISTS milk_name_custom_cooldowns (
+                    user_hash TEXT PRIMARY KEY REFERENCES milk_names(user_hash),
+                    changed_at TEXT NOT NULL
+                );
+
                 -- 入群事件会重投，同一个人在同一个群只起一次奶名。
                 CREATE TABLE IF NOT EXISTS milk_name_welcomes (
                     chat_hash TEXT NOT NULL,
@@ -357,6 +486,17 @@ class BotStore:
                     chat_hash TEXT PRIMARY KEY REFERENCES chat_targets(chat_hash),
                     proactive_enabled INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
+                );
+
+                -- 每人每群每天只存首次签文；以后改文案或算法不改已收藏的历史。
+                -- 身份使用适配层隔离后的哈希，不保存原始用户或群标识。
+                CREATE TABLE IF NOT EXISTS milk_fortunes (
+                    chat_hash TEXT NOT NULL,
+                    sender_hash TEXT NOT NULL,
+                    fortune_day TEXT NOT NULL,
+                    payload_version INTEGER NOT NULL DEFAULT 1,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (chat_hash, sender_hash, fortune_day)
                 );
                 """
             )
@@ -432,6 +572,12 @@ class BotStore:
                 )
                 """
             )
+            # 首次升级只能补回当前仍在库里的名字；旧版本覆盖掉的名字无从恢复。
+            # 先占位再处理旧重复记录，修复产生的新名字也在同一写锁内占位。
+            connection.execute(
+                "INSERT OR IGNORE INTO milk_name_reservations (milk_name) "
+                "SELECT milk_name FROM milk_names"
+            )
             duplicates = connection.execute(
                 """
                 SELECT user_hash, milk_name FROM milk_names
@@ -453,6 +599,10 @@ class BotStore:
                 connection.execute(
                     "UPDATE milk_names SET milk_name = ? WHERE user_hash = ?",
                     (unique_name, row["user_hash"]),
+                )
+                connection.execute(
+                    "INSERT INTO milk_name_reservations (milk_name) VALUES (?)",
+                    (unique_name,),
                 )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_milk_names_unique ON milk_names(milk_name)"
@@ -531,6 +681,7 @@ class BotStore:
         confidence: float,
         accepted: bool,
         discoverer_name: str | None = None,
+        promote_seed: bool = False,
     ) -> ObservationRecord:
         self._validate_label(predicted_label)
         now = datetime.now(LOCAL_TIMEZONE)
@@ -602,7 +753,9 @@ class BotStore:
                         WHEN assets.phash IS NULL OR assets.phash = ''
                         THEN excluded.phash
                         ELSE assets.phash
-                    END
+                    END,
+                    -- 用户分享链接收录的图即使原来属于种子库，也要进入文档同步队列。
+                    origin = CASE WHEN ? THEN 'collected' ELSE assets.origin END
                 """,
                 (
                     digest,
@@ -615,6 +768,7 @@ class BotStore:
                     phash,
                     sender_hash,
                     discoverer_name,
+                    int(promote_seed),
                 ),
             )
             asset_row = connection.execute(
@@ -961,10 +1115,12 @@ class BotStore:
         connection: sqlite3.Connection, *, candidates: Iterable[str],
         fallback_name: str, previous_name: str | None = None,
     ) -> str:
-        """在已持有的数据库写锁内查重；词库被占满时追加随机短标记继续查重。"""
+        """在写锁内排除当前和已退役奶名；词库耗尽时短标记兜底也必须查重。"""
         def available(name: str) -> bool:
             return bool(name) and name != previous_name and connection.execute(
-                "SELECT 1 FROM milk_names WHERE milk_name = ?", (name,)
+                "SELECT 1 FROM milk_name_reservations WHERE milk_name = ? "
+                "UNION ALL SELECT 1 FROM milk_names WHERE milk_name = ? LIMIT 1",
+                (name, name),
             ).fetchone() is None
 
         for candidate in candidates:
@@ -983,38 +1139,77 @@ class BotStore:
         name_options: Callable[[str], Iterable[str]] | None = None,
         original_name_known: bool = True,
         replace_existing: bool = True,
+        exact_name: bool = False,
+        weekly_limit: bool = False,
     ) -> MilkName:
         """原子登记奶名；入群欢迎也随机生成，但 replace_existing=False 保留已有名。
 
         取得写锁后才读取旧名、生成候选并排除旧名，避免同时求名读到同一旧值。
         候选函数使用库中首次原昵称，昵称改变或并发首授也不会让主体发生漂移。
-        所有用户共用同一奶名空间，候选被占用时重抽，数据库唯一索引再兜底。
+        所有用户共用同一奶名空间，候选与已赐历史撞名时重抽，唯一约束再兜底。
         返回本次实际保存的映射，之后入群欢迎不会覆盖主动更换过的名字。
+        exact_name 用于自选奶名：撞名直接拒绝并回滚，重复提交本人当前名字则保留。
+        weekly_limit 仅由“取奶名”启用：每七天成功一次，失败或同名确认不消耗额度。
         """
         original_name, milk_name = original_name.strip(), milk_name.strip()
         if not user_id or not original_name or not milk_name:
             raise ValueError("User identity, original name and milk name must not be empty")
+        if exact_name:
+            if name_options is not None:
+                raise ValueError("An exact milk name cannot have random candidates")
+            if not milk_name.isprintable():
+                raise ValueError("奶名请写在一行里，不要包含换行或控制字符。")
         digest = self.identity_hash(user_id)
-        now = datetime.now(LOCAL_TIMEZONE).isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = datetime.now(LOCAL_TIMEZONE).isoformat()
             if original_name_known:
                 self._fill_original_name(connection, digest, original_name)
             existing = connection.execute(
                 "SELECT original_name, milk_name FROM milk_names WHERE user_hash = ?",
                 (digest,),
             ).fetchone()
-            should_replace = name_options is not None and replace_existing
+            should_replace = replace_existing and (
+                name_options is not None
+                or (exact_name and existing is not None and existing["milk_name"] != milk_name)
+            )
             if existing is None or should_replace:
-                candidates = (
-                    name_options(existing["original_name"] if existing else original_name)
-                    if name_options is not None else (milk_name,)
-                )
-                milk_name = self._available_milk_name(
-                    connection,
-                    candidates=candidates,
-                    fallback_name=milk_name,
-                    previous_name=existing["milk_name"] if existing else None,
+                if weekly_limit:
+                    cooldown = connection.execute(
+                        "SELECT changed_at FROM milk_name_custom_cooldowns WHERE user_hash = ?",
+                        (digest,),
+                    ).fetchone()
+                    if cooldown is not None:
+                        available_at = (
+                            datetime.fromisoformat(cooldown["changed_at"]) + timedelta(days=7)
+                        )
+                        if datetime.fromisoformat(now) < available_at:
+                            raise MilkNameCooldownError(available_at)
+                if exact_name:
+                    # 查重与占位都在写锁内完成；两人同时取同名只能有一人成功。
+                    # 自选名字必须原样保存，不能走随机名的重抽或后缀兜底。
+                    taken = connection.execute(
+                        "SELECT 1 FROM milk_name_reservations WHERE milk_name = ? "
+                        "UNION ALL SELECT 1 FROM milk_names WHERE milk_name = ? LIMIT 1",
+                        (milk_name, milk_name),
+                    ).fetchone()
+                    if taken is not None:
+                        raise MilkNameTakenError(milk_name)
+                else:
+                    candidates = (
+                        name_options(existing["original_name"] if existing else original_name)
+                        if name_options is not None else (milk_name,)
+                    )
+                    milk_name = self._available_milk_name(
+                        connection,
+                        candidates=candidates,
+                        fallback_name=milk_name,
+                        previous_name=existing["milk_name"] if existing else None,
+                    )
+                # 占位与更新映射一起提交；中途失败会同时回滚，不会白白耗掉候选。
+                connection.execute(
+                    "INSERT INTO milk_name_reservations (milk_name) VALUES (?)",
+                    (milk_name,),
                 )
             connection.execute(
                 """
@@ -1041,6 +1236,13 @@ class BotStore:
                 connection.execute(
                     "UPDATE milk_names SET milk_name = ?, assigned_at = ? WHERE user_hash = ?",
                     (milk_name, now, digest),
+                )
+            if weekly_limit and (existing is None or should_replace):
+                # 限额、占名、改名一起提交；撞名或写入失败会全部回滚。
+                connection.execute(
+                    "INSERT INTO milk_name_custom_cooldowns (user_hash, changed_at) VALUES (?, ?) "
+                    "ON CONFLICT(user_hash) DO UPDATE SET changed_at = excluded.changed_at",
+                    (digest, now),
                 )
             row = connection.execute(
                 "SELECT * FROM milk_names WHERE user_hash = ?",
@@ -1233,6 +1435,100 @@ class BotStore:
                 ).fetchone()
         return self._asset_from_row(row) if row else None
 
+    def chain_candidates(self, label: str, model_id: str) -> list[ChainCandidate]:
+        """接龙保持同角色，特征尚未算好的图仍可参加随机和怪图分支。"""
+        self._validate_label(label)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT assets.*, chain_features.feature, weird_assets.asset_id AS weird_id
+                FROM assets
+                LEFT JOIN chain_features
+                  ON chain_features.asset_id = assets.id AND chain_features.model_id = ?
+                LEFT JOIN weird_assets ON weird_assets.asset_id = assets.id
+                WHERE assets.label = ?
+                """,
+                (model_id, label),
+            ).fetchall()
+        return [
+            ChainCandidate(
+                self._asset_from_row(row), row["phash"],
+                row["weird_id"] is not None, row["feature"],
+            )
+            for row in rows
+        ]
+
+    def recent_chain_assets(self, chat_id: str) -> list[ChainCandidate]:
+        """排除本群一天内最近二十张已发图，也排除它们的压缩/缩放版本。"""
+        cutoff = (datetime.now(LOCAL_TIMEZONE) - timedelta(days=1)).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT assets.*
+                FROM chain_replies JOIN assets ON assets.id = chain_replies.asset_id
+                WHERE chain_replies.chat_hash = ? AND chain_replies.sent_at >= ?
+                ORDER BY chain_replies.sent_at DESC, chain_replies.id DESC LIMIT 20
+                """,
+                (self.identity_hash(chat_id), cutoff),
+            ).fetchall()
+        return [
+            ChainCandidate(self._asset_from_row(row), row["phash"])
+            for row in rows
+        ]
+
+    def unindexed_chain_assets(self, model_id: str) -> list[AssetRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT assets.* FROM assets
+                LEFT JOIN chain_features
+                  ON chain_features.asset_id = assets.id AND chain_features.model_id = ?
+                WHERE assets.label IN ('nailong', 'naiwa') AND chain_features.asset_id IS NULL
+                ORDER BY assets.id DESC
+                """,
+                (model_id,),
+            ).fetchall()
+        return [self._asset_from_row(row) for row in rows]
+
+    def save_chain_feature(self, asset_id: int, model_id: str, feature: bytes) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO chain_features (asset_id, model_id, feature) "
+                "VALUES (?, ?, ?)",
+                (asset_id, model_id, feature),
+            )
+
+    def set_weird_asset(self, asset_id: int, weird: bool) -> None:
+        with self._connect() as connection:
+            if weird:
+                connection.execute(
+                    "INSERT OR IGNORE INTO weird_assets (asset_id) VALUES (?)", (asset_id,)
+                )
+            else:
+                connection.execute("DELETE FROM weird_assets WHERE asset_id = ?", (asset_id,))
+
+    def mark_weird_reference(self, reference_id: str, weird: bool) -> AssetRecord | None:
+        """回复机器人发图时标记实际发出的图，不能误标当时收到的原图。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT assets.* FROM chain_replies "
+                "JOIN assets ON assets.id = chain_replies.asset_id "
+                "WHERE chain_replies.response_message_id = ?",
+                (reference_id,),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    "SELECT assets.* FROM observations "
+                    "JOIN assets ON assets.id = observations.asset_id "
+                    "WHERE observations.source_message_id = ? OR observations.response_message_id = ?",
+                    (reference_id, reference_id),
+                ).fetchone()
+        if row is None or row["label"] not in {"nailong", "naiwa"}:
+            return None
+        asset = self._asset_from_row(row)
+        self.set_weird_asset(asset.id, weird)
+        return asset
+
     def record_chain_reply(
         self,
         *,
@@ -1245,7 +1541,7 @@ class BotStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO chain_replies (
+                INSERT OR IGNORE INTO chain_replies (
                     chat_hash, label, asset_id, response_message_id, sent_at
                 )
                 VALUES (?, ?, ?, ?, ?)

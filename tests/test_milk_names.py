@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from itertools import product
+from datetime import datetime, timedelta
+from itertools import cycle, product
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +20,19 @@ from nailong_classifier.adapters.base import (
     SendResult,
 )
 from nailong_classifier.application.services import BackendServices, SerializedPredictor
-from nailong_classifier.persistence.storage import BotStore
+from nailong_classifier.domain.milk_name_words import (
+    MILK_NAME_ANIMALS,
+    MILK_NAME_MAX_LENGTH,
+    MILK_NAME_SHORT_NAMES,
+    MILK_NAME_SUFFIXES,
+    MILK_NAME_VARIANTS,
+)
+from nailong_classifier.persistence.storage import (
+    LOCAL_TIMEZONE,
+    BotStore,
+    MilkNameCooldownError,
+    MilkNameTakenError,
+)
 
 
 def test_milk_name_survives_restart_and_nickname_changes_without_storing_raw_identity(tmp_path):
@@ -62,6 +75,7 @@ def exercise_names(
     tmp_path, monkeypatch, *, platform="feishu", chat_type="group", mentioned=True,
     nickname="王小明", lookup="李雷", welcome=False, send_outcomes=(True,),
     friend=False, quiet=False, real_words=False,
+    commands=("求赐名", " 求 赐名 "), taken_names=(),
 ):
     scope = IdentityScope(platform, "name-test")
     # 路由与持久化测试固定名字主体；随机位置由独立生成器测试覆盖。
@@ -78,9 +92,14 @@ def exercise_names(
             lambda name: (
                 f"奶蛙最爱的 {bot.make_milk_name(name)}",
                 f"最奶的 {bot.make_milk_name(name)}",
+                f"奶龙鸡腿护卫 {bot.make_milk_name(name)}",
             ),
         )
     store = BotStore(tmp_path)
+    for index, name in enumerate(taken_names):
+        store.assign_milk_name(
+            scope.key("user", f"other-{index}"), original_name="李雷", milk_name=name,
+        )
     sent, lookups = [], []
     user_id = scope.key("user", "sender")
     if quiet:
@@ -118,7 +137,7 @@ def exercise_names(
                     scope.key("chat", "welcome-chat"),
                     (Member(user_id, "王小明"),),
                 ))
-            for index in range(2):
+            for index, command in enumerate(commands):
                 current_nickname = nickname[index] if isinstance(nickname, tuple) else nickname
                 await self.handlers["message"](Message(
                     message_id=scope.key("message", f"request-{index}"),
@@ -127,7 +146,7 @@ def exercise_names(
                     sender_id=user_id,
                     sender_name=current_nickname,
                     mentioned_bot=mentioned,
-                    body_text="求赐名" if index == 0 else " 求 赐名 ",
+                    body_text=command,
                     mentions=(Mention(scope.key("user", "friend"), "李雷"),) if friend else (),
                 ))
 
@@ -179,6 +198,227 @@ def test_group_without_mention_does_not_grant_name(tmp_path, monkeypatch):
     assert not sent
     assert not lookups
     assert store.milk_name_for_user(user_id) is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("取奶名", ""),
+    (" 取奶名 奶狗 ", "奶狗"),
+    ("取奶名：嘎嘎奶", "嘎嘎奶"),
+    ("取奶名: 尼古拉斯·奶狗", "尼古拉斯·奶狗"),
+    ("取奶名 漏风 奶蛙", "漏风 奶蛙"),
+    ("取奶名：", ""),
+    ("求赐名", None),
+    ("我想取奶名 奶鸡", None),
+    ("取奶名字", None),
+])
+def test_custom_milk_name_parser_preserves_requested_name(text, expected):
+    assert bot.parse_custom_milk_name_command(text) == expected
+
+
+@pytest.mark.parametrize("platform", ["feishu", "qq"])
+@pytest.mark.parametrize("chat_type,mentioned", [("group", True), ("p2p", False)])
+def test_custom_command_saves_sender_name_and_fortune_uses_it(
+    tmp_path, monkeypatch, platform, chat_type, mentioned,
+):
+    store, user_id, sent, lookups = exercise_names(
+        tmp_path, monkeypatch, platform=platform, chat_type=chat_type, mentioned=mentioned,
+        friend=True, commands=("取奶名 嘎嘎奶", "今日奶运"),
+    )
+    assert "你的奶名是「嘎嘎奶」" in sent[0][1]["text"]
+    assert "嘎嘎奶" in str(sent[1][1])
+    assert BotStore(tmp_path).milk_name_for_user(user_id).milk_name == "嘎嘎奶"
+    assert store.milk_name_for_user(IdentityScope(platform, "name-test").key("user", "friend")) is None
+    assert not lookups
+
+
+@pytest.mark.parametrize("platform", ["feishu", "qq"])
+def test_custom_command_rejects_taken_name_and_keeps_current_one(tmp_path, monkeypatch, platform):
+    store, user_id, sent, _ = exercise_names(
+        tmp_path, monkeypatch, platform=platform, taken_names=("奶狗",),
+        commands=("求赐名", "取奶名 奶狗"),
+    )
+    assert "已经被用过" in sent[1][1]["text"]
+    assert store.milk_name_for_user(user_id).milk_name == "奶蛙最爱的 王小奶"
+
+
+def test_empty_custom_command_shows_usage_without_assigning_name(tmp_path, monkeypatch):
+    store, user_id, sent, _ = exercise_names(
+        tmp_path, monkeypatch, commands=("取奶名",),
+    )
+    assert "发送「取奶名 奶狗」" in sent[0][1]["text"]
+    assert store.milk_name_for_user(user_id) is None
+
+
+def test_custom_command_in_unmentioned_group_does_not_rename(tmp_path, monkeypatch):
+    store, user_id, sent, _ = exercise_names(
+        tmp_path, monkeypatch, mentioned=False, commands=("取奶名 奶狗",),
+    )
+    assert not sent
+    assert store.milk_name_for_user(user_id) is None
+
+
+def test_custom_name_survives_restart_and_own_current_name_is_idempotent(tmp_path):
+    store = BotStore(tmp_path)
+    assigned = store.assign_milk_name(
+        "user", original_name="王小明", milk_name=" 漏风 奶蛙 ", exact_name=True,
+    )
+    restarted = BotStore(tmp_path)
+    assert restarted.assign_milk_name(
+        "user", original_name="李雷", milk_name="漏风 奶蛙", exact_name=True,
+    ) == assigned
+    assert assigned.original_name == "王小明"
+    assert assigned.milk_name == "漏风 奶蛙"
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM milk_name_reservations").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("recipient", ["first", "other"])
+def test_custom_name_cannot_reuse_retired_random_name(tmp_path, recipient):
+    store = BotStore(tmp_path)
+    store.assign_milk_name("first", original_name="王小明", milk_name="奶狗")
+    renewed = store.assign_milk_name(
+        "first", original_name="王小明", milk_name="奶鸡", exact_name=True,
+    )
+    restarted = BotStore(tmp_path)
+    with pytest.raises(MilkNameTakenError, match="已经被用过"):
+        restarted.assign_milk_name(
+            recipient, original_name="李雷", milk_name="奶狗", exact_name=True,
+        )
+    assert restarted.milk_name_for_user("first") == renewed
+    assert restarted.milk_name_for_user("other") is None
+
+
+def test_simultaneous_custom_claims_only_save_one_owner(tmp_path):
+    store = BotStore(tmp_path)
+
+    def claim(index):
+        try:
+            return store.assign_milk_name(
+                f"user-{index}", original_name="王小明", milk_name="奶狗", exact_name=True,
+            )
+        except MilkNameTakenError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(claim, range(8)))
+    assert len([result for result in results if result is not None]) == 1
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM milk_names").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM milk_name_reservations").fetchone()[0] == 1
+
+
+def test_failed_custom_rename_does_not_reserve_requested_name(tmp_path):
+    store = BotStore(tmp_path)
+    assigned = store.assign_milk_name("user", original_name="王小明", milk_name="奶狗")
+    with sqlite3.connect(store.database_path) as connection:
+        connection.executescript(
+            "CREATE TRIGGER reject_custom_name BEFORE UPDATE OF milk_name ON milk_names "
+            "BEGIN SELECT RAISE(ABORT, 'custom update rejected'); END;"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="custom update rejected"):
+        store.assign_milk_name(
+            "user", original_name="王小明", milk_name="奶鸡", exact_name=True,
+        )
+    assert store.milk_name_for_user("user") == assigned
+    assert store.assign_milk_name(
+        "other", original_name="李雷", milk_name="奶鸡", exact_name=True,
+    ).milk_name == "奶鸡"
+
+
+@pytest.mark.parametrize("platform", ["feishu", "qq"])
+def test_custom_weekly_limit_keeps_random_grants_unlimited(tmp_path, monkeypatch, platform):
+    store, user_id, sent, _ = exercise_names(
+        tmp_path, monkeypatch, platform=platform,
+        commands=("取奶名 奶鸡", "取奶名 奶狗", "求赐名", "求赐名", "取奶名 奶蛙"),
+    )
+    assert "一周只能取一次奶名" in sent[1][1]["text"]
+    assert "奶蛙最爱的 王小奶" in sent[2][1]["text"]
+    assert "最奶的 王小奶" in sent[3][1]["text"]
+    assert "一周只能取一次奶名" in sent[4][1]["text"]
+    assert store.milk_name_for_user(user_id).milk_name == "最奶的 王小奶"
+
+
+def test_custom_cooldown_survives_restart_and_random_rename_does_not_reset_it(tmp_path):
+    store = BotStore(tmp_path)
+    assigned = store.assign_milk_name(
+        "user", original_name="王小明", milk_name="奶鸡", exact_name=True, weekly_limit=True,
+    )
+    assert store.assign_milk_name(
+        "user", original_name="王小明", milk_name="奶鸡", exact_name=True, weekly_limit=True,
+    ) == assigned
+    with sqlite3.connect(store.database_path) as connection:
+        initial_time = connection.execute(
+            "SELECT changed_at FROM milk_name_custom_cooldowns"
+        ).fetchone()[0]
+    restarted = BotStore(tmp_path)
+    renewed = restarted.assign_milk_name(
+        "user", original_name="王小明", milk_name="王小奶",
+        name_options=lambda _: ("奶狗",),
+    )
+    with pytest.raises(MilkNameCooldownError, match="不限次数"):
+        restarted.assign_milk_name(
+            "user", original_name="王小明", milk_name="奶蛙", exact_name=True, weekly_limit=True,
+        )
+    assert restarted.milk_name_for_user("user") == renewed
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT changed_at FROM milk_name_custom_cooldowns"
+        ).fetchone()[0] == initial_time
+
+
+def test_custom_name_is_available_again_at_exact_seven_day_boundary(tmp_path, monkeypatch):
+    store = BotStore(tmp_path)
+    store.assign_milk_name(
+        "user", original_name="王小明", milk_name="奶鸡", exact_name=True, weekly_limit=True,
+    )
+    next_time = datetime.now(LOCAL_TIMEZONE)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE milk_name_custom_cooldowns SET changed_at = ?",
+            ((next_time - timedelta(days=7)).isoformat(),),
+        )
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next_time
+
+    monkeypatch.setattr("nailong_classifier.persistence.storage.datetime", Clock)
+    assert store.assign_milk_name(
+        "user", original_name="王小明", milk_name="奶狗", exact_name=True, weekly_limit=True,
+    ).milk_name == "奶狗"
+
+
+def test_taken_custom_name_does_not_consume_weekly_allowance(tmp_path):
+    store = BotStore(tmp_path)
+    store.assign_milk_name("other", original_name="李雷", milk_name="奶狗")
+    with pytest.raises(MilkNameTakenError):
+        store.assign_milk_name(
+            "user", original_name="王小明", milk_name="奶狗", exact_name=True, weekly_limit=True,
+        )
+    assert store.assign_milk_name(
+        "user", original_name="王小明", milk_name="奶鸡", exact_name=True, weekly_limit=True,
+    ).milk_name == "奶鸡"
+
+
+def test_simultaneous_custom_renames_only_consume_one_weekly_allowance(tmp_path):
+    store = BotStore(tmp_path)
+
+    def claim(index):
+        try:
+            return store.assign_milk_name(
+                "user", original_name="王小明", milk_name=f"奶狗{index}",
+                exact_name=True, weekly_limit=True,
+            )
+        except MilkNameCooldownError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(claim, range(8)))
+    assert len([result for result in results if result is not None]) == 1
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM milk_name_reservations").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM milk_name_custom_cooldowns").fetchone()[0] == 1
 
 
 def test_grant_for_mentioned_member_keeps_existing_name_and_public_lookup_requests_image(
@@ -363,7 +603,7 @@ def test_welcome_and_active_grant_share_one_mapping_across_groups(tmp_path, monk
     assert "李奶" not in sent[1][1]["text"]
     assert store.milk_name_for_user(user_id).original_name == "王小明"
     assert "最奶的 王小奶" in sent[1][1]["text"]
-    assert store.milk_name_for_user(user_id).milk_name == "奶蛙最爱的 王小奶"
+    assert store.milk_name_for_user(user_id).milk_name == "奶龙鸡腿护卫 王小奶"
     assert store.milk_family_member(user_id).display_name == "李雷"
 
 
@@ -391,23 +631,25 @@ def test_explicit_grant_still_works_when_proactive_messages_are_disabled(tmp_pat
 
 
 @pytest.mark.parametrize("style,expected", [
-    ("nickname", "奶蛙最爱的 奶小明"),
-    ("foreign", "尼古拉斯·奶龙·奶小明"),
-    ("foreign_milk", "尼古拉斯·奶龙大侠"),
-    ("title", "奶龙大侠"),
-    ("title_name", "奶龙大侠·奶小明"),
+    ("animal", "奶龙"),
+    ("suffix", "纯奶"),
+    ("nickname", "奶小明"),
+    ("variant", "小奶龙"),
 ])
 def test_word_generator_combines_each_style(monkeypatch, style, expected):
+    monkeypatch.setattr(bot.secrets, "randbelow", lambda _: 99)
     monkeypatch.setattr(
         bot.secrets, "choice",
         lambda options: style if "nickname" in options else options[0],
     )
-    assert set(bot.milk_name_options("王小明")) == {expected}
+    candidates = list(bot.milk_name_options("王小明"))
+    assert candidates == [expected]
 
 
-@pytest.mark.parametrize("style", ["nickname", "foreign", "foreign_milk", "title", "title_name"])
+@pytest.mark.parametrize("style", ["animal", "suffix", "nickname", "variant"])
 @pytest.mark.parametrize("original", ["韩婉清", "张雪奶", "神秘奶友"])
-def test_all_name_styles_keep_explicit_character_connection(monkeypatch, style, original):
+def test_all_name_styles_are_short_and_contain_milk(monkeypatch, style, original):
+    monkeypatch.setattr(bot.secrets, "randbelow", lambda _: 99)
     real_choice = bot.secrets.choice
     monkeypatch.setattr(
         bot.secrets, "choice",
@@ -415,22 +657,26 @@ def test_all_name_styles_keep_explicit_character_connection(monkeypatch, style, 
     )
     candidates = list(bot.milk_name_options(original))
     assert candidates
-    assert all("奶龙" in name or "奶蛙" in name for name in candidates)
-    if style in {"nickname", "foreign", "title_name"}:
+    assert all("奶" in name and len(name) <= MILK_NAME_MAX_LENGTH for name in candidates)
+    if style == "nickname":
         assert all(any(
             variant in name for variant in bot.milk_nickname_variants(original)
         ) for name in candidates)
 
 
 @pytest.mark.parametrize("platform", ["feishu", "qq"])
-def test_real_word_bank_works_for_welcome_and_repeated_grant(tmp_path, monkeypatch, platform):
+@pytest.mark.parametrize("roll", [0, 99])
+def test_real_word_bank_works_for_welcome_and_repeated_grant(tmp_path, monkeypatch, platform, roll):
+    monkeypatch.setattr(bot.secrets, "randbelow", lambda _: roll)
     store, user_id, sent, _ = exercise_names(
         tmp_path, monkeypatch, platform=platform, welcome=True, real_words=True,
     )
     assert len(sent) == 3
-    assert all("奶龙" in content["text"] or "奶蛙" in content["text"] for _, content, _ in sent)
+    assert all("奶" in content["text"] for _, content, _ in sent)
     assert sent[1][1]["text"] != sent[2][1]["text"]
     assigned = store.milk_name_for_user(user_id)
+    if roll == 99:
+        assert len(assigned.milk_name) <= MILK_NAME_MAX_LENGTH
     assert assigned.milk_name in sent[2][1]["text"]
     assert assigned.original_name == "王小明"
     assert BotStore(tmp_path).milk_name_for_user(user_id) == assigned
@@ -568,3 +814,155 @@ def test_legacy_duplicate_migration_preserves_original_identity_and_is_idempoten
     assert second.milk_name != first.milk_name
     assert restarted.milk_name_for_user("third") == unaffected
     assert BotStore(tmp_path).milk_name_for_user("second") == second
+
+
+@pytest.mark.parametrize("recipient", ["first", "other"])
+def test_retired_names_are_not_reused_by_same_or_other_user_after_restart(tmp_path, recipient):
+    store = BotStore(tmp_path)
+    store.assign_milk_name("first", original_name="王小明", milk_name="奶龙鸡腿保卫战内鬼")
+    store.assign_milk_name(
+        "first", original_name="王小明", milk_name="王小奶",
+        name_options=lambda original: ("奶蛙扣篮梦钉子户",),
+    )
+    restarted = BotStore(tmp_path)
+    assigned = restarted.assign_milk_name(
+        recipient, original_name="王小明", milk_name="王小奶",
+        name_options=lambda original: (
+            " 奶龙鸡腿保卫战内鬼 ", "奶蛙扣篮梦钉子户", "奶龙天线鸡腿导航员",
+        ),
+    )
+    assert assigned.milk_name == "奶龙天线鸡腿导航员"
+    with sqlite3.connect(store.database_path) as connection:
+        reserved = {row[0] for row in connection.execute(
+            "SELECT milk_name FROM milk_name_reservations"
+        )}
+    assert reserved == {"奶龙鸡腿保卫战内鬼", "奶蛙扣篮梦钉子户", "奶龙天线鸡腿导航员"}
+
+
+def test_legacy_names_are_backfilled_before_rename_and_remain_reserved(tmp_path):
+    store = BotStore(tmp_path)
+    initial = store.assign_milk_name("first", original_name="王小明", milk_name="奶蛙扣篮王")
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DROP TABLE milk_name_reservations")
+    restarted = BotStore(tmp_path)
+    assert restarted.milk_name_for_user("first") == initial
+    restarted.assign_milk_name(
+        "first", original_name="王小明", milk_name="王小奶",
+        name_options=lambda original: ("奶龙鸡腿护卫",),
+    )
+    assigned = BotStore(tmp_path).assign_milk_name(
+        "other", original_name="李雷", milk_name="李奶",
+        name_options=lambda original: ("奶蛙扣篮王", "奶龙鸡腿护卫", "奶蛙大笑搭子"),
+    )
+    assert assigned.milk_name == "奶蛙大笑搭子"
+
+
+def test_failed_rename_rolls_back_name_reservation(tmp_path):
+    store = BotStore(tmp_path)
+    initial = store.assign_milk_name("first", original_name="王小明", milk_name="奶蛙扣篮王")
+    with sqlite3.connect(store.database_path) as connection:
+        connection.executescript(
+            "CREATE TRIGGER reject_name_update BEFORE UPDATE OF milk_name ON milk_names "
+            "BEGIN SELECT RAISE(ABORT, 'name update rejected'); END;"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="name update rejected"):
+        store.assign_milk_name(
+            "first", original_name="王小明", milk_name="王小奶",
+            name_options=lambda original: ("奶龙鸡腿护卫",),
+        )
+    assert store.milk_name_for_user("first") == initial
+    assigned = store.assign_milk_name(
+        "other", original_name="李雷", milk_name="奶龙鸡腿护卫",
+    )
+    assert assigned.milk_name == "奶龙鸡腿护卫"
+
+
+def test_random_fallback_also_skips_retired_names(tmp_path, monkeypatch):
+    store = BotStore(tmp_path)
+    store.assign_milk_name(
+        "first", original_name="王小明", milk_name="奶龙鸡腿护卫·retired",
+    )
+    store.assign_milk_name(
+        "first", original_name="王小明", milk_name="王小奶",
+        name_options=lambda original: ("奶蛙扣篮王",),
+    )
+    tokens = iter(("retired", "fresh"))
+    monkeypatch.setattr(
+        "nailong_classifier.persistence.storage.secrets.token_hex", lambda _: next(tokens),
+    )
+    assigned = store.assign_milk_name(
+        "other", original_name="李雷", milk_name="奶龙鸡腿护卫",
+        name_options=lambda original: ("奶蛙扣篮王",),
+    )
+    assert assigned.milk_name == "奶龙鸡腿护卫·fresh"
+
+
+def test_short_name_bank_includes_requested_naming_patterns():
+    assert {"奶龙", "奶蛙", "奶狗", "奶鸡"} <= set(MILK_NAME_ANIMALS)
+    assert {"嘎嘎奶", "鸡腿奶", "通透奶"} <= set(MILK_NAME_SUFFIXES)
+    assert {"漏风奶蛙", "迷糊奶龙", "暴躁奶鸡", "小嘎嘎奶"} <= set(MILK_NAME_VARIANTS)
+    assert len(MILK_NAME_SHORT_NAMES) >= 200
+    assert len(MILK_NAME_VARIANTS) >= 10000
+    assert len(MILK_NAME_SHORT_NAMES) == len(set(MILK_NAME_SHORT_NAMES))
+    assert len(MILK_NAME_VARIANTS) == len(set(MILK_NAME_VARIANTS))
+    assert all(
+        "奶" in name and 2 <= len(name) <= MILK_NAME_MAX_LENGTH
+        for name in (*MILK_NAME_SHORT_NAMES, *MILK_NAME_VARIANTS)
+    )
+    assert not any("·" in name or " " in name for name in MILK_NAME_VARIANTS)
+
+
+def test_collision_retry_can_use_other_positions_in_original_nickname(monkeypatch):
+    monkeypatch.setattr(bot.secrets, "randbelow", lambda _: 99)
+    variants = cycle(("奶小明", "王奶明", "王小奶"))
+    monkeypatch.setattr(bot, "make_milk_name", lambda name: next(variants))
+    monkeypatch.setattr(
+        bot.secrets, "choice",
+        lambda options: "nickname" if "nickname" in options else options[0],
+    )
+    assert set(bot.milk_name_options("王小明")) == {
+        "奶小明", "王奶明", "王小奶",
+    }
+
+
+def test_long_original_nickname_does_not_make_long_milk_names(monkeypatch):
+    monkeypatch.setattr(bot.secrets, "randbelow", lambda _: 99)
+    monkeypatch.setattr(
+        bot.secrets, "choice",
+        lambda options: "nickname" if "nickname" in options else options[0],
+    )
+    assert list(bot.milk_name_options("这是一个非常非常长的原始昵称")) == ["小奶龙"]
+
+
+@pytest.mark.parametrize("roll,expected", [
+    (0, "奶蛙最爱的 奶小明"),
+    (9, "奶蛙最爱的 奶小明"),
+    (10, "奶龙"),
+    (99, "奶龙"),
+])
+def test_long_name_probability_boundary_and_retry_keep_selected_family(monkeypatch, roll, expected):
+    rolls = []
+    def choose_family(upper):
+        rolls.append(upper)
+        return roll
+    monkeypatch.setattr(bot.secrets, "randbelow", choose_family)
+    monkeypatch.setattr(bot.secrets, "choice", lambda options: options[0])
+    assert list(bot.milk_name_options("王小明")) == [expected]
+    # 96 次候选尝试只抽一次风格；重试不把低概率长名变成另一种兜底。
+    assert rolls == [100]
+
+
+@pytest.mark.parametrize("style,expected", [
+    ("prefix", "奶蛙最爱的 奶小明"),
+    ("foreign", "尼古拉斯·奶龙·奶小明"),
+    ("foreign_milk", "尼古拉斯·奶龙大侠"),
+    ("title", "奶龙大侠"),
+    ("title_name", "奶龙大侠·奶小明"),
+])
+def test_long_branch_keeps_previous_name_formats(monkeypatch, style, expected):
+    monkeypatch.setattr(bot.secrets, "randbelow", lambda _: 0)
+    monkeypatch.setattr(
+        bot.secrets, "choice",
+        lambda options: style if "prefix" in options else options[0],
+    )
+    assert list(bot.milk_name_options("王小明")) == [expected]

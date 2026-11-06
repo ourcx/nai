@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import imagecodecs
 import pytest
 from lark_channel.channel.errors import FeishuChannelErrorCode
 from PIL import Image
@@ -50,6 +51,7 @@ def run_mock_bot(
     doubao_detected: bool = False,
     chat_type: str = "group",
     audio_uploads: list | None = None,
+    image_uploads: list | None = None,
 ):
     store = BotStore(tmp_path)
     store.register_seed(image_bytes("yellow"), "nailong")
@@ -98,6 +100,12 @@ def run_mock_bot(
                     success=False, error=SimpleNamespace(code=first_error), message_id=None
                 )
             return SimpleNamespace(success=True, error=None, message_id="response-id")
+
+        async def upload_media(self, source, *, kind):
+            assert kind == "image"
+            if image_uploads is not None:
+                image_uploads.append(source.buffer)
+            return "test-hdr-image"
 
         async def connect(self):
             message = SimpleNamespace(
@@ -167,46 +175,52 @@ def run_mock_bot(
     return calls, store
 
 
-def _assert_flash_gif(source: bytes) -> None:
-    with Image.open(io.BytesIO(source)) as image:
-        assert image.format == "GIF"
-        assert image.n_frames == 3
+def _assert_hdr_jpeg(source: bytes) -> None:
+    assert imagecodecs.ultrahdr_check(source)
 
 
-def test_manual_hdr_sends_flash_gif_even_when_random_hdr_is_disabled(tmp_path, monkeypatch) -> None:
-    calls, _ = run_mock_bot(tmp_path, monkeypatch, text="HDR奶图", hdr_probability=0)
+def test_manual_hdr_sends_ultrahdr_even_when_random_hdr_is_disabled(tmp_path, monkeypatch) -> None:
+    uploads = []
+    calls, _ = run_mock_bot(
+        tmp_path, monkeypatch, text="HDR奶图", hdr_probability=0, image_uploads=uploads
+    )
     assert len(calls) == 1
     content, options = calls[0]
-    assert set(content) == {"image"}
+    assert set(content) == {"card"}
+    assert content["card"]["body"]["elements"][0]["img_key"] == "test-hdr-image"
     assert options == {"reply_to": "source-id"}
-    _assert_flash_gif(content["image"]["source"])
+    assert len(uploads) == 1
+    _assert_hdr_jpeg(uploads[0])
 
 
-def test_chain_reply_runs_flash_conversion_and_preserves_response_tracking(tmp_path, monkeypatch):
-    calls, store = run_mock_bot(tmp_path, monkeypatch, text="", image=True)
+@pytest.mark.parametrize("hdr_probability", [0, 1])
+def test_chain_never_converts_hdr_and_preserves_caption_and_tracking(
+    tmp_path, monkeypatch, hdr_probability
+):
+    uploads = []
+    calls, store = run_mock_bot(
+        tmp_path, monkeypatch, text="", image=True,
+        hdr_probability=hdr_probability, image_uploads=uploads,
+    )
     assert len(calls) == 1
     content, options = calls[0]
-    assert set(content) == {"image"}
-    _assert_flash_gif(content["image"]["source"])
+    assert isinstance(content["image"]["source"], str)
+    assert "presentation" not in content["image"]
+    assert "奶龙接上了" in content["caption"]
+    assert uploads == []
     assert options == {"reply_to": "source-id"}
     correction = store.correct_label("response-id", "naiwa")
     assert correction is not None
 
 
-def test_chain_without_hdr_keeps_existing_caption(tmp_path, monkeypatch) -> None:
-    calls, _ = run_mock_bot(tmp_path, monkeypatch, text="", image=True, hdr_probability=0)
-    content, _ = calls[0]
-    assert isinstance(content["image"]["source"], str)
-    assert "奶龙接上了" in content["caption"]
-
-
-def test_normal_chat_random_push_uses_shared_flash_sender(tmp_path, monkeypatch) -> None:
-    calls, _ = run_mock_bot(tmp_path, monkeypatch, text="随便聊聊")
+def test_normal_chat_random_push_uses_shared_hdr_sender(tmp_path, monkeypatch) -> None:
+    uploads = []
+    calls, _ = run_mock_bot(tmp_path, monkeypatch, text="随便聊聊", image_uploads=uploads)
     assert len(calls) == 1
     content, options = calls[0]
-    assert set(content) == {"image"}
+    assert set(content) == {"card"}
     assert options is None
-    _assert_flash_gif(content["image"]["source"])
+    _assert_hdr_jpeg(uploads[0])
 
 
 def test_mentioning_a_registered_milk_family_member_returns_public_milk_name(

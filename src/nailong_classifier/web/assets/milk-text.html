@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffd24b" />
+    <title>奶峰生成器 · 奶龙奶蛙文字表情包</title>
+    <link rel="icon" href="../static/nailong-avatar.png?v=real-heads-1" type="image/png" />
+    <link rel="stylesheet" href="../static/milk-text.css?v=3" />
+    <script src="../static/milk-text.js?v=5" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="./" aria-label="奶峰生成器首页"><span class="brand-dot"></span>奶峰生成器<span class="wordmark-en">MILK PEAK</span></a>
+      <a class="gallery-link" href="../">去奶龙图鉴 <span aria-hidden="true">↗</span></a>
+    </header>
+    <main class="workshop">
+      <section class="editor" aria-labelledby="page-title">
+        <p class="eyebrow">奶龙 · 奶蛙 · 你的胡说八道</p>
+        <h1 id="page-title">把话说得<br /><span>奶里奶气。</span></h1>
+        <p class="intro">写一句话，带上一只奶，<br />做成群里最有奶味的表情包。</p>
+        <form id="editor-form">
+          <div class="field-heading"><label for="sticker-text">写点什么</label><span id="char-count">10 / 60</span></div>
+          <textarea id="sticker-text" name="text" maxlength="60" rows="3" placeholder="今天的鸡腿都是我的！" spellcheck="false">今天也要
+奶里奶气</textarea>
+          <div class="presets" aria-label="试试这些文案">
+            <button type="button" data-preset="我才是奶龙">我才是奶龙</button>
+            <button type="button" data-preset="笑得肚子疼">笑得肚子疼</button>
+            <button type="button" data-preset="鸡腿拿来！">鸡腿拿来！</button>
+            <button type="button" data-preset="奶龙批准">奶龙批准</button>
+          </div>
+          <fieldset class="character-field">
+            <legend>带上哪只奶</legend>
+            <div class="characters">
+              <label class="character"><input type="radio" name="character" value="random" checked /><span class="type-symbol" aria-hidden="true">↻</span><span>随机</span></label>
+              <label class="character"><input type="radio" name="character" value="nailong" /><img src="../static/nailong-avatar.png?v=real-heads-1" alt="" /><span>奶龙</span></label>
+              <label class="character"><input type="radio" name="character" value="naiwa" /><img src="../static/naiwa-avatar.png?v=real-heads-1" alt="" /><span>奶蛙</span></label>
+              <label class="character character-both"><input type="radio" name="character" value="both" /><span class="duo"><img src="../static/nailong-avatar.png?v=real-heads-1" alt="" /><img src="../static/naiwa-avatar.png?v=real-heads-1" alt="" /></span><span>双奶</span></label>
+              <label class="character character-none"><input type="radio" name="character" value="none" /><span class="type-symbol" aria-hidden="true">字</span><span>纯文字</span></label>
+            </div>
+          </fieldset>
+          <div class="style-row">
+            <fieldset class="palette-field">
+              <legend>奶系配色</legend>
+              <div class="palette-options">
+                <label class="swatch swatch-random"><input type="radio" name="palette" value="random" checked /><span></span><span class="sr-only">随机配色</span></label>
+                <label class="swatch swatch-gold"><input type="radio" name="palette" value="gold" /><span></span><span class="sr-only">奶龙黄</span></label>
+                <label class="swatch swatch-cream"><input type="radio" name="palette" value="cream" /><span></span><span class="sr-only">奶油黄</span></label>
+                <label class="swatch swatch-orange"><input type="radio" name="palette" value="orange" /><span></span><span class="sr-only">鸡腿橙</span></label>
+                <label class="swatch swatch-white"><input type="radio" name="palette" value="white" /><span></span><span class="sr-only">黄边白字</span></label>
+              </div>
+            </fieldset>
+            <label class="layout-field" for="layout">文字排版<select id="layout" name="layout"><option value="random">随机排版</option><option value="jitter">错位字形</option><option value="rise">蹦蹦跳跳</option><option value="straight">乖乖站好</option><option value="stack">多行叠字</option></select></label>
+          </div>
+          <div class="style-row">
+            <label class="layout-field" for="avatar">头像表情<select id="avatar" name="avatar"><option value="random">随机换一张</option><option value="1">表情 1</option><option value="2">表情 2</option><option value="3">表情 3</option><option value="4">表情 4</option><option value="5">表情 5</option><option value="6">表情 6</option><option value="7">表情 7</option><option value="8">表情 8</option></select></label>
+            <label class="layout-field" for="motion">文字动作<select id="motion" name="motion"><option value="random">随机动作（含静态）</option><option value="bounce">跳动</option><option value="sway">摇摆</option><option value="wave">波浪</option><option value="static">静态 PNG</option></select></label>
+          </div>
+          <details class="fine-tuning"><summary>微调字形和动作</summary><div class="tuning-fields">
+            <label for="font-size">字号<input id="font-size" name="font_size" type="number" min="0" max="140" placeholder="留空随机" /><span>48–140；0 自动适配</span></label>
+            <label for="stroke">描边<input id="stroke" name="stroke" type="number" min="2" max="14" placeholder="留空随机" /><span>2–14 像素</span></label>
+            <label for="tilt">倾斜<input id="tilt" name="tilt" type="number" min="-12" max="12" placeholder="留空随机" /><span>−12°–12°</span></label>
+            <label for="amplitude">动作幅度<input id="amplitude" name="amplitude" type="number" min="0" max="24" placeholder="留空随机" /><span>0–24 像素</span></label>
+            <label for="speed">每帧时长<input id="speed" name="duration_ms" type="number" min="60" max="300" placeholder="留空随机" /><span>60–300 毫秒</span></label>
+          </div></details>
+          <button type="button" id="randomize" class="button button-secondary reroll">随机换一版 ↻</button>
+          <p class="editor-note">默认全部随机，各选项等概率，可能连续重复。每只奶有 8 张表情；支持四行文字。</p>
+        </form>
+      </section>
+      <section class="preview-section" aria-label="表情包预览">
+        <div class="preview-toolbar"><span><span class="live-dot"></span>实时预览</span><fieldset class="background-field"><legend class="sr-only">导出背景</legend><label><input type="radio" name="background" value="random" form="editor-form" checked /><span>随机底</span></label><label><input type="radio" name="background" value="transparent" form="editor-form" /><span>透明底</span></label><label><input type="radio" name="background" value="cream" form="editor-form" /><span>奶油底</span></label></fieldset></div>
+        <div id="preview-stage" class="preview-stage">
+          <span class="stage-tag">一张有奶味的表情包</span>
+          <div class="sticker-wrap"><img id="sticker-preview" alt="生成的奶龙文字贴纸" hidden /><div id="preview-placeholder">正在把文字变成奶字…</div></div>
+          <span class="stage-footnote">小小一只奶，大大一句话。</span>
+        </div>
+        <div class="export-bar"><div><strong id="output-size">奶字制作中</strong><span id="export-format">PNG / GIF · 放进聊天，刚刚好</span></div><div class="export-buttons"><button type="button" id="copy-image" class="button button-secondary" disabled>复制图片</button><button type="button" id="download-image" class="button button-primary" disabled>下载表情包 <span aria-hidden="true">↓</span></button></div></div>
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+        <aside class="bot-tip"><span class="bot-tip-mark" aria-hidden="true">↳</span><p>也可以在群里 <strong>@机器人 奶峰生成器 鸡腿拿来！</strong><br /><span>加 --配色 黄边白字 --动作 波浪 可指定；换成「奶蛙字」就是奶蛙版。</span></p></aside>
+      </section>
+    </main>
+    <footer class="site-footer"><span>每句话，都有一点奶。</span><span>排版灵感来自 <a href="https://zhousiru.github.io/scale-new-heights-generator/" target="_blank" rel="noopener">高峰生成器 ↗</a></span></footer>
+  </body>
+</html>

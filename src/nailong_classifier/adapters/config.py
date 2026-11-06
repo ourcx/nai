@@ -89,13 +89,18 @@ def create_adapter(config: AdapterConfig, *, isolate_feishu: bool = False) -> Bo
     app_id = settings.get("app_id") or _environment(settings, "app_id")
     if not isinstance(app_id, str) or not app_id.isdigit():
         raise ValueError("QQ app_id must be the official bot AppID")
-    for option in ("sandbox", "allow_proactive"):
-        if not isinstance(settings.get(option, False), bool):
+    for option in ("sandbox", "allow_proactive", "markdown_enabled", "custom_keyboard_enabled"):
+        if not isinstance(settings.get(option, option == "markdown_enabled"), bool):
             raise ValueError(f"QQ {option} must be a boolean")
+    if not isinstance(settings.get("keyboard_template_id", ""), str):
+        raise ValueError("QQ keyboard_template_id must be a string")
     return QQAdapter(
         scope,
         app_id=app_id,
         app_secret=_environment(settings, "app_secret"),
         sandbox=settings.get("sandbox", False),
         allow_proactive=settings.get("allow_proactive", False),
+        markdown_enabled=settings.get("markdown_enabled", True),
+        keyboard_template_id=settings.get("keyboard_template_id", ""),
+        custom_keyboard_enabled=settings.get("custom_keyboard_enabled", False),
     )

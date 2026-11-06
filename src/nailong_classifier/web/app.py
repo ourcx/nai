@@ -24,6 +24,8 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from ..imaging.milk_text import STATIC_ASSETS, MilkTextOptions, render_milk_text
+
 LOCAL_TIMEZONE: Final = ZoneInfo("Asia/Shanghai")
 PUBLIC_LABELS: Final = ("nailong", "naiwa")
 PUBLIC_LABEL_SET: Final = set(PUBLIC_LABELS)
@@ -232,9 +234,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "default-src 'self'; img-src 'self' data:; style-src 'self'; "
             "script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
         )
+        if request.url.path.startswith("/text/"):
+            # The editor previews a locally generated PNG using a revocable object URL.
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; "
+                "script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+            )
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path == "/api/milk-text":
+            response.headers["Cache-Control"] = "no-store"
         return response
 
 
@@ -286,9 +296,64 @@ def create_app(state_dir: Path) -> Starlette:
 
     async def static_file(request: Request) -> Response:
         name = request.path_params["name"]
-        if name not in {"app.css", "app.js"}:
+        if name in STATIC_ASSETS:
+            return FileResponse(STATIC_ASSETS[name], headers={"Cache-Control": STATIC_CACHE})
+        if name not in {"app.css", "app.js", "milk-text.css", "milk-text.js"}:
             raise HTTPException(status_code=404)
         return FileResponse(static_dir / name, headers={"Cache-Control": STATIC_CACHE})
+
+    async def text_editor(_request: Request) -> Response:
+        return HTMLResponse(
+            (static_dir / "milk-text.html").read_text(encoding="utf-8"),
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    async def api_milk_text(request: Request) -> Response:
+        # Limit the streamed body before parsing: a sticker only needs a few short options.
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 4096:
+                return JSONResponse({"error": "文字请求太长了。"}, status_code=413)
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("请填写文字和样式。")
+            options = MilkTextOptions(
+                text=payload.get("text", ""),
+                character=payload.get("character", "random"),
+                palette=payload.get("palette", "random"),
+                layout=payload.get("layout", "random"),
+                background=payload.get("background", "random"),
+                avatar=payload.get("avatar", "random"),
+                motion=payload.get("motion", "random"),
+                font_size=payload.get("font_size"),
+                stroke=payload.get("stroke"),
+                tilt=payload.get("tilt"),
+                amplitude=payload.get("amplitude"),
+                duration_ms=payload.get("duration_ms"),
+            )
+            if any(
+                not isinstance(value, str)
+                for value in (options.text, options.character, options.palette,
+                              options.layout, options.background, options.avatar, options.motion)
+            ):
+                raise ValueError("文字和样式格式不正确。")
+            image = await run_in_threadpool(render_milk_text, options)
+        except (ValueError, UnicodeError) as error:
+            return JSONResponse({"error": str(error)}, status_code=400)
+        animated = image.startswith(b"GIF8")
+        return Response(
+            image,
+            media_type="image/gif" if animated else "image/png",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": (
+                    'inline; filename="milk-text.gif"' if animated
+                    else 'inline; filename="milk-text.png"'
+                ),
+            },
+        )
 
     async def api_assets(request: Request) -> Response:
         query = request.query_params
@@ -386,7 +451,9 @@ def create_app(state_dir: Path) -> Starlette:
         middleware=[Middleware(SecurityHeadersMiddleware)],
         routes=[
             Route("/", index),
+            Route("/text/", text_editor),
             Route("/static/{name:str}", static_file),
+            Route("/api/milk-text", api_milk_text, methods=["POST"]),
             Route("/api/assets", api_assets),
             Route("/api/stats", api_stats),
             Route("/media/{asset_id:int}/thumbnail", thumbnail),

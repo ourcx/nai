@@ -2,30 +2,49 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
+import io
 import json
 import logging
 import os
 import re
 import secrets
 import time as time_module
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+
+from PIL import Image
 
 from ..adapters.base import BotAdapter, CardAction, ErrorCode, ImageTarget, MembersAdded
 from ..adapters.config import create_adapter, load_adapter_configs
 from ..classification.doubao import DoubaoDetector
 from ..classification.milk import combined_milk_concentration
 from ..classification.model import NailongPredictor, Prediction
-from ..domain.milk_name_words import (
+from ..domain.milk_fortune import (
+    FORTUNE_FACES,
+    FORTUNE_SETS,
+    FortuneCollection,
+    MilkFortune,
+)
+from ..domain.milk_fortune import (
+    make_milk_fortune as make_milk_fortune,
+)
+from ..domain.milk_name_long_words import (
     MILK_NAME_CHARACTERS,
     MILK_NAME_FOREIGN,
     MILK_NAME_PREFIXES,
     MILK_NAME_TITLES,
+)
+from ..domain.milk_name_words import (
+    MILK_NAME_ANIMALS,
+    MILK_NAME_LONG_PERCENT,
+    MILK_NAME_MAX_LENGTH,
+    MILK_NAME_SUFFIXES,
+    MILK_NAME_VARIANTS,
 )
 from ..domain.rarity import Rarity
 from ..imaging.hdr import (
@@ -35,6 +54,7 @@ from ..imaging.hdr import (
     validate_hdr_settings,
 )
 from ..imaging.image_fingerprint import find_duplicate, try_content_hash, try_file_content_hash
+from ..imaging.milk_text import MILK_TEXT_USAGE, parse_milk_text_command, render_milk_text
 from ..imaging.puzzle import try_make_puzzle_image
 from ..integrations.douyin import (
     SEARCH_KEYWORDS,
@@ -45,6 +65,7 @@ from ..integrations.douyin import (
     search_douyin_videos,
 )
 from ..integrations.speech import MAX_SPEECH_CHARS, NailongSpeechClient, SpeechError
+from ..integrations.social_media import SocialMediaError, find_social_link, iter_social_images
 from ..persistence.storage import (
     LEGACY_NAME_FALLBACKS,
     LOCAL_TIMEZONE,
@@ -59,6 +80,7 @@ from ..persistence.storage import (
     MilkFamilyMember,
     ObservationRecord,
 )
+from .chain_selector import ChainSelector
 from .services import BackendServices, SerializedPredictor
 
 if TYPE_CHECKING:
@@ -125,17 +147,6 @@ DEFAULT_DOUYIN_VIDEO_PUSH_PROBABILITY = 0.4
 DEFAULT_DOUYIN_VIDEO_PUSH_WINDOW_SECONDS = 3600
 DEFAULT_DOUYIN_VIDEO_PUSH_MAX_PER_WINDOW = 2
 DEFAULT_DOUYIN_SEARCH_CACHE_SECONDS = 900
-
-
-@dataclass(frozen=True)
-class MilkFortune:
-    score: int
-    banter: int
-    title: str
-    keyword: str
-    good: str
-    avoid: str
-    message: str
 
 
 def _decode_message_content(raw: dict[str, Any]) -> Any:
@@ -320,12 +331,24 @@ def is_catalog_command(text: str) -> bool:
     return text.strip() in {"奶龙图鉴", "查看奶龙图鉴", "打开奶龙图鉴"}
 
 
+def is_random_milk_command(text: str) -> bool:
+    return text.strip() in {"随机奶图", "来张奶图", "来张随机奶图"}
+
+
 def is_hdr_milk_command(text: str) -> bool:
     return text.strip().lower() in {"hdr奶图", "hdr奶龙", "来张hdr奶图"}
 
 
 def parse_speech_command(text: str) -> str | None:
     match = re.fullmatch(r"奶龙说(?:[\s：:]+(.*))?", text.strip(), flags=re.DOTALL)
+    return (match.group(1) or "").strip() if match else None
+
+
+def parse_naiwa_speech_command(text: str) -> str | None:
+    stripped = text.strip()
+    if stripped == "奶蛙大笑":
+        return "哈哈哈哈哈哈哈哈！"
+    match = re.fullmatch(r"奶蛙说(?:[\s：:]+(.*))?", stripped, flags=re.DOTALL)
     return (match.group(1) or "").strip() if match else None
 
 
@@ -407,6 +430,15 @@ def is_milk_name_command(text: str) -> bool:
     return "".join(text.split()) == "求赐名"
 
 
+def parse_custom_milk_name_command(text: str) -> str | None:
+    """识别自选名字命令；保留名字内空格，单独发送命令时返回空串提示用法。"""
+    text = text.strip()
+    if text == "取奶名":
+        return ""
+    match = re.fullmatch(r"取奶名(?:\s+|[：:]\s*)(.*)", text, re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
 def is_milk_name_grant_for_other_command(text: str) -> bool:
     """只认“给某人求赐名”，避免普通 @ 群友时意外替对方换名。"""
     compact = "".join(text.split())
@@ -414,31 +446,52 @@ def is_milk_name_grant_for_other_command(text: str) -> bool:
 
 
 def milk_name_options(original_name: str) -> Iterator[str]:
-    """每类候选都含奶龙或奶蛙；存储层在写锁内查重，撞名再取下一候选。
+    """90% 抽短奶名，10% 抽旧版定语、洋名和长梗称号。
 
-    称号按抖音文案改写后整条抽取，避免无关甜品词、称号随机拼出不顺口的名字。
-    欢迎和求赐名共用词库；已有名字是否更新仍由存储层的 replace_existing 决定。
+    每次赐名先决定风格，撞名重试不切换，避免短词撞名后长名概率被抬高。
+    短名的四种叫法等概率；长名保留旧版五种叫法的随机组合。
+    存储层继续排除当前和历史奶名；是否换已有名由 replace_existing 决定。
     """
-    base_name = make_milk_name(original_name)
-    if base_name is None:
+    if not milk_nickname_variants(original_name):
         raise ValueError("Original name must not be empty")
+    long_form = secrets.randbelow(100) < MILK_NAME_LONG_PERCENT
+    styles = (
+        ("prefix", "foreign", "foreign_milk", "title", "title_name")
+        if long_form else ("animal", "suffix", "nickname", "variant")
+    )
+    seen: set[str] = set()
     for _ in range(96):
-        style = secrets.choice(("nickname", "foreign", "foreign_milk", "title", "title_name"))
-        if style == "nickname":
-            yield f"{secrets.choice(MILK_NAME_PREFIXES)} {base_name}"
-        elif style == "foreign":
-            yield (
-                f"{secrets.choice(MILK_NAME_FOREIGN)}·"
-                f"{secrets.choice(MILK_NAME_CHARACTERS)}·{base_name}"
-            )
-        elif style == "foreign_milk":
-            yield f"{secrets.choice(MILK_NAME_FOREIGN)}·{secrets.choice(MILK_NAME_TITLES)}"
-        else:
-            title = secrets.choice(MILK_NAME_TITLES)
-            if style == "title":
-                yield title
+        style = secrets.choice(styles)
+        if long_form:
+            base_name = make_milk_name(original_name)
+            if style == "prefix":
+                candidate = f"{secrets.choice(MILK_NAME_PREFIXES)} {base_name}"
+            elif style == "foreign":
+                candidate = (
+                    f"{secrets.choice(MILK_NAME_FOREIGN)}·"
+                    f"{secrets.choice(MILK_NAME_CHARACTERS)}·{base_name}"
+                )
+            elif style == "foreign_milk":
+                candidate = f"{secrets.choice(MILK_NAME_FOREIGN)}·{secrets.choice(MILK_NAME_TITLES)}"
+            elif style == "title":
+                candidate = secrets.choice(MILK_NAME_TITLES)
             else:
-                yield f"{title}·{base_name}"
+                candidate = f"{secrets.choice(MILK_NAME_TITLES)}·{base_name}"
+        elif style == "animal":
+            candidate = secrets.choice(MILK_NAME_ANIMALS)
+        elif style == "suffix":
+            candidate = secrets.choice(MILK_NAME_SUFFIXES)
+        elif style == "nickname":
+            candidate = make_milk_name(original_name)
+            # 保留首次原昵称的映射，但不把一大串昵称直接当作新奶名。
+            if candidate is None or not 2 <= len(candidate) <= MILK_NAME_MAX_LENGTH:
+                candidate = secrets.choice(MILK_NAME_VARIANTS)
+        else:
+            candidate = secrets.choice(MILK_NAME_VARIANTS)
+        # 单次分配不反复查询同一个候选；数据库仍负责跨用户、跨请求的去重。
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate
 
 
 def format_milk_name_grant(
@@ -486,6 +539,91 @@ def format_milk_name_welcome(entries: list[tuple[str, str]]) -> str:
     return f"新奶友进群，今日奶名：{shown}{suffix}。"
 
 
+def format_milk_name_speech(milk_name: str) -> str:
+    return secrets.choice((
+        f"奶龙赐名！从今天起，你的奶名就是，{milk_name}！",
+        f"鸡腿敲章，奶籍生效！以后就叫你，{milk_name}！",
+        f"奶龙认真想了一下，决定赐你奶名，{milk_name}！",
+        f"欢迎加入奶家人！你的新名字是，{milk_name}！",
+    ))
+
+
+def format_milk_name_welcome_speech(
+    entries: list[tuple[str, str]], voice: str = "nailong",
+) -> str:
+    prefixes = {
+        "nailong": (
+            "欢迎新奶友！奶龙赐名：",
+            "新朋友来啦！鸡腿敲章，今日奶名是：",
+            "奶龙点名！从今天起，你们就叫：",
+            "奶龙带着鸡腿来迎接新朋友啦！你们的奶名是：",
+            "欢迎来到奶家人！奶龙宣布，你们的新名字是：",
+            "让奶龙看看是谁来啦！今天赐名：",
+            "奶龙抱紧鸡腿跑来迎新啦！今日奶名是：",
+            "鸡腿还没吃完，新朋友先安排上！你们就叫：",
+            "奶龙从圆滚滚的肚皮后面探出头来，宣布：",
+            "奶龙听说有新人，端着饭碗就赶来了！赐名：",
+            "今天不减肥，先给新奶友取名字！你们叫：",
+            "奶龙把小七喊来一起见证，新奶友名叫：",
+            "奶龙摇着小尾巴欢迎大家！今日奶名：",
+            "一口鸡腿一口奶名，奶龙宣布你们叫：",
+            "奶龙肚子咕噜一声，灵感来了！赐名：",
+            "奶龙从表情包里滚出来迎新啦！你们叫：",
+            "奶龙端起小饭碗，郑重宣布新奶友名叫：",
+            "奶龙的鸡腿雷达发现新朋友！今日赐名：",
+            "谁把新奶友带来啦？奶龙决定叫你们：",
+            "奶龙拍了拍圆肚皮，新名字已经想好啦：",
+            "奶龙胖嘟嘟地挤到前排，宣布你们叫：",
+            "奶龙决定少吃一口，把时间留给赐名！你们叫：",
+            "奶龙守住鸡腿，也守住新奶友！今日奶名是：",
+        ),
+        "naiwa": (
+            "呱！奶蛙来欢迎新朋友啦！你们的奶名是：",
+            "新奶友到啦！奶蛙蹲在荷叶上宣布：",
+            "奶蛙点名！从今天起，你们就叫：",
+            "欢迎加入奶家人！奶蛙为你们赐名：",
+            "荷叶晃一晃，新朋友登场！今日奶名是：",
+            "奶蛙已经笑着等半天啦！你们的新名字是：",
+            "奶蛙捧腹大笑着来迎新啦！你们就叫：",
+            "奶蛙一个蛙跳落在群里，宣布今日奶名：",
+            "呱声一响，新奶友登场！奶蛙赐名：",
+            "奶蛙蹲稳荷叶，认真给大家取名：",
+            "奶蛙笑得肚子疼，也没忘记欢迎新人！你们叫：",
+            "奶蛙开启战斗模式，只为抢先赐名：",
+            "上掌下拳准备完毕，奶蛙宣布新名字：",
+            "奶蛙似笑非笑地看了一眼，决定叫你们：",
+            "荷叶今天有点挤，因为新奶友叫：",
+            "奶蛙从池塘边飞奔而来，呱一声赐名：",
+            "奶蛙把笑声收一收，郑重宣布你们叫：",
+            "一声呱，两声呱，新奶友的名字是：",
+            "奶蛙抱着肚子滚了一圈，灵感来了！赐名：",
+            "奶蛙占好最佳荷叶位置，欢迎新朋友：",
+            "奶蛙呱呱点名，今天来的新奶友叫：",
+            "奶蛙蹲了半天，终于等到你们啦！赐名：",
+            "奶蛙笑声已经就位，新奶友名字也定了：",
+        ),
+    }
+    prefix = secrets.choice(prefixes[voice])
+    invitation = secrets.choice((
+        "！欢迎加入奶家人，鸡腿和荷叶都给你留位置啦！",
+        "！快来抽奶签，看看今天是鸡腿运还是荷叶运！",
+        "！有空来猜图，看看你能不能分清奶龙和奶蛙！",
+        "！先领一张随机奶图，正式开启含奶生活吧！",
+        "！从今天起一起吃鸡腿、蹲荷叶、捧腹大笑吧！",
+    ))
+    spoken: list[str] = []
+    for _, milk_name in entries:
+        candidate = "、".join((*spoken, milk_name))
+        remaining = len(entries) - len(spoken) - 1
+        suffix = f"，还有{remaining}位奶友" if remaining else ""
+        if len(prefix + candidate + suffix + invitation) > MAX_SPEECH_CHARS:
+            break
+        spoken.append(milk_name)
+    remaining = len(entries) - len(spoken)
+    suffix = f"，还有{remaining}位奶友" if remaining else ""
+    return f"{prefix}{'、'.join(spoken)}{suffix}{invitation}"
+
+
 def is_guess_start_command(text: str) -> bool:
     return text.strip() in {"猜图", "盲盒猜图", "来一局", "猜一猜"}
 
@@ -503,88 +641,75 @@ def is_hunter_ranking_command(text: str) -> bool:
 
 
 def is_milk_fortune_command(text: str) -> bool:
-    return text.strip() in {"今日奶运", "奶运", "奶龙签", "抽奶签"}
+    # 两种角色的别名都抽同一份日签，不用换命令刷角色或刷分。
+    return text.strip() in {"今日奶运", "奶运", "奶龙签", "奶蛙签", "抽奶签"}
 
 
-MILK_FORTUNE_GOOD = (
-    "主动接住群友的梗",
-    "发一张压箱底奶图",
-    "夸群友一句真心话",
-    "猜图时相信第一直觉",
-    "忙里偷闲摸鱼五分钟",
-    "给今天定个小目标",
-)
-MILK_FORTUNE_AVOID = (
-    "把奶蛙认成奶龙",
-    "连续刷屏十张表情",
-    "空腹参加长会议",
-    "把群聊聊成工单群",
-    "为了最后一句争输赢",
-    "潜水到大家以为你掉线",
-)
-MILK_FORTUNE_KEYWORDS = (
-    "接梗",
-    "松弛",
-    "好奇",
-    "开怀",
-    "摸鱼",
-    "行动",
-    "分享",
-    "好运",
-)
-MILK_FORTUNE_MESSAGES = (
-    "今天的快乐藏在第一句主动开口里。",
-    "别急着证明自己，先把群里的气氛接住。",
-    "适合做一点不费劲、但能让人开心的小事。",
-    "你的好运来得很轻，可能就是一个刚好的表情包。",
-    "先完成最小的一步，剩下的奶气会自己跟上。",
-    "今天很适合把严肃的话说得稍微可爱一点。",
-)
-
-
-def make_milk_fortune(
-    *,
-    chat_id: str,
-    sender_id: str,
-    day: str,
-) -> MilkFortune:
-    """同一群、同一用户、同一天得到相同奶运，不落库也不会重复刷随机值。"""
-    digest = hashlib.sha256(f"{day}\0{chat_id}\0{sender_id}".encode()).digest()
-    score = int.from_bytes(digest[0:4], "big") % 101
-    banter = int.from_bytes(digest[4:8], "big") % 101
-    if score >= 95:
-        title = "天选奶龙"
-    elif score >= 80:
-        title = "群聊锦鲤"
-    elif score >= 60:
-        title = "元气奶龙"
-    elif score >= 40:
-        title = "稳稳奶友"
-    elif score >= 20:
-        title = "慢热奶龙"
-    else:
-        title = "潜水奶苗"
-    return MilkFortune(
-        score=score,
-        banter=banter,
-        title=title,
-        keyword=MILK_FORTUNE_KEYWORDS[digest[8] % len(MILK_FORTUNE_KEYWORDS)],
-        good=MILK_FORTUNE_GOOD[digest[9] % len(MILK_FORTUNE_GOOD)],
-        avoid=MILK_FORTUNE_AVOID[digest[10] % len(MILK_FORTUNE_AVOID)],
-        message=MILK_FORTUNE_MESSAGES[digest[11] % len(MILK_FORTUNE_MESSAGES)],
-    )
-
-
-def format_milk_fortune(fortune: MilkFortune, *, day: str) -> str:
+def format_milk_fortune(
+    fortune: MilkFortune, *, day: str, milk_name: str | None = None,
+) -> str:
+    greeting = f"{milk_name}，收好你的奶签。\n" if milk_name else ""
+    mood = f"今日状态：{fortune.mood}\n" if fortune.mood else ""
     return (
         f"今日奶运：{fortune.title}\n"
-        f"奶气值 {fortune.score} · 接梗力 {fortune.banter}\n"
+        f"{greeting}{day} · {fortune.character}签 · {fortune.set_name}「{fortune.face}」\n\n"
+        f"{fortune.headline}\n"
+        f"奶气值 {fortune.score} · 接梗力 {fortune.banter} · "
+        f"{fortune.special_luck_label} {fortune.special_luck}\n\n"
+        f"{mood}"
         f"宜：{fortune.good}\n"
         f"忌：{fortune.avoid}\n"
         f"今日关键词：{fortune.keyword}\n"
-        f"{fortune.message}\n"
-        f"{day}，同一群同一天签固定。"
+        f"幸运物：{fortune.lucky_item}\n\n"
+        f"今日小事件：{fortune.daily_event}\n"
+        f"{fortune.message}\n\n"
+        "已存入本群收藏册。同一天签固定，运势仅供娱乐。\n"
+        "发送「奶签收藏册」看收集进度，「奶签历史」回看。"
     )
+
+
+def format_fortune_collection(
+    collection: FortuneCollection, *, history: bool = False, milk_name: str | None = None,
+) -> str:
+    title = "奶签历史" if history else "奶签收藏册"
+    greeting = f"\n{milk_name}，这是你的奶签收藏。" if milk_name else ""
+    if not collection.total:
+        return f"{title}{greeting}\n还没有收藏的奶签。发送「今日奶运」，抽到的签会自动保存。"
+    lines = [
+        f"{title}{greeting}",
+        f"累计抽签 {collection.total} 天 · 签面 {len(collection.faces)}/{len(FORTUNE_FACES)}",
+        f"当前连签 {collection.streak} 天 · 最长连签 {collection.longest_streak} 天", "",
+    ]
+    if not history:
+        for name, faces in FORTUNE_SETS.items():
+            collected = [face for face in faces if face in collection.faces]
+            missing = [face for face in faces if face not in collection.faces]
+            lines.append(f"{name} {len(collected)}/{len(faces)}")
+            lines.append("已收：" + ("、".join(collected) or "暂无"))
+            if missing:
+                lines.append("待收：" + "、".join(missing))
+            lines.append("")
+        badges = []
+        if collection.longest_streak >= 3:
+            badges.append("三日奶友")
+        if collection.longest_streak >= 7:
+            badges.append("一周不掉奶")
+        if collection.longest_streak >= 30:
+            badges.append("满月奶友")
+        badges.extend(f"{name}集齐" for name in collection.completed_sets)
+        lines.extend(["收藏徽章：" + ("、".join(badges) or "继续抽签，集签面或连签可解锁。"), ""])
+    lines.append(f"最近奶签 · 第 {collection.page}/{collection.pages} 页")
+    lines.extend(
+        f"{entry.day}  {entry.fortune.face} · {entry.fortune.title} · {entry.fortune.score} 分"
+        for entry in collection.entries
+    )
+    lines.extend(["", "发送「奶签历史 2」翻页；「奶签详情 2026-11-04」回看完整签文。"])
+    return "\n".join(lines)
+
+
+def parse_fortune_collection_command(text: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"(奶签收藏册|收藏册|奶签历史|奶签详情)(?:\s+(.*))?", text.strip())
+    return (match[1], (match[2] or "").strip()) if match else None
 
 
 GUESS_ANSWER_PATTERN = re.compile(r"^(?:猜|是|答案是?)?\s*(奶龙|奶蛙|其他)$")
@@ -702,6 +827,23 @@ def parse_douyin_topic_request(text: str) -> tuple[str, ...]:
 
 def has_direct_image(message) -> bool:
     return any(resource.type in {"image", "sticker"} for resource in message.resources)
+
+
+def gif_recognition_frame(image_bytes: bytes) -> bytes:
+    """GIF 用中间帧识别，避免封面或透明过渡帧导致漏识别；保存时仍保留原图。"""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            if getattr(image, "n_frames", 1) <= 1:
+                return image_bytes
+            image.seek(image.n_frames // 2)
+            frame = image.convert("RGBA")
+            background = Image.new("RGBA", frame.size, "white")
+            background.alpha_composite(frame)
+            output = io.BytesIO()
+            background.convert("RGB").save(output, format="JPEG", quality=95)
+            return output.getvalue()
+    except (OSError, ValueError):
+        return image_bytes
 
 
 def should_reply_media_error(*, mentioned_bot: bool, chat_type: str) -> bool:
@@ -1067,6 +1209,8 @@ def build_milk_fortune_card(
     fortune: MilkFortune,
     *,
     day: str,
+    historical: bool = False,
+    milk_name: str | None = None,
 ) -> dict[str, Any]:
     advice = {
         "tag": "column_set",
@@ -1099,21 +1243,29 @@ def build_milk_fortune_card(
     }
     return _handdrawn_card(
         summary=f"今日奶运 {fortune.score} 分，称号是{fortune.title}",
-        pill="每日一签",
-        title=f"今日奶运：{fortune.title}",
-        subtitle=f"{day} · 同一群同一天签固定",
+        pill=f"每日一签 · {fortune.character}",
+        title=f"{'奶签回看' if historical else '今日奶运'}：{fortune.title}",
+        subtitle=f"{day} · {fortune.set_name} · {fortune.face}",
         elements=[
+            *([_theme_panel([(f"{milk_name}，收好你的奶签。", "on_panel", True)])]
+              if milk_name else []),
             _theme_highlights(
                 [
                     ("奶气值", str(fortune.score), "accent_2", "on_accent_2"),
                     ("接梗力", str(fortune.banter), "accent", "on_accent"),
+                    (fortune.special_luck_label, str(fortune.special_luck), "panel", "on_panel"),
                 ]
             ),
             advice,
             _theme_panel(
                 [
                     (f"今日关键词：{fortune.keyword}", "on_panel", True),
+                    (fortune.headline, "on_panel", True),
+                    *([(f"今日状态：{fortune.mood}", "on_panel", False)] if fortune.mood else []),
+                    (f"幸运物：{fortune.lucky_item}", "on_panel", False),
+                    (f"今日小事件：{fortune.daily_event}", "on_panel", False),
                     (fortune.message, "muted", False),
+                    ("已存入本群收藏册 · 发送「奶签收藏册」回看 · 仅供娱乐", "muted", False),
                 ]
             ),
         ],
@@ -1322,53 +1474,91 @@ def format_help_message(
     report_time: time, *, platform: str = "feishu", allow_proactive: bool = False,
     speech_enabled: bool = False,
 ) -> str:
-    if platform == "qq":
-        report_note = (
+    """两端共用功能说明，只按平台调整操作方式，新增功能时同步更新这里。"""
+    qq = platform == "qq"
+    intro = (
+        "奶龙玩法\nQQ群里先 @我再发送下面的内容，私聊直接发。\n"
+        if qq else "我是奶龙，可以这样玩：\n群聊先 @我发送命令，私聊直接发。\n"
+    )
+    image_note = (
+        "发图或回复图片并 @我：识图、接奶，显示奶含量和稀有度。QQ表情请保存成图片。\n"
+        if qq else
+        "群里发图、表情会自动接奶；@我识图，可看奶含量和稀有度。\n"
+    )
+    family_note = (
+        "接奶（或奶家人）：领一张随机奶图。\n"
+        if qq else
+        "@我和群友：查看奶名；给 @群友 求赐名：给对方随机换名。\n"
+    )
+    report_note = (
+        (
             f"已开启主动播报，每天 {report_time.strftime('%H:%M')} 发送，需群主允许主动发言。"
             if allow_proactive else "当前未开启定时主动播报，可手动查询。"
         )
-        speech_note = (
-            "11. 奶龙说 你好：用奶龙的声音读出台词，最多 200 字。\n"
-            if speech_enabled else ""
-        )
-        return (
-            "我是奶龙，QQ群里先 @我再发送下面的内容，私聊直接发：\n"
-            "help / 帮助：随时查看这份使用说明，也支持 /help。\n"
-            "1. 图片：识别奶龙/奶蛙，查看奶含量和稀有度；QQ表情请保存成图片发送。\n"
-            "2. 直接发图片并 @我：识图后自动接同类奶图；"
-            "回复图片并 @我：同样识图并接龙，附奶含量和稀有度。\n"
-            "3. 回复原图或接龙图，再 @我发“纠正为奶龙/奶蛙/其他”：修正分类。\n"
-            "4. 奶龙图鉴：查看最近收录的奶图。\n"
-            f"5. 今日含奶量：查看本群已收到的图片统计。{report_note}\n"
-            "6. 猜图：开盲盒；@我 奶龙/奶蛙/其他 抢答；"
-            "公布答案：揭晓；猜图榜：看积分。\n"
-            "7. 奶龙猎人榜：看首发收图排行；今日奶运：抽当天奶签。\n"
-            "8. 接奶（或奶家人）：认领你为奶家人，领一张随机奶图，不用 @群友或输入昵称。\n"
-            "9. 求赐名：随机起一个不撞名的奶名并记住，再求一次就换名。\n"
-            "10. #奶龙 / #奶蛙 / #其他话题：找相关抖音视频，需搜索可用且链接通过QQ审核。\n"
-            "HDR奶图：领一张闪亮奶图。\n"
-            "安静一点 / 开始说话：@我关闭或恢复随机奶图、视频推送。\n"
-            f"{speech_note}群主允许接收全量消息后，普通发图也能自动接龙；"
-            "普通成员入群暂不能自动欢迎。奶运和识图使用文字回复。"
-        )
+        if qq else f"每天 {report_time.strftime('%H:%M')} 也会自动播报。"
+    )
+    speech_note = (
+        "奶龙说 你好 / 奶蛙说 你好：用对应声音读出台词，最多 200 字。\n"
+        "奶蛙大笑：让奶蛙直接笑一段。\n"
+        if speech_enabled else ""
+    )
+    answer_note = "@我后发" if qq else "直接发"
+    generator_note = "QQ 发静态 PNG。" if qq else "飞书支持动态 GIF。"
+    video_note = "需搜索可用且通过QQ审核。" if qq else "搜索可用时返回链接。"
     return (
-        "我是奶龙，可以这样玩：\n"
-        "群聊 @我发送 help 或 帮助，私聊直接发；也支持 /help。\n"
-        "1. 直接发送图片或表情：自动接龙，不用 @。\n"
-        "2. 回复图片并 @我：查看识别结果、奶龙浓度和稀有度。\n"
-        "3. 回复原图或接龙图，发送“纠正为奶龙/奶蛙/其他”：修正分类。\n"
-        "4. 发送“奶龙图鉴”：查看最近收录的奶龙图。\n"
-        "5. 发送“今日含奶量”：立即查看；"
-        f"每天 {report_time.strftime('%H:%M')} 也会自动播报。\n"
-        "6. 发送“猜图”：开一局盲盒猜图，抢答“奶龙/奶蛙/其他”得分；"
-        "“公布答案”揭晓本局，“猜图榜”看积分排行。\n"
-        "7. 发送“奶龙猎人榜”：看谁首发收进图鉴的奶图最多。\n"
-        "8. 发送“今日奶运”：抽当天固定奶签，看看奶气值、宜忌和称号。\n"
-        "9. @我发送“求赐名”：随机起一个不撞名的奶名并记住，再求一次就换名。\n"
-        "10. 发送“HDR奶图”：立即来一张闪亮奶图；自动接龙也会随机转成闪亮 GIF。\n"
-        "@我发送“安静一点”或“开始说话”：关闭或恢复随机奶图、视频推送。"
-    ) + ("\n11. @我发送“奶龙说 你好”：用奶龙的声音读出台词，最多 200 字。"
-         if speech_enabled else "")
+        f"{intro}"
+        "help / 帮助：查看玩法。\n"
+        "\n奶名与奶家人\n"
+        "取奶名 奶狗：自选奶名，每 7 天成功一次。\n"
+        "求赐名：随机换奶名，不限次数。\n"
+        "名字会记住；取名撞名会提醒，失败不占次数。\n"
+        f"{family_note}"
+        "\n每日抽签与收藏\n"
+        "今日奶运：抽今日签，四个主题等概率，当天固定、零点更新。\n"
+        f"奶签收藏册：看 {len(FORTUNE_FACES)} 张签面、套装和连签徽章。\n"
+        "奶签历史 2：翻到第二页；奶签详情 2026-11-04：回看那天的签。\n"
+        "\n识图与接奶\n"
+        f"{image_note}"
+        "随机奶图 / 来张奶图：随机领一张奶龙或奶蛙。\n"
+        "回复奶图发“标怪图 / 取消怪图”：加入或移出怪图接龙池。\n"
+        "奶龙图鉴：看最近收录的奶图。\n"
+        "发抖音或小红书图文分享文案和链接并 @我：识别奶蛙/奶龙，收录图片并同步图鉴；视频跳过。\n"
+        "回复图片发“纠正为奶龙/奶蛙/其他”：修正分类。\n"
+        "HDR奶图：尝试高亮奶图，效果取决于平台、客户端和屏幕。\n"
+        "\n群聊小游戏\n"
+        f"猜图：开盲盒，{answer_note}“奶龙/奶蛙/其他”抢答。\n"
+        "公布答案：揭晓；猜图榜：看积分；奶龙猎人榜：看首发收图排行。\n"
+        "\n奶系创作\n"
+        "奶峰生成器 鸡腿拿来！ / 奶蛙字 笑得肚子疼：做文字表情包。\n"
+        f"最多 60 字、四行，默认全部随机。{generator_note}\n"
+        "奶峰生成器：查看配色、头像、动作等全部参数。\n"
+        f"{speech_note}"
+        f"#奶龙 / #奶蛙 / #话题：@我找抖音奶视频，{video_note}\n"
+        "\n群聊设置\n"
+        f"今日含奶量：查看本群统计。{report_note}\n"
+        "安静一点 / 开始说话：@我关闭或恢复主动推送。"
+    )
+
+
+def build_help_card(text: str) -> dict[str, Any]:
+    """帮助使用飞书原生分组卡片；每组保留常用命令，详细参数走独立命令。"""
+    elements = []
+    for index, paragraph in enumerate(text.split("\n\n")):
+        lines = paragraph.splitlines()
+        if index and lines:
+            lines[0] = f"**{lines[0]}**"
+        content = "\n".join(lines)
+        content = re.sub(r"^([^：\n]{1,32})：", r"**\1**：", content, flags=re.MULTILINE)
+        elements.append({"tag": "markdown", "content": content})
+    return {
+        "schema": "2.0",
+        "config": {"enable_forward": True, "summary": {"content": "奶龙玩法"}},
+        "header": {
+            "title": {"tag": "plain_text", "content": "奶龙玩法"},
+            "template": "yellow",
+        },
+        "body": {"vertical_spacing": "12px", "elements": elements},
+    }
 
 
 def format_catalog_caption(stats: CatalogStats, shown: int) -> str:
@@ -1417,6 +1607,16 @@ def format_existing_observation(
         display_label = DISPLAY_LABELS[observation.asset.label]
         return f"这张图已经确认是{display_label}，图鉴编号 #{observation.asset.id:04d}。"
     return format_prediction(prediction)
+
+
+def parse_chain_weights(value: str) -> tuple[int, ...]:
+    try:
+        weights = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("chain weights must be integers: similar,weird,random") from exc
+    if len(weights) != 3 or any(weight < 0 for weight in weights) or not any(weights):
+        raise argparse.ArgumentTypeError("chain weights require three nonnegative values with a positive total")
+    return weights
 
 
 def parse_args() -> argparse.Namespace:
@@ -1468,6 +1668,24 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         type=float,
         default=float(os.environ["MODEL_THRESHOLD"]) if os.getenv("MODEL_THRESHOLD") else None,
+    )
+    parser.add_argument(
+        "--chain-weights", type=parse_chain_weights,
+        default=os.getenv("BOT_CHAIN_WEIGHTS", "20,40,30"),
+        help="Relative weights for similar,weird,random image chaining.",
+    )
+    parser.add_argument(
+        "--feishu-emoji-ids-file",
+        type=Path,
+        default=os.getenv("NAILONG_FEISHU_EMOJI_IDS_FILE") or None,
+        help="JSON mapping of emoji names to Feishu enterprise emoji IDs.",
+    )
+    parser.add_argument(
+        "--chain-top-k", type=int, default=int(os.getenv("BOT_CHAIN_TOP_K", "5")),
+    )
+    parser.add_argument(
+        "--chain-min-similarity", type=float,
+        default=float(os.getenv("BOT_CHAIN_MIN_SIMILARITY", "0.55")),
     )
     parser.add_argument(
         "--daily-report-time",
@@ -1537,6 +1755,12 @@ def parse_args() -> argparse.Namespace:
             os.getenv("DOUYIN_SEARCH_KEYWORDS", ",".join(SEARCH_KEYWORDS))
         ),
         help="Comma-separated Douyin topics. A leading # is optional.",
+    )
+    parser.add_argument(
+        "--xiaohongshu-cookie-file", type=Path,
+        default=Path(os.environ["XIAOHONGSHU_COOKIE_FILE"])
+        if os.getenv("XIAOHONGSHU_COOKIE_FILE") else None,
+        help="Private browser-exported Xiaohongshu cookie JSON for shared note parsing.",
     )
     parser.add_argument(
         "--douyin-search-cache-seconds",
@@ -1613,6 +1837,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("douyin search cache seconds must be positive")
     if args.doubao_threshold is not None and not 0 < args.doubao_threshold < 1:
         parser.error("doubao threshold must be between 0 and 1")
+    if args.chain_top_k < 1 or not 0 <= args.chain_min_similarity <= 1:
+        parser.error("chain top-k must be positive; similarity must be between 0 and 1")
     return args
 
 
@@ -1620,6 +1846,7 @@ async def run_bot(args: argparse.Namespace) -> None:
     configs = load_adapter_configs(getattr(args, "bots_config", None))
     adapters: list[BotAdapter] = []
     tasks: list[asyncio.Task] = []
+    index_task: asyncio.Task | None = None
     try:
         # 先校验所有接入凭证，再加载一份共用模型，避免每个机器人重复占内存。
         # SDK 导入时捕获模块级事件循环；即使只有一个飞书实例，在运行中的
@@ -1648,10 +1875,19 @@ async def run_bot(args: argparse.Namespace) -> None:
                 if args.doubao_model
                 else None
             )
-        services = BackendServices(
-            predictor, BotStore(args.state_dir), doubao_detector,
-            speech_client=NailongSpeechClient.from_environment(),
+        store = BotStore(args.state_dir)
+        chain_selector = ChainSelector(
+            store, weights=getattr(args, "chain_weights", (20, 40, 30)),
+            top_k=getattr(args, "chain_top_k", 5),
+            min_similarity=getattr(args, "chain_min_similarity", 0.55),
         )
+        services = BackendServices(
+            predictor, store, doubao_detector,
+            speech_client=NailongSpeechClient.from_environment(),
+            chain_selector=chain_selector,
+        )
+        # 独立索引任务不参加接入实例的 gather；图库没准备好也能正常启动和随机接龙。
+        index_task = asyncio.create_task(chain_selector.build_index(), name="chain-index")
         for config, adapter in zip(configs, adapters, strict=True):
             runtime_args = argparse.Namespace(**vars(args))
             if getattr(args, "bots_config", None):
@@ -1659,12 +1895,17 @@ async def run_bot(args: argparse.Namespace) -> None:
                 # 不能把旧全局文档配置无意间复制给所有 QQ/飞书实例。
                 runtime_args.catalog_document_id = config.catalog_document_id
                 runtime_args.catalog_section_block_id = config.catalog_section_block_id
+                # 企业表情 ID 只在对应租户可用，多实例时按机器人单独配置。
+                runtime_args.feishu_emoji_ids_file = config.settings.get("emoji_ids_file")
             tasks.append(asyncio.create_task(
                 run_adapter(runtime_args, adapter, services),
                 name=f"bot:{config.instance_id}",
             ))
         await asyncio.gather(*tasks)
     finally:
+        if index_task:
+            index_task.cancel()
+            await asyncio.gather(index_task, return_exceptions=True)
         for task in tasks:
             task.cancel()
         # 一个实例异常退出时也必须收尾其余实例；重抛失败任务会跳过 close。
@@ -1677,6 +1918,23 @@ async def run_bot(args: argparse.Namespace) -> None:
                 LOGGER.exception("Adapter shutdown failed instance=%s", adapter.scope.instance_id)
 
 
+def load_feishu_emoji_ids(path: str | Path | None) -> dict[str, str]:
+    if not path:
+        return {}
+    try:
+        entries = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(entries, dict) or not entries or any(
+            not name.strip() or not isinstance(emoji_id, str)
+            or not re.fullmatch(r"[0-9]+", emoji_id)
+            for name, emoji_id in entries.items()
+        ):
+            raise ValueError("Expected a JSON object of names and numeric ID strings")
+        return {name.strip(): emoji_id for name, emoji_id in entries.items()}
+    except (OSError, ValueError):
+        LOGGER.warning("Could not load Feishu enterprise emoji mapping")
+        return {}
+
+
 async def run_adapter(
     args: argparse.Namespace, channel: BotAdapter, services: BackendServices
 ) -> None:
@@ -1686,11 +1944,17 @@ async def run_adapter(
     chain_lock = asyncio.Lock()
     guess_lock = asyncio.Lock()
     contact_resolver = channel
+    feishu_emoji_ids = (
+        load_feishu_emoji_ids(getattr(args, "feishu_emoji_ids_file", None))
+        if channel.scope.platform == "feishu" else {}
+    )
+    feishu_emoji_lookup = {name.casefold(): emoji_id for name, emoji_id in feishu_emoji_ids.items()}
     # 每个群上次主动推送的单调时钟时间，用于冷却；进程内存着即可，重启清零无妨。
     last_random_push: dict[str, float] = {}
     # 第三方生图机器人不属于奶家人，也不写入数据库；仅在当前进程记住其群内身份。
     milk_image_generator_ids: dict[str, str] = {}
     douyin_search_lock = asyncio.Lock()
+    social_import_lock = asyncio.Lock()
     douyin_video_cache: dict[tuple[str, ...], tuple[float, list[DouyinVideo]]] = {}
     catalog_sync_event = asyncio.Event()
     catalog_sync_lock = asyncio.Lock()
@@ -1716,29 +1980,59 @@ async def run_adapter(
             baseline_count,
         )
 
-    async def reply(message, text: str):
+    async def reply(message, text: str, *, in_thread: bool = False):
+        options = {"reply_to": message.message_id}
+        if in_thread:
+            options["reply_in_thread"] = True
         result = await channel.send(
             message.chat_id,
             {"text": text},
-            {"reply_to": message.message_id},
+            options,
         )
         if not result.success:
             LOGGER.error("Failed to reply: %s", result.error)
         return result
 
-    async def reply_card(message, card: dict[str, Any], fallback_text: str):
+    async def reply_card(
+        message, card: dict[str, Any], fallback_text: str, *, in_thread: bool = False,
+    ):
+        options = {"reply_to": message.message_id}
+        if in_thread:
+            options["reply_in_thread"] = True
         result = await channel.send(
             message.chat_id,
             {"card": card, "fallback_text": fallback_text},
-            {"reply_to": message.message_id},
+            options,
         )
         if result.success:
             return result
         LOGGER.error("Failed to reply with card: %s", result.error)
+        # QQ 在适配层完成确定拒绝时的样式降级，不再重复发送或猜测未知错误。
+        if channel.scope.platform == "qq":
+            return result
         if result.error and result.error.code in {ErrorCode.TARGET_REVOKED, ErrorCode.SEND_TIMEOUT}:
             return result
         LOGGER.info("Falling back to plain-text reply after card send failure")
-        return await reply(message, fallback_text)
+        return await reply(message, fallback_text, in_thread=in_thread)
+
+    async def fortune_milk_name(message) -> str:
+        """直接喊已登记的奶名；首次抽签分配一次，普通抽签不触发换名或额外发图。"""
+        assigned = await asyncio.to_thread(store.milk_name_for_user, message.sender_id)
+        if assigned is not None:
+            return assigned.milk_name
+        member = await asyncio.to_thread(store.milk_family_member, message.sender_id)
+        display_name = (message.sender_name or (
+            member.display_name if member else None
+        ) or "").strip()
+        name_known = bool(display_name and display_name not in LEGACY_NAME_FALLBACKS)
+        original_name = display_name if name_known else "神秘奶友"
+        assigned = await asyncio.to_thread(
+            store.assign_milk_name, message.sender_id,
+            original_name=original_name, milk_name=make_milk_name(original_name),
+            name_options=milk_name_options, original_name_known=name_known,
+            replace_existing=False,
+        )
+        return assigned.milk_name
 
     async def reply_image(message, source: bytes | Path, caption: str):
         image_source = source if isinstance(source, bytes) else str(source)
@@ -1750,6 +2044,35 @@ async def run_adapter(
         if not result.success:
             LOGGER.error("Failed to reply with image: %s", result.error)
         return result
+
+    async def send_milk_name_speech(
+        chat_id: str, text: str, *, reply_to: str | None = None,
+        voice: str = "nailong",
+    ) -> None:
+        """赐名语音是文字结果的互动补充，失败时不影响赐名和新人欢迎。"""
+        if channel.scope.platform != "feishu" or services.speech_client is None:
+            return
+        try:
+            audio = await services.speech_client.synthesize(text, voice=voice)
+            options = {"reply_to": reply_to} if reply_to else None
+            result = await channel.send(
+                chat_id,
+                {"audio": {
+                    "source": audio.opus,
+                    "duration_ms": audio.duration_ms,
+                }},
+                options,
+            )
+            if not result.success:
+                LOGGER.warning(
+                    "Milk name speech send failed instance=%s",
+                    channel.scope.instance_id,
+                )
+        except Exception:
+            LOGGER.exception(
+                "Milk name speech generation failed instance=%s",
+                channel.scope.instance_id,
+            )
 
     async def request_milk_name_image(message, milk_name: str) -> None:
         image_bot_open_id = (
@@ -1865,7 +2188,7 @@ async def run_adapter(
         reply_to: bool,
         caption: str | None = None,
     ):
-        """接龙、主动推送和点名闪亮奶图共用发送入口。"""
+        """接龙、主动推送、随机奶图和手动 HDR 奶图共用发送入口。"""
         if doubao_detector:
             doubao_prediction = await asyncio.to_thread(
                 doubao_detector.predict_path,
@@ -1878,47 +2201,62 @@ async def run_adapter(
                     doubao_prediction.confidence,
                 )
                 return None
+        # 飞书原图保留增益图，但普通图片气泡会取 SDR 衍生图；卡片图片已实测保留 HDR。
+        # QQ 仍走原来的 GIF 兼容路径，平台与展示方式的选择留在业务编排层。
+        effect = "hdr" if channel.scope.platform == "feishu" else "flash"
         content = await asyncio.to_thread(
             random_milk_image_content,
             asset.path,
             probability=hdr_probability,
             peak_nits=args.hdr_peak_nits,
+            effect=effect,
         )
-        is_flash_gif = isinstance(content["image"]["source"], bytes)
-        if caption and not is_flash_gif:
+        is_derived = isinstance(content["image"]["source"], bytes)
+        if is_derived and effect == "hdr":
+            content["image"]["presentation"] = "card"
+        if caption and not is_derived:
             content["caption"] = caption
         options = {"reply_to": message.message_id} if reply_to else None
         result = await channel.send(message.chat_id, content, options)
-        # GIF 上传失败时只回退一次原图；群已撤销或发送结果不确定时不重复发。
+        # 衍生图上传失败时只回退一次原图；群已撤销或发送结果不确定时不重复发。
         if (
             not result.success
-            and is_flash_gif
+            and is_derived
             and result.error
             and result.error.code == ErrorCode.UPLOAD_FAILED
         ):
             LOGGER.warning(
-                "Flash GIF upload failed, falling back to original asset_id=%d",
-                asset.id,
+                "Derived image upload failed, falling back to original asset_id=%d effect=%s",
+                asset.id, effect,
             )
             result = await channel.send(
                 message.chat_id, {"image": {"source": str(asset.path)}}, options
             )
-            is_flash_gif = False
+            is_derived = False
         if result.success:
+            if result.message_id:
+                await asyncio.to_thread(
+                    store.record_chain_reply,
+                    chat_id=message.chat_id,
+                    label=asset.label,
+                    asset_id=asset.id,
+                    response_message_id=result.message_id,
+                )
             LOGGER.info(
-                "Milk image sent chat_hash=%s asset_id=%d flash_gif=%s message_id=%s",
+                "Milk image sent chat_hash=%s asset_id=%d flash_gif=%s hdr_jpeg=%s message_id=%s",
                 store.identity_hash(message.chat_id),
                 asset.id,
-                is_flash_gif,
+                is_derived and effect == "flash",
+                is_derived and effect == "hdr",
                 result.message_id,
             )
         elif result.error and result.error.code == ErrorCode.TARGET_REVOKED:
             await asyncio.to_thread(store.deactivate_chat, message.chat_id)
         else:
             LOGGER.error(
-                "Milk image send failed asset_id=%d flash_gif=%s error=%s",
+                "Milk image send failed asset_id=%d effect=%s error=%s",
                 asset.id,
-                is_flash_gif,
+                effect if is_derived else "original",
                 result.error,
             )
         return result
@@ -1955,6 +2293,90 @@ async def run_adapter(
                     return []
             return videos
 
+    async def import_social_link(message, url: str) -> None:
+        """用户明确分享链接才解析；逐图识别、收录，文档仍走原有去重与重试流程。"""
+        async with social_import_lock:
+            await reply(message, "正在读取图片或抽取视频画面并识别奶蛙、奶龙，稍等一下。")
+            images = iter_social_images(
+                url, douyin_cookie_file=args.douyin_cookie_file,
+                xiaohongshu_cookie_file=getattr(args, "xiaohongshu_cookie_file", None),
+                share_text=message.body_text or message.content_text,
+            )
+            counts: Counter = Counter()
+            known_hashes: dict[str, str] = {}
+            error_text = ""
+            try:
+                while (image := await asyncio.to_thread(next, images, None)) is not None:
+                    counts.update(["processed"])
+                    if not image.content:
+                        counts.update(["failed"])
+                        continue
+                    fingerprint = await asyncio.to_thread(try_content_hash, image.content)
+                    if fingerprint and find_duplicate(fingerprint, known_hashes):
+                        counts.update(["duplicate"])
+                        continue
+                    if fingerprint:
+                        known_hashes[image.source_key] = fingerprint
+                    try:
+                        if doubao_detector:
+                            guard = await asyncio.to_thread(
+                                doubao_detector.predict_bytes, image.content,
+                            )
+                            if guard.detected:
+                                counts.update(["filtered"])
+                                continue
+                        prediction = await asyncio.to_thread(predictor.predict_bytes, image.content)
+                        if not prediction.accepted or prediction.label not in {"nailong", "naiwa"}:
+                            counts.update(["filtered"])
+                            continue
+                        observation = await asyncio.to_thread(
+                            store.record_observation,
+                            image_bytes=image.content,
+                            source_message_id=f"{message.message_id}:social:{image.source_key}",
+                            chat_id=message.chat_id, chat_type=message.chat_type,
+                            sender_id=message.sender_id, discoverer_name=message.sender_name,
+                            predicted_label=prediction.label, confidence=prediction.confidence,
+                            accepted=True, promote_seed=True,
+                        )
+                        if observation.asset.label not in {"nailong", "naiwa"}:
+                            counts.update(["filtered"])
+                            continue
+                        counts.update([observation.asset.label])
+                        if observation.is_new_asset:
+                            counts.update(["new"])
+                        services.notify_catalog_changed()
+                    except Exception:
+                        LOGGER.exception("Social image recognition failed kind=%s", image.kind)
+                        counts.update(["failed"])
+            except SocialMediaError as exc:
+                error_text = str(exc)
+            finally:
+                await asyncio.to_thread(images.close)
+            if error_text and not counts["processed"]:
+                await reply(message, error_text)
+                return
+            lines = [
+                f"链接识别：处理 {counts['processed']} 张图片或视频帧，"
+                f"奶蛙 {counts['naiwa']} 张，奶龙 {counts['nailong']} 张，"
+                f"新收录 {counts['new']} 张。",
+            ]
+            if counts["duplicate"]:
+                lines.append(f"跳过 {counts['duplicate']} 张重复或近重复图。")
+            if counts["filtered"]:
+                lines.append(f"{counts['filtered']} 张未通过奶图识别或豆包过滤，不收录。")
+            if counts["failed"]:
+                lines.append(f"{counts['failed']} 张下载或识别失败，其他图片已继续处理。")
+            if counts["naiwa"] or counts["nailong"]:
+                lines.append(
+                    "已进入图鉴文档同步队列，重复图片不会再插入。"
+                    if services.catalog_sync_events else "已存入图库；当前未配置图鉴文档同步。"
+                )
+                if args.catalog_document_id:
+                    lines.append(f"https://bytedance.feishu.cn/docx/{args.catalog_document_id}")
+            if error_text:
+                lines.append(error_text)
+            await reply(message, "\n".join(lines))
+
     async def reply_catalog(
         message,
         assets: list[AssetRecord],
@@ -1982,6 +2404,17 @@ async def run_adapter(
         text = message.body_text or message.content_text
         normalized_text = text.strip().replace(" ", "")
         mentioned_users = mentioned_user_ids(message, body_text=text)
+        custom_milk_name = parse_custom_milk_name_command(text)
+
+        if (
+            normalized_text in {"初始化", "初始化群聊"}
+            and channel.scope.platform == "feishu"
+            and message.chat_type == "group"
+            and message.mentioned_bot
+        ):
+            await reply(message, "正在登记群成员并分析历史表情包，稍等一下。")
+            await initialize_group(message.chat_id)
+            return True
 
         # 帮助优先于群友点名和引用图片，避免问用法时误触发查奶名或识图。
         if is_help_request(
@@ -1990,7 +2423,85 @@ async def run_adapter(
             await reply_usage(message)
             return True
 
+        if feishu_emoji_ids and (message.mentioned_bot or message.chat_type == "p2p"):
+            emoji_command = re.fullmatch(r"(?:奶龙|奶蛙)表情[ \t:：]*(.*)", text.strip())
+            if emoji_command:
+                name = emoji_command[1].strip().removeprefix("奶龙").strip()
+                emoji_id = feishu_emoji_lookup.get(name.casefold())
+                if emoji_id is None:
+                    await reply(message, "可以点播这些小表情：" + "、".join(feishu_emoji_ids))
+                    return True
+                # 飞书富文本需要企业表情的原始 ID 字符串，避免长整数精度丢失。
+                emotion = {"tag": "emotion", "emoji_type": emoji_id}
+                result = await channel.send(
+                    message.chat_id,
+                    {"post": {"zh_cn": {"content": [[emotion]]}}},
+                    {"reply_to": message.message_id},
+                )
+                if not result.success:
+                    LOGGER.warning("Feishu enterprise emoji reply failed: %s", result.error)
+                return True
+
+        social_link = find_social_link(text)
+        if social_link and (message.mentioned_bot or message.chat_type == "p2p"):
+            await import_social_link(message, social_link)
+            return True
+
+        # 明确要随机图时优先响应命令，不因引用图片或 @群友转去识图、点名。
+        # 复用图库两类等概率抽图和已有发送护栏，只返回普通图片。
+        if is_random_milk_command(text):
+            asset = await asyncio.to_thread(store.random_milk_asset)
+            if asset is None:
+                await reply(message, "图库里还没有奶图，先发张奶龙或奶蛙图片给我收录吧。")
+            else:
+                result = await send_milk_image(
+                    message, asset, hdr_probability=0, reply_to=True,
+                )
+                if result is None:
+                    await reply(message, "这张奶图暂时不能发送，再试一次吧。")
+                elif not result.success and (
+                    result.error is None
+                    or result.error.code not in {ErrorCode.TARGET_REVOKED, ErrorCode.SEND_TIMEOUT}
+                ):
+                    await reply(message, "奶图没发出去，稍后再试试。")
+            return True
+
+        try:
+            milk_text = parse_milk_text_command(text)
+        except ValueError as error:
+            if message.mentioned_bot or message.chat_type == "p2p":
+                await reply(message, str(error))
+                return True
+            return False
+        if (
+            milk_text is not None
+            and (message.mentioned_bot or message.chat_type == "p2p")
+        ):
+            if not milk_text.text:
+                await reply(message, MILK_TEXT_USAGE)
+            else:
+                try:
+                    if channel.scope.platform == "qq":
+                        # QQ 适配器会移除透明通道，先合成奶油底，避免透明区域变成黑底。
+                        # QQ 当前富媒体发送只保留 PNG 首帧；仍保留随机倾斜和错位的字形。
+                        milk_text = replace(milk_text, background="cream", motion="static")
+                    # 在工作线程排版，避免阻塞消息接收和模型推理。
+                    image = await asyncio.to_thread(render_milk_text, milk_text)
+                    result = await reply_image(message, image, "")
+                    if not result.success:
+                        await reply(message, "奶字图片没发出去，稍后再试试。")
+                except ValueError as error:
+                    await reply(message, str(error))
+                except Exception:
+                    LOGGER.exception("Milk text render failed")
+                    await reply(message, "奶字制作失败，稍后再试试。")
+            return True
+
+        naiwa_speech_text = parse_naiwa_speech_command(text)
         speech_text = parse_speech_command(text)
+        speech_voice = "naiwa" if naiwa_speech_text is not None else "nailong"
+        if naiwa_speech_text is not None:
+            speech_text = naiwa_speech_text
         if (
             speech_text is not None
             and channel.scope.platform in {"feishu", "qq"}
@@ -1999,13 +2510,18 @@ async def run_adapter(
             if services.speech_client is None:
                 await reply(message, "语音功能暂未启用。")
             elif not speech_text or len(speech_text) > MAX_SPEECH_CHARS:
-                await reply(message, f"发送“奶龙说 你好”，台词最多 {MAX_SPEECH_CHARS} 字。")
+                command = "奶蛙说 你好" if speech_voice == "naiwa" else "奶龙说 你好"
+                await reply(message, f"发送“{command}”，台词最多 {MAX_SPEECH_CHARS} 字。")
             else:
                 try:
                     with services.speech_limiter.admit(
                         chat_id=message.chat_id, user_id=message.sender_id
                     ):
-                        audio = await services.speech_client.synthesize(speech_text)
+                        audio = (
+                            await services.speech_client.synthesize(speech_text, voice="naiwa")
+                            if speech_voice == "naiwa"
+                            else await services.speech_client.synthesize(speech_text)
+                        )
                     result = await channel.send(
                         message.chat_id,
                         {"audio": {
@@ -2026,6 +2542,7 @@ async def run_adapter(
         if (
             message.mentioned_bot
             and mentioned_users
+            and custom_milk_name is None
             and is_milk_name_grant_for_other_command(text)
         ):
             # 只有明确说“给某人求赐名”才替群友起名；普通求赐名仍只作用于本人。
@@ -2057,17 +2574,25 @@ async def run_adapter(
                     display_name, existing.milk_name, existing=already_named
                 ),
             )
+            await send_milk_name_speech(
+                message.chat_id,
+                format_milk_name_speech(existing.milk_name),
+            )
             await request_milk_name_image(message, existing.milk_name)
             return True
 
         if (
-            is_milk_name_command(text)
+            (is_milk_name_command(text) or custom_milk_name is not None)
             and (message.mentioned_bot or message.chat_type != "group")
         ):
             # 指令只给发送者本人起名，优先于群友点名和引用图片逻辑。
             # 已有真实原昵称不重复查询；系统兜底留下的空缺允许后续补全。
+            if custom_milk_name == "":
+                await reply(message, "发送「取奶名 奶狗」，把奶狗换成你想要的名字就行。")
+                return True
             if not message.sender_id:
-                await reply(message, "暂时拿不到你的身份，请重新发送“求赐名”试试。")
+                command = "取奶名 你想要的名字" if custom_milk_name is not None else "求赐名"
+                await reply(message, f"暂时拿不到你的身份，请重新发送「{command}」试试。")
                 return True
             assigned = await asyncio.to_thread(store.milk_name_for_user, message.sender_id)
             name_known = assigned is not None and assigned.original_name_known
@@ -2098,20 +2623,43 @@ async def run_adapter(
                     )
                 else:
                     display_name = "神秘奶友"
-            assigned = await asyncio.to_thread(
-                store.assign_milk_name,
-                message.sender_id,
-                original_name=display_name,
-                milk_name=make_milk_name(display_name),
-                name_options=milk_name_options,
-                original_name_known=name_known,
-            )
-            await reply(
-                message, format_milk_name_grant(
-                    assigned.original_name, assigned.milk_name,
-                    original_name_known=assigned.original_name_known,
+            try:
+                assigned = await asyncio.to_thread(
+                    store.assign_milk_name,
+                    message.sender_id,
+                    original_name=display_name,
+                    milk_name=(
+                        custom_milk_name
+                        if custom_milk_name is not None else make_milk_name(display_name)
+                    ),
+                    name_options=None if custom_milk_name is not None else milk_name_options,
+                    original_name_known=name_known,
+                    exact_name=custom_milk_name is not None,
+                    weekly_limit=custom_milk_name is not None,
                 )
-            )
+            except ValueError as error:
+                if custom_milk_name is None:
+                    raise
+                await reply(message, str(error))
+                return True
+            if custom_milk_name is not None:
+                await reply(
+                    message,
+                    f"你的奶名是「{assigned.milk_name}」，已经记住啦。\n"
+                    "以后抽奶签就喊这个名字。「取奶名」每 7 天成功一次，"
+                    "「求赐名」可无限次随机换名。",
+                )
+            else:
+                await reply(
+                    message, format_milk_name_grant(
+                        assigned.original_name, assigned.milk_name,
+                        original_name_known=assigned.original_name_known,
+                    )
+                )
+                await send_milk_name_speech(
+                    message.chat_id,
+                    format_milk_name_speech(assigned.milk_name),
+                )
             return True
 
         if message.mentioned_bot and normalized_text in {"安静一点", "少说话", "闭嘴"}:
@@ -2122,6 +2670,80 @@ async def run_adapter(
         if message.mentioned_bot and normalized_text in {"开始说话", "活跃一点", "别安静"}:
             await asyncio.to_thread(store.set_proactive_enabled, message.chat_id, True)
             await reply(message, "收到，恢复正常参与。")
+            return True
+
+        collection_command = parse_fortune_collection_command(text)
+        if is_milk_fortune_command(text) or collection_command:
+            if not message.sender_id:
+                await reply(message, "暂时拿不到你的身份，请重新发送奶签命令。")
+                return True
+            day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+            if is_milk_fortune_command(text):
+                fortune = await asyncio.to_thread(
+                    store.draw_milk_fortune,
+                    chat_id=message.chat_id, sender_id=message.sender_id, day=day,
+                )
+                milk_name = await fortune_milk_name(message)
+                await reply_card(
+                    message, build_milk_fortune_card(fortune, day=day, milk_name=milk_name),
+                    format_milk_fortune(fortune, day=day, milk_name=milk_name),
+                )
+                return True
+            command, argument = collection_command
+            if command == "奶签详情":
+                try:
+                    requested_day = datetime.strptime(argument, "%Y-%m-%d").date().isoformat()
+                except ValueError:
+                    await reply(message, "请发送「奶签详情 2026-11-04」，日期格式为 年-月-日。")
+                    return True
+                fortune = await asyncio.to_thread(
+                    store.milk_fortune_on,
+                    chat_id=message.chat_id, sender_id=message.sender_id, day=requested_day,
+                )
+                if fortune is None:
+                    await reply(message, "那天没有收藏奶签。发送「奶签历史」查看已收藏的日期。")
+                else:
+                    milk_name = await fortune_milk_name(message)
+                    await reply_card(
+                        message,
+                        build_milk_fortune_card(
+                            fortune, day=requested_day, historical=True, milk_name=milk_name,
+                        ),
+                        format_milk_fortune(
+                            fortune, day=requested_day, milk_name=milk_name,
+                        ).replace(
+                            "今日奶运：", "奶签回看：", 1
+                        ),
+                    )
+                return True
+            if argument and (not re.fullmatch(r"[0-9]{1,5}", argument)
+                             or not 1 <= int(argument) <= 10000):
+                await reply(message, "页码请填 1 到 10000，例如「奶签历史 2」。")
+                return True
+            collection = await asyncio.to_thread(
+                store.milk_fortune_collection,
+                chat_id=message.chat_id, sender_id=message.sender_id, today=day,
+                page=int(argument or "1"),
+            )
+            if collection.page > collection.pages:
+                await reply(message, f"目前共 {collection.pages} 页，请发送「奶签历史 1」回看。")
+                return True
+            milk_name = await fortune_milk_name(message)
+            summary = format_fortune_collection(
+                collection, history=command == "奶签历史", milk_name=milk_name,
+            )
+            card = _handdrawn_card(
+                summary=summary.splitlines()[0], pill="奶签收藏",
+                title=summary.splitlines()[0],
+                subtitle="只展示你在当前聊天中收藏的奶签",
+                # 每套签面共用一个面板；百级收藏按段落展示，避免每一行都占一张容器。
+                elements=[
+                    _theme_panel([(line, "on_panel", False) for line in paragraph.splitlines()])
+                    for paragraph in "\n".join(summary.splitlines()[1:]).split("\n\n")
+                    if paragraph
+                ],
+            )
+            await reply_card(message, card, summary)
             return True
 
         # QQ 用发送者的可靠身份直接领图，不依赖群成员 @ 或昵称解析。
@@ -2208,18 +2830,18 @@ async def run_adapter(
                 await reply(message, "还没有可用奶图，先发几张奶龙或奶蛙吧。")
             return True
 
-        if is_milk_fortune_command(text):
-            day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
-            fortune = make_milk_fortune(
-                chat_id=message.chat_id,
-                sender_id=message.sender_id,
-                day=day,
-            )
-            await reply_card(
-                message,
-                build_milk_fortune_card(fortune, day=day),
-                format_milk_fortune(fortune, day=day),
-            )
+        if text.strip() in {"标怪图", "取消怪图"}:
+            reference_id = message.reply_to_message_id or _raw_parent_id(message)
+            if not reference_id:
+                await reply(message, "请回复一张奶图，再发“标怪图”或“取消怪图”。")
+                return True
+            weird = text.strip() == "标怪图"
+            asset = await asyncio.to_thread(store.mark_weird_reference, reference_id, weird)
+            if asset is None:
+                await reply(message, "没找到这张奶图，请先发给我识别，再回复图片标记。")
+            else:
+                action = "已加入怪图池" if weird else "已移出怪图池"
+                await reply(message, f"图鉴 #{asset.id:04d} {action}。")
             return True
 
         corrected_label = parse_correction_command(text)
@@ -2318,9 +2940,18 @@ async def run_adapter(
             allow_proactive=getattr(channel, "allow_proactive", False),
             speech_enabled=services.speech_client is not None,
         )
+        if feishu_emoji_ids:
+            text += "\n奶龙表情 点赞 · 点播企业表情；发「奶龙表情」查看列表。"
         if unknown_command:
             text = "没认出这个指令，看看下面的用法：\n\n" + text
-        await reply(message, text)
+        if channel.scope.platform == "feishu":
+            # 只有长帮助放进话题，识图、奶签等其他回复保持普通消息。
+            await reply_card(
+                message, build_help_card(text), text,
+                in_thread=message.chat_type in {"group", "topic"},
+            )
+        else:
+            await reply(message, text)
 
     async def start_guess(message) -> None:
         async with guess_lock:
@@ -2388,12 +3019,17 @@ async def run_adapter(
         ):
             return
         async with chain_lock:
-            reply_asset = await asyncio.to_thread(
-                store.next_chain_asset,
-                chat_id=message.chat_id,
-                label=observation.asset.label,
-                exclude_sha256=observation.asset.sha256,
-            )
+            if services.chain_selector:
+                reply_asset = await asyncio.to_thread(
+                    services.chain_selector.select, observation.asset, message.chat_id,
+                )
+            else:
+                reply_asset = await asyncio.to_thread(
+                    store.next_chain_asset,
+                    chat_id=message.chat_id,
+                    label=observation.asset.label,
+                    exclude_sha256=observation.asset.sha256,
+                )
             if not reply_asset:
                 LOGGER.warning("No reply asset available for label=%s", observation.asset.label)
                 if message.mentioned_bot:
@@ -2410,7 +3046,8 @@ async def run_adapter(
             result = await send_milk_image(
                 message,
                 reply_asset,
-                hdr_probability=0 if include_prediction else args.random_push_hdr_probability,
+                # 接龙频率较高，固定发普通图片，避免高亮或闪烁影响群友。
+                hdr_probability=0,
                 reply_to=True,
                 caption=caption,
             )
@@ -2419,13 +3056,6 @@ async def run_adapter(
                     store.attach_response,
                     observation.id,
                     result.message_id,
-                )
-                await asyncio.to_thread(
-                    store.record_chain_reply,
-                    chat_id=message.chat_id,
-                    label=observation.asset.label,
-                    asset_id=reply_asset.id,
-                    response_message_id=result.message_id,
                 )
 
     async def reply_mention_result(
@@ -2928,10 +3558,11 @@ async def run_adapter(
                 if reply_error:
                     await reply(message, "图片超过 20 MB，暂时无法识别。")
                 return
+            recognition_bytes = await asyncio.to_thread(gif_recognition_frame, image_bytes)
             if doubao_detector:
                 doubao_prediction = await asyncio.to_thread(
                     doubao_detector.predict_bytes,
-                    image_bytes,
+                    recognition_bytes,
                 )
                 if doubao_prediction.detected:
                     LOGGER.warning(
@@ -2940,8 +3571,19 @@ async def run_adapter(
                         target.message_id or message.message_id,
                         doubao_prediction.confidence,
                     )
+                    # 自动收图仍静默过滤；明确 @识图或私聊必须给结果，不能无声退出。
+                    if reply_error:
+                        prediction = await asyncio.to_thread(
+                            predictor.predict_bytes, recognition_bytes,
+                        )
+                        await reply(
+                            message,
+                            f"{format_prediction(prediction)}\n"
+                            f"{format_concentration(prediction)}\n"
+                            "豆包过滤器认为这张图疑似含豆包，本次不收录图鉴。",
+                        )
                     return
-            prediction = await asyncio.to_thread(predictor.predict_bytes, image_bytes)
+            prediction = await asyncio.to_thread(predictor.predict_bytes, recognition_bytes)
             # 首发署名：发图者昵称为空时按 open_id 反查，拿不到就留空（图鉴不显示该行）。
             discoverer_name = message.sender_name
             if not discoverer_name:
@@ -3007,6 +3649,78 @@ async def run_adapter(
 
     async def on_error(error) -> None:
         LOGGER.error("Adapter error instance=%s: %s", channel.scope.instance_id, error)
+
+    async def initialize_group(chat_id: str) -> None:
+        """手动登记全群成员，并识别最近历史消息里的表情包。"""
+        await asyncio.to_thread(store.record_chat, chat_id, "group")
+        try:
+            members = await channel.get_chat_members(chat_id)
+            await asyncio.to_thread(
+                store.record_milk_family_members,
+                [(member.id, member.name) for member in members],
+            )
+        except Exception:
+            LOGGER.warning(
+                "New group member enrollment failed instance=%s",
+                channel.scope.instance_id,
+                exc_info=True,
+            )
+        try:
+            stickers = await channel.get_recent_stickers(chat_id)
+            for sticker in stickers:
+                try:
+                    image_bytes = await download_target(
+                        channel,
+                        ImageTarget(
+                            sticker.message_id,
+                            sticker.file_key,
+                            "sticker",
+                            "resolved",
+                        ),
+                    )
+                    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+                        continue
+                    recognition_bytes = await asyncio.to_thread(
+                        gif_recognition_frame, image_bytes,
+                    )
+                    if doubao_detector:
+                        guard = await asyncio.to_thread(
+                            doubao_detector.predict_bytes, recognition_bytes,
+                        )
+                        if guard.detected:
+                            continue
+                    prediction = await asyncio.to_thread(
+                        predictor.predict_bytes, recognition_bytes,
+                    )
+                    if not prediction.accepted or prediction.label not in {"nailong", "naiwa"}:
+                        continue
+                    observation = await asyncio.to_thread(
+                        store.record_observation,
+                        image_bytes=image_bytes,
+                        source_message_id=sticker.message_id,
+                        chat_id=chat_id,
+                        chat_type="group",
+                        sender_id=sticker.sender_id,
+                        predicted_label=prediction.label,
+                        confidence=prediction.confidence,
+                        accepted=True,
+                        promote_seed=True,
+                    )
+                    if observation.is_new_asset:
+                        services.notify_catalog_changed()
+                except Exception:
+                    LOGGER.warning(
+                        "Historical sticker analysis failed instance=%s",
+                        channel.scope.instance_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            LOGGER.warning(
+                "New group history initialization failed instance=%s",
+                channel.scope.instance_id,
+                exc_info=True,
+            )
+        await send_milk_name_speech(chat_id, "我进来了！")
 
     async def on_user_added(event: MembersAdded) -> None:
         """为入群新人登记奶家人并起一次奶名。"""
@@ -3081,6 +3795,12 @@ async def run_adapter(
                 "Milk name welcome sent instance=%s members=%d",
                 channel.scope.instance_id,
                 len(entries),
+            )
+            welcome_voice = secrets.choice(("nailong", "naiwa"))
+            await send_milk_name_speech(
+                chat_id,
+                format_milk_name_welcome_speech(entries, voice=welcome_voice),
+                voice=welcome_voice,
             )
         except Exception:
             LOGGER.error(

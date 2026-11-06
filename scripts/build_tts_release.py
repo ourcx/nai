@@ -28,6 +28,11 @@ def main() -> None:
         "--source", type=Path, default=ROOT / "outputs/nailong-voice-20261102/gpt-sovits"
     )
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/tts-release")
+    parser.add_argument(
+        "--naiwa-source",
+        type=Path,
+        help="Optional directory containing base-model/ and naiwa-reference.wav",
+    )
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
@@ -67,6 +72,37 @@ def main() -> None:
     weights.append(
         {"file": "reference.wav", "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()}
     )
+    voices = {
+        "nailong": {
+            "gpt_weights": "weights/NaiLong-e16.ckpt",
+            "sovits_weights": "weights/NaiLong_e14_s504.pth",
+            "reference": "reference.wav",
+            "reference_text": "啊，我才不要这样，好害羞啊。",
+        }
+    }
+    if args.naiwa_source:
+        naiwa_source = args.naiwa_source.resolve()
+        naiwa_files = {
+            "weights/s1v3.ckpt": naiwa_source / "base-model/s1v3.ckpt",
+            "weights/s2Gv2ProPlus.pth": naiwa_source / "base-model/v2Pro/s2Gv2ProPlus.pth",
+            "naiwa-reference.wav": naiwa_source / "naiwa-reference.wav",
+        }
+        for relative, original in naiwa_files.items():
+            if not original.is_file():
+                raise FileNotFoundError(original)
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy_file(str(original), str(target))
+            weights.append({
+                "file": relative,
+                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            })
+        voices["naiwa"] = {
+            "gpt_weights": "weights/s1v3.ckpt",
+            "sovits_weights": "weights/s2Gv2ProPlus.pth",
+            "reference": "naiwa-reference.wav",
+            "reference_text": "我落地枪，不要慌，全靠运气全靠浪。",
+        }
     for name in RUNTIME_FILES:
         shutil.copyfile(ROOT / "deploy/tts" / name, output / name)
     metadata = {
@@ -76,6 +112,7 @@ def main() -> None:
             ["git", "rev-parse", "HEAD"], cwd=source / "upstream", text=True
         ).strip(),
         "reference_text": "啊，我才不要这样，好害羞啊。",
+        "voices": voices,
         "weights": weights,
         "gpt_weights": "NaiLong-e16.ckpt",
         "sovits_weights": "NaiLong_e14_s504.pth",

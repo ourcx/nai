@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
@@ -17,6 +18,7 @@ from ..integrations.contact import ContactResolver
 from .base import (
     CardAction,
     Handler,
+    HistoricalSticker,
     IdentityScope,
     ImageTarget,
     Member,
@@ -265,6 +267,51 @@ class FeishuAdapter:
             self._member_cache[raw_chat] = (time.monotonic() + 300, tuple(normalized))
             return normalized
 
+    async def get_recent_stickers(self, chat_id: str) -> list[HistoricalSticker]:
+        raw_chat = self.scope.raw("chat", chat_id)
+        stickers: list[HistoricalSticker] = []
+        page_token = ""
+        scanned = 0
+        while scanned < 500 and len(stickers) < 100:
+            queries = [
+                ("container_id_type", "chat"),
+                ("container_id", raw_chat),
+                ("sort_type", "ByCreateTimeDesc"),
+                ("page_size", "50"),
+            ]
+            if page_token:
+                queries.append(("page_token", page_token))
+            data = await self.channel._raw_tenant_get(
+                "/open-apis/im/v1/messages", {}, queries,
+            )
+            items = data.get("items") or []
+            scanned += len(items)
+            for item in items:
+                if not isinstance(item, dict) or item.get("msg_type") != "sticker":
+                    continue
+                body = item.get("body")
+                content = body.get("content") if isinstance(body, dict) else ""
+                try:
+                    content = json.loads(content) if isinstance(content, str) else content
+                except json.JSONDecodeError:
+                    continue
+                file_key = _find_file_key(content)
+                sender = item.get("sender")
+                sender_id = sender.get("id") if isinstance(sender, dict) else None
+                message_id = item.get("message_id")
+                if all(isinstance(value, str) and value for value in (
+                    file_key, sender_id, message_id,
+                )):
+                    stickers.append(HistoricalSticker(
+                        self.scope.key("message", message_id),
+                        file_key,
+                        self.scope.key("user", sender_id),
+                    ))
+            page_token = data.get("page_token") or ""
+            if not data.get("has_more") or not page_token:
+                break
+        return stickers
+
     async def resolve_image_target(self, message: Message) -> ImageTarget:
         for kind in ("image", "sticker"):
             resource = next((r for r in message.resources if r.type == kind), None)
@@ -335,6 +382,36 @@ class FeishuAdapter:
         self, chat_id: str, content: dict[str, Any], options: dict[str, Any] | None = None
     ) -> SendResult:
         payload = {key: value for key, value in content.items() if key != "fallback_text"}
+        image = payload.get("image")
+        if isinstance(image, dict) and image.get("presentation") == "card":
+            source = image.get("source")
+            if isinstance(source, bytes):
+                media = MediaSource(kind="buffer", buffer=source)
+            elif isinstance(source, (str, Path)):
+                media = MediaSource(kind="file", path=str(source))
+            elif isinstance(source, MediaSource):
+                media = source
+            else:
+                return SendResult(False, error=SendError("invalid_image"))
+            try:
+                key = await self.channel.upload_media(media, kind="image")
+                if not key:
+                    return SendResult(False, error=SendError("upload_failed"))
+            except Exception:
+                LOGGER.exception("Failed to upload card image")
+                return SendResult(False, error=SendError("upload_failed"))
+            # 调用方显式选择图片卡片；只包装上传结果，不在接入层判断图片业务或格式。
+            elements = [{
+                "tag": "img", "img_key": key,
+                "alt": {"tag": "plain_text", "content": image.get("alt", "图片")},
+                "scale_type": "fit_horizontal", "preview": True,
+            }]
+            if payload.get("caption"):
+                elements.append({"tag": "markdown", "content": payload["caption"]})
+            payload = {"card": {
+                "schema": "2.0", "config": {"width_mode": "default"},
+                "body": {"elements": elements},
+            }}
         audio = payload.get("audio")
         if isinstance(audio, dict) and "duration_ms" in audio:
             duration, source = audio["duration_ms"], audio.get("source")
@@ -389,13 +466,14 @@ class FeishuAdapter:
                 return SendResult(False, error=SendError("upload_failed"))
             payload = {"post": {"zh_cn": {"title": "奶龙图鉴", "content": rows}}}
         native_options = dict(options or {})
+        raw_chat_id = self.scope.raw("chat", chat_id)
         if native_options.get("reply_to"):
             native_options["reply_to"] = self.scope.raw(
                 "message", native_options["reply_to"]
             )
         return self._result(
             await self.channel.send(
-                self.scope.raw("chat", chat_id), payload, native_options or None
+                raw_chat_id, payload, native_options or None
             )
         )
 

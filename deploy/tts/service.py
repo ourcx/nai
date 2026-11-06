@@ -28,7 +28,7 @@ DEFAULT_SEED = 20261103
 
 
 def create_app(
-    synthesize: Callable[[str, int], tuple[bytes, float, float]],
+    synthesize: Callable[[str, int, str], tuple[bytes, float, float]],
     *,
     token: str,
     release: str,
@@ -59,11 +59,11 @@ def create_app(
             if not waiting:
                 wake.clear()
             active = True
-            text, seed, started, result = job
+            text, seed, voice, started, result = job
             started.set()
             try:
                 # 推理归后台 worker 所有；调用方取消请求也不能启动第二次推理。
-                audio = await run_in_threadpool(synthesize, text, seed)
+                audio = await run_in_threadpool(synthesize, text, seed, voice)
                 if not result.done():
                     result.set_result(audio)
             except Exception:
@@ -80,7 +80,7 @@ def create_app(
             yield
         finally:
             for job in waiting:
-                job[3].cancel()
+                job[4].cancel()
             waiting.clear()
             task.cancel()
             with suppress(asyncio.CancelledError):
@@ -91,13 +91,13 @@ def create_app(
             waiting.remove(job)
         if not waiting:
             wake.clear()
-        job[3].cancel()
+        job[4].cancel()
 
     async def health(_request: Request) -> Response:
         return JSONResponse(
             {
                 "status": "ok",
-                "model": "nailong-gpt-sovits-v2proplus",
+                "model": "nailong-naiwa-gpt-sovits-v2proplus",
                 "release": release,
                 "busy": active,
                 "queued": len(waiting),
@@ -121,10 +121,13 @@ def create_app(
             payload = json.loads(body)
         except (ValueError, UnicodeError):
             return JSONResponse({"error": "invalid_json"}, status_code=400)
-        if not isinstance(payload, dict) or set(payload) - {"text", "seed"}:
-            return JSONResponse({"error": "expected_text_and_optional_seed"}, status_code=400)
+        if not isinstance(payload, dict) or set(payload) - {"text", "seed", "voice"}:
+            return JSONResponse(
+                {"error": "expected_text_with_optional_seed_and_voice"}, status_code=400
+            )
         text = payload.get("text")
         seed = payload.get("seed", DEFAULT_SEED)
+        voice = payload.get("voice", "nailong")
         if not isinstance(text, str) or not text.strip():
             return JSONResponse({"error": "text_required"}, status_code=400)
         text = text.strip()
@@ -136,6 +139,8 @@ def create_app(
             return JSONResponse({"error": "chinese_text_required"}, status_code=400)
         if type(seed) is not int or not 0 <= seed < 2**32:
             return JSONResponse({"error": "invalid_seed"}, status_code=400)
+        if voice not in {"nailong", "naiwa"}:
+            return JSONResponse({"error": "invalid_voice"}, status_code=400)
         # 只有一个模型实例。一个执行位加有限等待位，队满时立即拒绝，不堆积任务。
         if len(waiting) + int(active) >= max_waiting + 1:
             return JSONResponse(
@@ -152,7 +157,7 @@ def create_app(
         admissions.append(now)
         started = asyncio.Event()
         result = asyncio.get_running_loop().create_future()
-        job = (text, seed, started, result)
+        job = (text, seed, voice, started, result)
         waiting.append(job)
         wake.set()
         try:

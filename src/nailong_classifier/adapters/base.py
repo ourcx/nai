@@ -87,6 +87,13 @@ class MembersAdded:
 
 
 @dataclass(frozen=True)
+class HistoricalSticker:
+    message_id: str
+    file_key: str
+    sender_id: str
+
+
+@dataclass(frozen=True)
 class CardAction:
     message_id: str
     value: dict[str, Any]
@@ -134,7 +141,8 @@ class IdentityScope:
 class BotAdapter(Protocol):
     """平台接口：SDK、身份、下载、发送和事件转换都在此边界内。
 
-    send 的 text/image/gallery 是统一内容；card 是可选飞书展示，
+    send 的 text/image/gallery 是统一内容；飞书 image 可显式指定 presentation="card"。
+    card 是可选飞书展示，
     不支持卡片的平台使用同一请求中的 fallback_text。
     """
 
@@ -147,6 +155,7 @@ class BotAdapter(Protocol):
     async def download_target(self, target: ImageTarget) -> bytes | None: ...
     async def resolve(self, user_id: str, *, fallback: str = "神秘奶友") -> str: ...
     async def get_chat_members(self, chat_id: str) -> list[Member]: ...
+    async def get_recent_stickers(self, chat_id: str) -> list[HistoricalSticker]: ...
     async def send(
         self, chat_id: str, content: dict[str, Any], options: dict[str, Any] | None = None
     ) -> SendResult: ...

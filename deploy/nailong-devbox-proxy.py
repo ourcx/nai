@@ -62,9 +62,33 @@ class GalleryProxyHandler(BaseHTTPRequestHandler):
         self._proxy(send_body=False)
 
     def do_POST(self) -> None:
-        self.send_error(405, "Method Not Allowed")
+        # 图库仍只读；仅开放文字贴纸渲染，请求和生成图均不写入代理缓存。
+        if urlsplit(self.path).path != "/api/milk-text":
+            self.send_error(405, "Method Not Allowed")
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.send_error(400, "Content-Length Required")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.send_error(411, "Length Required")
+            return
+        if not 0 <= length <= 4096:
+            self.send_error(413, "Content Too Large")
+            return
+        self.connection.settimeout(15)
+        try:
+            body = self.rfile.read(length)
+        except TimeoutError:
+            self.send_error(408, "Request Timeout")
+            return
+        if len(body) != length:
+            self.send_error(400, "Incomplete Request")
+            return
+        self._proxy(send_body=True, request_body=body)
 
-    def _proxy(self, *, send_body: bool) -> None:
+    def _proxy(self, *, send_body: bool, request_body: bytes | None = None) -> None:
         parsed = urlsplit(self.path)
         if parsed.path == "/_proxy_health":
             self._health()
@@ -96,12 +120,16 @@ class GalleryProxyHandler(BaseHTTPRequestHandler):
             value = self.headers.get(name)
             if value:
                 headers[name] = value
+        if request_body is not None:
+            headers["Content-Type"] = self.headers.get("Content-Type", "application/json")
 
         connection = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=30)
         response_started = False
         temporary_body: Path | None = None
         try:
-            connection.request(self.command, upstream_path, headers=headers)
+            connection.request(
+                self.command, upstream_path, body=request_body, headers=headers
+            )
             response = connection.getresponse()
             response_headers = [
                 (name, value)

@@ -8,6 +8,7 @@ from typing import Any
 
 from ..integrations.speech import NailongSpeechClient, SpeechRequestLimiter
 from ..persistence.storage import BotStore
+from .chain_selector import ChainSelector
 
 
 class SerializedPredictor:
@@ -48,8 +49,11 @@ class BackendServices:
     catalog_sync_events: list[asyncio.Event] = field(default_factory=list)
     speech_client: NailongSpeechClient | None = None
     speech_limiter: SpeechRequestLimiter = field(default_factory=SpeechRequestLimiter)
+    chain_selector: ChainSelector | None = None
 
     def notify_catalog_changed(self) -> None:
         """任何平台收录或纠正图片后，唤醒所有配置了图鉴同步的接入实例。"""
         for event in self.catalog_sync_events:
             event.set()
+        if self.chain_selector:
+            self.chain_selector.index_event.set()

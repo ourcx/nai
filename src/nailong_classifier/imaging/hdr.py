@@ -6,6 +6,7 @@ import logging
 import math
 import secrets
 from pathlib import Path
+from typing import Literal
 
 import imagecodecs
 import numpy as np
@@ -86,23 +87,30 @@ def random_milk_image_content(
     *,
     probability: float = DEFAULT_HDR_PROBABILITY,
     peak_nits: float = DEFAULT_HDR_PEAK_NITS,
+    effect: Literal["flash", "hdr"] = "flash",
 ) -> dict:
-    """为主动推送选择原图或聊天内可播放的闪亮 GIF，始终只发图片。
+    """按概率生成 Ultra HDR JPEG 或闪亮 GIF，始终保留原图库文件。
 
-    飞书会过滤或丢失 Ultra HDR 的 gain map，因此群聊不再直接上传 HDR JPEG。
-    保留原配置名和触发概率，命中后生成普通 GIF，在客户端用亮度脉冲模拟闪亮。
+    调用方选择输出格式；默认沿用 GIF，避免改变既有调用方契约。
+    HDR 需要接收端保留增益图并启用 HDR 显示，普通 GIF 只能模拟亮度变化。
     文件读取与编码由调用方放到工作线程中，避免阻塞群聊消息处理。
     """
     validate_hdr_settings(probability, peak_nits)
+    if effect not in {"flash", "hdr"}:
+        raise ValueError("Image effect must be flash or hdr")
     content = {"image": {"source": str(source)}}
     if probability <= 0 or secrets.SystemRandom().random() >= probability:
         return content
     try:
-        encoded = make_flash_gif(source.read_bytes())
+        original = source.read_bytes()
+        encoded = (
+            make_hdr_image(original, peak_nits=peak_nits)
+            if effect == "hdr" else make_flash_gif(original)
+        )
     except Exception:
-        LOGGER.exception("Flash GIF conversion failed, sending original image path=%s", source)
+        LOGGER.exception("Milk image conversion failed effect=%s path=%s", effect, source)
         return content
-    LOGGER.info("Prepared flash milk GIF bytes=%d", len(encoded))
+    LOGGER.info("Prepared milk image effect=%s bytes=%d", effect, len(encoded))
     return {"image": {"source": encoded}}
 
 
@@ -114,7 +122,7 @@ def make_flash_gif(image_bytes: bytes) -> bytes:
         background = Image.new("RGBA", frame.size, "white")
         base = Image.alpha_composite(background, frame).convert("RGB")
 
-    # 三帧短循环：原图 -> 高亮闪白 -> 原图。使用 SDR GIF，避免飞书过滤 HDR gain map。
+    # GIF 是 SDR 兼容效果，只模拟闪亮，不能作为真正的 HDR 输出。
     flash = Image.blend(base, Image.new("RGB", base.size, "white"), 0.38)
     output = io.BytesIO()
     base.save(

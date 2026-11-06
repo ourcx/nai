@@ -45,6 +45,10 @@ def event(text="", *, id="source", group="group-a", image=False, parent=None):
     return data
 
 
+def reply_text(data):
+    return data.get("markdown", {}).get("content", data.get("content", ""))
+
+
 async def mock_adapter(*, api=None, auth=None, **kwargs):
     adapter = QQAdapter(
         IdentityScope("qq", "qq-main"), app_id="102498836", app_secret="dummy-secret", **kwargs
@@ -175,8 +179,8 @@ def test_qq_business_identifies_corrects_collects_and_accepts_mentioned_guess(
     assert observation.asset.corrected
     assert observation.asset.label == "naiwa"
     messages = [data for path, data in calls if path.endswith("/messages")]
-    assert any("已纠正" in data.get("content", "") for data in messages)
-    assert any("今日含奶量" in data.get("content", "") for data in messages)
+    assert any("已纠正" in reply_text(data) for data in messages)
+    assert any("今日含奶量" in reply_text(data) for data in messages)
     assert any(data["msg_type"] == 7 for data in messages)
     assert all("msg_id" in data and data["msg_seq"] == 1 for data in messages)
     assert all(path.startswith("/v2/groups/group-a/") for path, _ in calls)
@@ -376,9 +380,9 @@ def test_qq_uses_shared_image_workflows_and_simple_milk_command(tmp_path, monkey
             old_mention = event("@王小明", id="old-mention")
             await adapter.handle_event("GROUP_AT_MESSAGE_CREATE", old_mention)
             messages = [payload for path, payload in calls if path.endswith("/messages")]
-            assert "没认出这个指令" in messages[-1]["content"]
-            assert "接奶（或奶家人）" in messages[-1]["content"]
-            assert "完整昵称" not in messages[-1]["content"]
+            assert "没认出这个指令" in reply_text(messages[-1])
+            assert "接奶（或奶家人）" in reply_text(messages[-1])
+            assert "完整昵称" not in reply_text(messages[-1])
 
             private_milk = event("接奶", id="private-milk")
             private_milk["content"] = "接奶"
@@ -391,11 +395,11 @@ def test_qq_uses_shared_image_workflows_and_simple_milk_command(tmp_path, monkey
             help_request = event("帮助", id="qq-help")
             await adapter.handle_event("GROUP_AT_MESSAGE_CREATE", help_request)
             messages = [payload for path, payload in calls if path.endswith("/messages")]
-            assert "回复图片并 @我" in messages[-1]["content"]
-            assert "当前未开启定时主动播报" in messages[-1]["content"]
-            assert "接龙 + 图片" not in messages[-1]["content"]
-            assert "接奶（或奶家人）" in messages[-1]["content"]
-            assert "手动输入" not in messages[-1]["content"]
+            assert "回复图片并 @我" in reply_text(messages[-1])
+            assert "当前未开启定时主动播报" in reply_text(messages[-1])
+            assert "接龙 + 图片" not in reply_text(messages[-1])
+            assert "接奶（或奶家人）" in reply_text(messages[-1])
+            assert "手动输入" not in reply_text(messages[-1])
 
             # 真实群事件把图片放在引用子节点里，顶层 content/attachments 都为空。
             native_quote = event(id="native-quote")
@@ -426,8 +430,8 @@ def test_qq_uses_shared_image_workflows_and_simple_milk_command(tmp_path, monkey
             private["author"]["username"] = "小红"
             await adapter.handle_event("C2C_MESSAGE_CREATE", private)
             messages = [payload for path, payload in calls if path.endswith("/messages")]
-            assert messages[-1]["msg_type"] == 0
-            assert "奶龙接上了" not in messages[-1]["content"]
+            assert messages[-1]["msg_type"] == 2
+            assert "奶龙接上了" not in reply_text(messages[-1])
             assert calls[-1][0] == "/v2/users/user-a/messages"
 
             # 只 @机器人时展示用法，不再要求输入群友昵称。
@@ -435,9 +439,9 @@ def test_qq_uses_shared_image_workflows_and_simple_milk_command(tmp_path, monkey
             bare["content"] = ""
             await adapter.handle_event("GROUP_AT_MESSAGE_CREATE", bare)
             messages = [payload for path, payload in calls if path.endswith("/messages")]
-            assert "help / 帮助" in messages[-1]["content"]
-            assert "接奶（或奶家人）" in messages[-1]["content"]
-            assert "手动输入" not in messages[-1]["content"]
+            assert "help / 帮助" in reply_text(messages[-1])
+            assert "接奶（或奶家人）" in reply_text(messages[-1])
+            assert "手动输入" not in reply_text(messages[-1])
 
             # 图片与引用仍按原逻辑识图、接龙和纠正。
             mixed = event("@王小明", id="image-and-name", image=True)

@@ -134,6 +134,29 @@ def test_disabled_flash_does_not_read_or_convert_missing_image(
     assert random_milk_image_content(path, probability=0) == {"image": {"source": str(path)}}
 
 
+def test_hdr_push_preserves_gainmap_and_original_file(tmp_path: Path) -> None:
+    source = tmp_path / "milk.png"
+    original = image_bytes(Image.new("RGB", (32, 32), "yellow"))
+    source.write_bytes(original)
+    content = random_milk_image_content(source, probability=1, effect="hdr")
+    assert set(content) == {"image"}
+    assert imagecodecs.ultrahdr_check(content["image"]["source"])
+    assert source.read_bytes() == original
+
+
+def test_hdr_encoder_failure_falls_back_to_original(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "milk.png"
+    source.write_bytes(image_bytes(Image.new("RGB", (32, 32), "yellow")))
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("HDR encoder unavailable")
+
+    monkeypatch.setattr("nailong_classifier.imaging.hdr.make_hdr_image", unavailable)
+    assert random_milk_image_content(source, probability=1, effect="hdr") == {
+        "image": {"source": str(source)}
+    }
+
+
 def test_probability_miss_preserves_original_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "nailong_classifier.imaging.hdr.secrets.SystemRandom", lambda: random.Random(2)

@@ -21,7 +21,7 @@ ssh "$HOST" bash -s -- "$REMOTE_SOURCE" <<'SH'
 set -euo pipefail
 SOURCE="$1"
 chmod -R a+rX "$SOURCE"
-/opt/nailong-bot/.venv/bin/python -m pip --disable-pip-version-check install --no-deps 'av==16.1.0'
+/opt/nailong-bot/.venv/bin/python -m pip --disable-pip-version-check install --upgrade --no-deps 'av==16.1.0' 'yt-dlp>=2025.1'
 PYTHONPATH="$SOURCE" /opt/nailong-bot/.venv/bin/python -c 'from nailong_classifier.application.bot import main; import av; assert "libopus" in av.codecs_available'
 DROPIN=/etc/systemd/system/nailong-bot.service.d/90-voice-client.conf
 install -d -m 0755 "$(dirname "$DROPIN")" /var/backups/nailong-voice-client

@@ -128,9 +128,11 @@ class NailongSpeechClient:
             raise ValueError("Install the speech extra with a libopus-enabled PyAV wheel")
         return cls(base_url.rstrip("/"), token)
 
-    async def synthesize(self, text: str) -> SpeechAudio:
+    async def synthesize(self, text: str, *, voice: str = "nailong") -> SpeechAudio:
         if not text.strip() or len(text) > MAX_SPEECH_CHARS:
             raise SpeechError(f"请提供 1～{MAX_SPEECH_CHARS} 字的中文台词。")
+        if voice not in {"nailong", "naiwa"}:
+            raise ValueError("Unsupported speech voice")
         try:
             async with (
                 httpx.AsyncClient(timeout=httpx.Timeout(120, connect=5), trust_env=False) as client,
@@ -138,7 +140,7 @@ class NailongSpeechClient:
                     "POST",
                     self.base_url + "/tts",
                     headers={"Authorization": "Bearer " + self.token},
-                    json={"text": text},
+                    json={"text": text, "voice": voice},
                 ) as response,
             ):
                 if response.status_code == 429:

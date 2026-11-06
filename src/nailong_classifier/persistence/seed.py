@@ -18,10 +18,11 @@ def parse_args() -> argparse.Namespace:
         default=Path(os.getenv("BOT_STATE_DIR", "runtime")),
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/train"))
+    parser.add_argument("--weird", action="store_true", help="Mark this curated folder as weird images.")
     return parser.parse_args()
 
 
-def seed(state_dir: Path, data_dir: Path) -> dict[str, int]:
+def seed(state_dir: Path, data_dir: Path, *, weird: bool = False) -> dict[str, int]:
     store = BotStore(state_dir)
     counts: dict[str, int] = {}
     for label in SEED_LABELS:
@@ -32,17 +33,18 @@ def seed(state_dir: Path, data_dir: Path) -> dict[str, int]:
             if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
         )
         for path in paths:
-            store.register_seed(path.read_bytes(), label)
+            asset = store.register_seed(path.read_bytes(), label)
+            if weird:
+                store.set_weird_asset(asset.id, True)
         counts[label] = len(paths)
     return counts
 
 
 def main() -> None:
     args = parse_args()
-    counts = seed(args.state_dir, args.data_dir)
+    counts = seed(args.state_dir, args.data_dir, weird=args.weird)
     print(" ".join(f"{label}={count}" for label, count in counts.items()))
 
 
 if __name__ == "__main__":
     main()
-
