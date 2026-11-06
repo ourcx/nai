@@ -6,7 +6,6 @@ import logging
 import math
 import secrets
 from pathlib import Path
-from typing import Literal
 
 import imagecodecs
 import numpy as np
@@ -87,55 +86,26 @@ def random_milk_image_content(
     *,
     probability: float = DEFAULT_HDR_PROBABILITY,
     peak_nits: float = DEFAULT_HDR_PEAK_NITS,
-    effect: Literal["flash", "hdr"] = "flash",
 ) -> dict:
-    """按概率生成 Ultra HDR JPEG 或闪亮 GIF，始终保留原图库文件。
+    """按概率生成 Ultra HDR JPEG，始终保留原图库文件。
 
-    调用方选择输出格式；默认沿用 GIF，避免改变既有调用方契约。
-    HDR 需要接收端保留增益图并启用 HDR 显示，普通 GIF 只能模拟亮度变化。
+    未命中概率时直接返回原图；命中时只生成静态 HDR JPEG，不再制作闪烁 GIF。
     文件读取与编码由调用方放到工作线程中，避免阻塞群聊消息处理。
     """
     validate_hdr_settings(probability, peak_nits)
-    if effect not in {"flash", "hdr"}:
-        raise ValueError("Image effect must be flash or hdr")
     content = {"image": {"source": str(source)}}
     if probability <= 0 or secrets.SystemRandom().random() >= probability:
         return content
     try:
         original = source.read_bytes()
-        encoded = (
-            make_hdr_image(original, peak_nits=peak_nits)
-            if effect == "hdr" else make_flash_gif(original)
-        )
+        encoded = make_hdr_image(original, peak_nits=peak_nits)
     except Exception:
-        LOGGER.exception("Milk image conversion failed effect=%s path=%s", effect, source)
+        LOGGER.exception("Milk image HDR conversion failed path=%s", source)
         return content
-    LOGGER.info("Prepared milk image effect=%s bytes=%d", effect, len(encoded))
+    LOGGER.info("Prepared static HDR milk image bytes=%d", len(encoded))
     return {"image": {"source": encoded}}
 
 
-def make_flash_gif(image_bytes: bytes) -> bytes:
-    """把一张奶图做成客户端可播放的短 GIF，模拟高光闪一下的效果。"""
-    with Image.open(io.BytesIO(image_bytes)) as image:
-        frame = ImageOps.exif_transpose(image).convert("RGBA")
-        frame.thumbnail(HDR_MAX_SIZE, Image.Resampling.LANCZOS)
-        background = Image.new("RGBA", frame.size, "white")
-        base = Image.alpha_composite(background, frame).convert("RGB")
-
-    # GIF 是 SDR 兼容效果，只模拟闪亮，不能作为真正的 HDR 输出。
-    flash = Image.blend(base, Image.new("RGB", base.size, "white"), 0.38)
-    output = io.BytesIO()
-    base.save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=[flash, base],
-        duration=[300, 120, 600],
-        loop=0,
-        disposal=2,
-        optimize=True,
-    )
-    return output.getvalue()
 
 
 def main() -> None:

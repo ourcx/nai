@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 
 from ..context import MessageContext
@@ -22,8 +23,11 @@ class HelpFeature:
         return (
             context.content_type in {"text", "post"}
             and (context.mentioned_bot or context.chat_type == "p2p")
-            and context.text.strip().lower()
-            in {"help", "/help", "帮助", "/帮助", "使用帮助", "奶龙帮助"}
+            and re.fullmatch(
+                r"(?:/?help|/?帮助|使用帮助|奶龙帮助)(?:[\s：:].*)?",
+                context.text.strip(),
+                flags=re.IGNORECASE,
+            ) is not None
         )
 
     async def handle(self, context: MessageContext) -> ResponsePlan:

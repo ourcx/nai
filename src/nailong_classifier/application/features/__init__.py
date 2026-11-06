@@ -2,6 +2,7 @@
 
 from .admin import AdminFeature, AdminRequest
 from .base import FeatureHandler, Workload
+from .callback import CallbackFeature
 from .help import HelpFeature
 from .social import SocialImportFeature
 from .speech import SpeechFeature, SpeechRequest
@@ -11,6 +12,7 @@ __all__ = [
     "FeatureHandler",
     "AdminFeature",
     "AdminRequest",
+    "CallbackFeature",
     "HelpFeature",
     "InitializationFeature",
     "SocialImportFeature",
